@@ -31,6 +31,12 @@ Some changes do **not** require an RFC:
 5. The maintainer team will decide whether the RFC is a candidate for inclusion. This may take time — we encourage you to seek community review first.
 6. An RFC may be **accepted** (merged), **rejected** (closed with rationale), or **deferred** for a later time.
 
+## AI usage policy
+
+We encourage using AI tools to explore the MLflow codebase, draft sections, and polish writing. However, an RFC is a thinking exercise, not a generation exercise. Proposals that read as unreviewed AI output may be rejected without detailed feedback.
+
+Before submitting, ask yourself: *Would I be comfortable defending every sentence in this document?*
+
 ## Implementing an RFC
 
 The author of an RFC is not obligated to implement it. Once an RFC is accepted, anyone is welcome to submit an implementation as a pull request.
