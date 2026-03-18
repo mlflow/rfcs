@@ -24,7 +24,8 @@ Some changes do **not** require an RFC:
 
 ## What the process is
 
-1. Copy `0000-template.md` to `text/0000-my-feature.md` (where "my-feature" is descriptive — don't assign a number yet).
+1. Create a new directory `0000-my-feature` (where "my-feature" is descriptive — don't assign a number yet).
+2. Copy `0000-template.md` to the directory.
 2. Fill in the RFC. Put care into the details: RFCs that do not present convincing motivation or are not honest about drawbacks tend to be poorly received.
 3. Submit a pull request. The RFC will receive design feedback from the community and maintainers. Be prepared to revise it.
 4. Build consensus and integrate feedback.
