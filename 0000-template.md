@@ -1,6 +1,6 @@
-- Start Date: (fill me in with today's date, YYYY-MM-DD)
-- RFC PR: (leave this empty)
-- MLflow Issue: (leave this empty)
+start_date:   # fill me in with today's date, YYYY-MM-DD
+mlflow_issue: # link to the issue in the MLflow repo
+rfc_pr:       # leave this empty
 
 # Summary
 

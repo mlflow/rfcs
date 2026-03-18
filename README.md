@@ -24,13 +24,15 @@ Some changes do **not** require an RFC:
 
 ## What the process is
 
-1. Create a new directory `0000-my-feature` (where "my-feature" is descriptive — don't assign a number yet).
-2. Copy `0000-template.md` to the directory.
-2. Fill in the RFC. Put care into the details: RFCs that do not present convincing motivation or are not honest about drawbacks tend to be poorly received.
-3. Submit a pull request. The RFC will receive design feedback from the community and maintainers. Be prepared to revise it.
-4. Build consensus and integrate feedback.
-5. The maintainer team will decide whether the RFC is a candidate for inclusion. This may take time — we encourage you to seek community review first.
-6. An RFC may be **accepted** (merged), **rejected** (closed with rationale), or **deferred** for a later time.
+1. Create an issue with `enhancement` label in the MLflow repository, with the brief description of the problem and the expected outcome.
+2. MLflow maintainers will triage the issue and determine if it is a candidate for an RFC. If it is, they will mark the issue with `ready` label.
+3. Once the issue is signed off, create a new directory `rfcs/0000-my-feature` in this repository (where "my-feature" is descriptive — don't assign a number yet).
+4. Copy `0000-template.md` to the directory and fill in the RFC. Put care into the details: RFCs that do not present convincing motivation or are not honest about drawbacks tend to be poorly received.
+5. Submit a pull request in this repository. The RFC will receive design feedback from the community and maintainers. Be prepared to revise it.
+6. Build consensus and integrate feedback.
+7. The maintainer team will decide whether the RFC is a candidate for inclusion. This may take time — we encourage you to seek community review first.
+8. An RFC may be **accepted** (merged), **rejected** (closed with rationale), or **deferred** for a later time.
+9. Once the RFC is accepted, the author or another contributor will implement the feature and submit a pull request to the MLflow repository.
 
 ## AI usage policy
 
