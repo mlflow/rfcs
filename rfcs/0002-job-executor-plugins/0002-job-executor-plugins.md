@@ -116,8 +116,9 @@ The new design separates job execution into three layers:
 
 1. The `@job` decorator remains the place where a job declares framework-visible
    metadata such as `name`, `max_workers`, `transient_error_classes`,
-   `python_env`, and `exclusive`. This design extends that metadata with
-   `resource_requests` and `resource_limits`.
+   `python_env` (typed as `_PythonEnv | None` in the executor interface), and
+   `exclusive`. This design extends that metadata with `resource_requests` and
+   `resource_limits`.
 2. `AbstractJobExecutor` defines the backend contract. A backend submits work,
    waits for completion, cancels work, and reconnects to unfinished work during
    recovery.
@@ -168,14 +169,14 @@ The core types are also simplified around that split:
   `is_transient_error`.
 - `JobExecutionContext` bundles execution metadata that the framework passes to
   the selected backend. This includes the job ID, the tracking URI the job
-  should use, optional workspace information, an extensible pip configuration
-  object, and remote-execution auth fields introduced here as part of the
-  framework contract and consumed by backend implementations in the follow-up
-  RFC.
-- `PipConfig` is shown below as a placeholder name for the install-related
-  settings passed to executors. The concrete data model may reuse or extend
-  MLflow's existing `_PythonEnv` shape rather than introduce a fully separate
-  configuration object.
+  should use, optional workspace information, and remote-execution auth fields
+  introduced here as part of the framework contract and consumed by backend
+  implementations in the follow-up RFC.
+- Install-related settings passed to executors should reuse MLflow's existing
+  `_PythonEnv` shape rather than introducing a separate parallel configuration
+  object. If pip index configuration or similar settings need to be modeled,
+  they should be added by extending `_PythonEnv` rather than by defining a new
+  executor-specific config type.
 
 The framework-level enums used by the interface are intentionally small:
 
@@ -191,6 +192,8 @@ plugins. The intent is to keep it small and stable:
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from mlflow.utils.environment import _PythonEnv
 
 
 @dataclass
@@ -212,20 +215,12 @@ class JobResult:
 
 
 @dataclass
-class PipConfig:
-    index_url: str | None = None
-    extra_index_urls: list[str] | None = None
-    trusted_hosts: list[str] | None = None
-
-
-@dataclass
 class JobExecutionContext:
     job_id: str
     tracking_uri: str
     gateway_uri: str | None = None  # optional MLflow AI Gateway base URI reachable from the job runtime; defaults to tracking_uri when unset
     token: str | None = None  # used by remote executors
     workspace: str | None = None
-    pip_config: PipConfig | None = None  # pip install settings for local or remote runtimes
 
 
 @dataclass
@@ -250,7 +245,7 @@ class AbstractJobExecutor(ABC):
         fn_fullname: str,
         params: dict[str, Any],
         context: JobExecutionContext,
-        python_env: Any | None = None,
+        python_env: _PythonEnv | None = None,
         timeout: float | None = None,
     ) -> None: ...
 
@@ -900,6 +895,51 @@ more coupling, not less.
 This alternative was not chosen because the proposal is fundamentally about
 moving lifecycle ownership into MLflow.
 
+## Use Huey for queueing and locking only
+
+Another possible design is a hybrid approach where MLflow keeps scheduler
+leadership, discovery, retries, persisted job state, and stale-work recovery,
+but delegates the shared queue and normal exclusivity locking to Huey. In this
+model, MLflow would still own the scheduler lease and use it to perform
+leader-elected discovery and stale-lock cleanup, while `SqlHuey` could provide
+shared dispatch on PostgreSQL and MySQL/MariaDB deployments and `lock_task()`
+could provide exclusive locking. `SubprocessJobExecutor` could remain the
+built-in executor, with Huey acting only as the dispatch layer in front of it.
+
+The main benefit of this alternative is that it avoids introducing a custom
+MLflow queue and general-purpose lock table. In the main design, the "queue" is
+the `jobs` table plus conditional `PENDING -> RUNNING` claims rather than a
+separate queue service. This hybrid approach would replace that dispatch layer
+with Huey's own SQL-backed queue tables. That would reduce the amount of
+framework-owned coordination code and reuse queueing and lock primitives that
+already exist in the current system. It also creates a potential middle ground
+between the current Huey-centric implementation and a fully MLflow-owned queue.
+
+One further middle ground would be to keep Huey's task and consumer model but
+implement a custom Huey `BaseStorage` backed by MLflow's own database stack.
+That could avoid relying on stock `SqlHuey` and its peewee integration while
+still reusing Huey's worker framework. The tradeoff is that storage is where
+most of the hard correctness problems live in this design: durable
+multi-replica dequeue, exclusivity locking, stale-lock cleanup, and recovery
+semantics. If MLflow still needs to implement custom storage behavior for those
+guarantees, the simplification benefit over a fully MLflow-owned queue narrows
+substantially.
+
+The downsides are mostly around supportability and semantics. `SqlHuey` is a
+contrib module inside the Huey repository rather than a separately maintained
+third-party package, but it is still less documented and less clearly positioned
+as a first-class backend than `RedisHuey` or `SqliteHuey`. It also uses peewee
+for its SQL layer, which would introduce a second ORM dependency alongside
+MLflow's SQLAlchemy store and introduce queue / lock tables managed by Huey
+rather than by MLflow itself. It also leaves a gap for MSSQL support unless the
+necessary behavior is contributed upstream to `SqlHuey`, which is outside
+MLflow's direct control and would make MSSQL a weaker deployment target for the
+job system. Even on supported SQL backends, Huey locks do not provide lease
+semantics or owner metadata, so MLflow would still need extra logic to detect
+and safely clean up stale locks. That means the hybrid design reduces some
+framework-owned infrastructure, but it does not eliminate the need for
+MLflow-specific scheduler and recovery logic.
+
 ## Allow custom scorers on the built-in local executor
 
 The benefit of this option is obvious: it would preserve the simplest possible
@@ -945,11 +985,10 @@ is introduced by the core design.
 
 # Open questions
 
-1. Should `python_env` remain part of the `@job` decorator contract as a
-   Python-version selector? It is currently unused in practice, and keeping that
-   aspect increases the complexity of remote backends because Docker and
-   Kubernetes then need an image strategy for multiple Python versions rather
-   than a single worker baseline. This question is separate from preserving
-   support for extra packages and pip index configuration, which the design
-   still needs and may model by reusing or extending MLflow's existing
-   `_PythonEnv` shape.
+1. Should remote backends honor the `python` field inside `_PythonEnv`, or
+   should they treat it as advisory and pin to a single worker baseline Python
+   version? The current `python_env` shape still seems useful for extra package
+   installation, but fully honoring the Python-version field increases the
+   complexity of remote backends because Docker and Kubernetes would then need
+   an image strategy for multiple Python versions rather than a single baseline.
+2. Should we adopt the hybrid Huey approach or remove Huey as a dependency?
