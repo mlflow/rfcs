@@ -41,8 +41,11 @@ Users need the ability to offload span content to a cheaper trace repository (e.
   - Per-experiment retention **may** be stored as an experiment tag `mlflow.trace.archivalRetention` with a defined schema (e.g. `{"type": "duration", "value": "30d"}`)
   - The archival process **must** support a time-based policy (e.g., archive traces older than N days)
   - The archival process **must** run automatically as a periodic server-side job using the existing MLflow job mechanisms
-  - The archival scheduler **should** run on a fixed interval such as every 5 minutes
+  - The archival scheduler interval **must** be configurable by the admin and **should** default to a reasonable fixed interval such as every 5 minutes
+  - The server **must** provide a configuration switch to disable the trace archival scheduler on a given MLflow instance
   - The feature **must** support an admin-set experiment tag `mlflow.trace.archiveNow` with value `true` that causes the experiment to be archived on the next scheduler pass, ahead of ordinary policy-based archival work
+  - When MLflow's Prometheus exporter is enabled, the archival scheduler **should** publish high-level archival metrics through the existing `/metrics` endpoint
+  - The archival scheduler **should** emit a summary log message for each pass (for example, archived X traces in Y minutes)
 - The feature **must** store archived span data in OTLP-compatible protobuf format (`TracesData` message)
 - The feature **must** maintain backward compatibility
   - Retrieving an archived trace **must** transparently fetch span data from the trace repository
@@ -203,7 +206,7 @@ Configuring the per-workspace trace repository and retention overrides will requ
 
 #### Archival Process
 
-Archival is a server-owned periodic job, not a client-triggered workflow. A Huey task runs on a fixed interval such as every 5 minutes and performs archival using the server's own configured backend store, trace repository, and policy settings.
+Archival is a server-owned periodic job, not a client-triggered workflow. A Huey task runs on an admin-configurable interval, with a reasonable default such as every 5 minutes, and performs archival using the server's own configured backend store, trace repository, and policy settings.
 
 At the start of each scheduler pass:
 
@@ -220,6 +223,10 @@ At the start of each scheduler pass:
 **Scheduler overlap:** The periodic archival task should follow MLflow's existing lock-based periodic job pattern. If a previous archival pass is still running when the next scheduled invocation fires, the new invocation is skipped rather than starting a concurrent scheduler pass.
 
 The archival is performed in batches to avoid locking the database for extended periods, and implementations may use bounded concurrency within a pass if needed.
+
+**Multi-replica deployments:** When running multiple MLflow replicas, operators should not enable the archival scheduler on every replica unless they have Huey locks through a shared Redis or other coordination system. The server should expose a configuration switch (for example an environment variable) to disable the trace archival scheduler on instances that should not run it.
+
+**Operational visibility:** When MLflow's Prometheus exporter is enabled, the scheduler should publish high-level archival metrics through the existing `/metrics` endpoint. The scheduler should also emit a summary log message for each pass, for example that it archived X traces in Y minutes, so operators can quickly understand progress without querying metrics first.
 
 #### Retrieval Changes
 
@@ -276,6 +283,8 @@ For `batch_get_traces`, the implementation should partition trace IDs by `SpansL
 The server also owns the default archival retention and the inheritance mode used when an experiment requests a longer retention than the broader-scope policy. The exact option names do not need to be fixed in this RFC, but the design requires:
 
 - a server-level default retention
+- a server-level scheduler interval
+- a server-level switch to enable or disable the trace archival scheduler on that instance
 - a server-level inheritance mode for longer experiment retention
 - the default inheritance mode is to enforce the broader-scope retention
 - a workspace-level retention override
@@ -286,6 +295,7 @@ The server also owns the default archival retention and the inheritance mode use
 | Variable                         | Description                                                                                                                               | Default                           |
 | :------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------- |
 | `MLFLOW_TRACE_ARCHIVAL_LOCATION` | Global destination URI for the trace repository (trace span storage). Overridable per workspace via `workspaces.trace_archival_location`. | Same as the server's effective artifact storage location |
+| `MLFLOW_ENABLE_TRACE_ARCHIVAL_SCHEDULER` | Enables the trace archival scheduler on the current MLflow instance. Useful in multi-replica deployments so only selected replicas run the scheduler. | `true` |
 
 #### Strengths
 
