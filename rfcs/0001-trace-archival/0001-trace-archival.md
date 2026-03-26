@@ -6,14 +6,14 @@ rfc_pr:
 
 ## MLflow OSS Design Template: Trace Data Archival from DB to Artifact Storage
 
-| Author(s)                      | Edson Tirelli |
-| :----------------------------- | :------------ |
-| **Date Last Modified**         | 2026-03-18    |
-| **AI Assistant**               | Claude Code   |
+| Author(s)                      | Edson Tirelli, Matt Prahl |
+| :----------------------------- | :------------------------ |
+| **Date Last Modified**         | 2026-03-26                |
+| **AI Assistant(s)**            | Claude Code, Cursor       |
 
 ## Intro
 
-MLflow Tracing currently stores all span data (the full JSON content of each span) in the tracking database alongside trace metadata. While this approach supports real-time ingestion and SQL-based search, it becomes a significant cost and performance concern at scale—span content can be very large (up to 4 GB per span in MySQL) and dominates database storage. This proposal introduces the ability to archive span data from the database into a trace repository, retaining lightweight metadata in the DB for search while moving bulk span content to cheaper, scalable object stores. The design also introduces configurable retention policies so users can automatically manage trace lifecycle based on age.
+MLflow Tracing currently stores all span data (the full JSON content of each span) in the tracking database alongside trace metadata. While this approach supports real-time ingestion and SQL-based search, it becomes a significant cost and performance concern at scale—span content can be very large (up to 4 GB per span in MySQL) and dominates database storage. This proposal introduces the ability for the server to archive span data from the database into a trace repository, retaining lightweight metadata in the DB for search while moving bulk span content to cheaper, scalable object stores. The design also introduces configurable retention policies so admins can automatically manage trace lifecycle based on age.
 
 ## Feature Request Information
 
@@ -34,11 +34,15 @@ Users need the ability to offload span content to a cheaper trace repository (e.
   - This configuration **can** be set globally, but **must** respect per-workspace overrides (stored in the `workspaces` table; see schema changes below)
 - The feature **must** support archiving span content from the DB to the trace repository based on configurable retention policies
   - Retention policies **must** be set globally; they **may** be overridden per workspace or per experiment
-  - Per-experiment retention **may** be stored as an experiment tag with a defined schema (e.g. `{"type": "time", "value": "30d"}`); the effective retention for a given archival run combines CLI and experiment settings (see Archival Process)
+  - The effective retention for a given experiment **must** be resolved from server, workspace, and experiment settings
+  - If an experiment retention is shorter than the broader-scope retention, the shorter experiment value **must** always be honored
+  - If an experiment retention is longer than the broader-scope retention, the server **must** expose a configuration option to either honor the experiment value or enforce the broader-scope value
+  - The default inheritance behavior **must** be to enforce the broader-scope value rather than honor the longer experiment value
+  - Per-experiment retention **may** be stored as an experiment tag `mlflow.trace.archivalRetention` with a defined schema (e.g. `{"type": "duration", "value": "30d"}`)
   - The archival process **must** support a time-based policy (e.g., archive traces older than N days)
-  - The archival process **should** be triggerable via a CLI command (e.g., `mlflow traces archive`)
-  - The archival process **could** be run automatically via a cron job or similar set by the admin
-- Invoking archival (via REST or CLI) **must** require the caller to be an admin or to have **MANAGE** permission on the workspace(s) targeted by the request; when the request is scoped to a single workspace, only that workspace's MANAGE permission is checked; when using `--all-workspaces`, the caller must have MANAGE on each workspace whose traces are considered (or be an admin)
+  - The archival process **must** run automatically as a periodic server-side job using the existing MLflow job mechanisms
+  - The archival scheduler **should** run on a fixed interval such as every 5 minutes
+  - The feature **must** support an admin-set experiment tag `mlflow.trace.archiveNow` with value `true` that causes the experiment to be archived on the next scheduler pass, ahead of ordinary policy-based archival work
 - The feature **must** store archived span data in OTLP-compatible protobuf format (`TracesData` message)
 - The feature **must** maintain backward compatibility
   - Retrieving an archived trace **must** transparently fetch span data from the trace repository
@@ -76,7 +80,7 @@ This proposal directly addresses the cost and performance gap between "hot" (rec
 
 This serves a broad need. Any user running MLflow Tracing at moderate-to-large scale (>1000 traces/day) will benefit from cost-optimized storage. The feature aligns with MLflow's existing pattern of separating metadata storage (backend store) from bulk data storage (trace repository; may share backend with artifact store), already established for run artifacts.
 
-### Example API
+### Example Configuration
 
 #### CLI: Configure Trace Repository
 
@@ -89,37 +93,25 @@ mlflow server \
   ...
 ```
 
-#### CLI: Archive Old Traces
+#### Policy Resolution Example
 
-Archival is performed **server-side**, analogous to `mlflow traces delete`. The client (CLI or Python) sends a request to the tracking server specified by `MLFLOW_TRACKING_URI`; the server executes the archival using its own configured backend store and trace repository. This is implemented with a **new REST API endpoint** (`POST /mlflow/traces/archive-traces`) that the server implements to run the archival workflow. The endpoint and the `mlflow traces archive` command **must** enforce authorization: only admins or users with **MANAGE** permission on the targeted workspace(s) may invoke archival; when scoped to a single workspace, only that workspace's MANAGE permission is checked. The `AbstractStore` base class defines an `archive_traces()` method and archival primitives (`collect_archive_candidates`, `read_trace_for_archive`, `mark_trace_archived`); `SqlAlchemyStore` implements these primitives, while `RestStore` delegates to the REST endpoint. An orchestrator in `mlflow/tracing/trace_repo.py` coordinates the end-to-end flow (candidate selection, protobuf export, artifact upload, DB cleanup).
+The examples below use bare durations such as `30d` and `7d` for readability. Whatever serialized representation is chosen for workspace and experiment retention should be consistent across both scopes.
 
-When `--older-than` is used, the effective retention threshold per experiment may be overridden by an optional **per-experiment retention** tag on the experiment (e.g. schema `{"type": "time", "value": "30d"}`). By default, the **more aggressive** (shorter retention) of the CLI value and the experiment's value is used (e.g. CLI 30d and experiment 15d → archive at 15d). When the experiment requests a **longer** retention than the CLI (e.g. experiment 45d, CLI 30d), optional flags control behavior: `--honor-experiment-retention` uses the experiment value when it is longer; `--override-experiment-retention` ignores the experiment tag and uses only the CLI value (useful for cron jobs).
+Assume the server default retention is `30d`, workspace `team-a` overrides to `14d`, and experiment `exp-fast` sets `7d`. That experiment archives at `7d`.
 
-```bash
-# Archive span data for traces older than 90 days in a specific workspace
-# (on a workspace-enabled server, --workspace or --all-workspaces is required)
-mlflow traces archive --workspace my-workspace --older-than 90d
+If experiment `exp-long` sets `90d`, the effective retention depends on the server's inheritance mode. The default is to **enforce broader-scope retention**:
 
-# Archive across all workspaces (mirrors mlflow gc --all-workspaces)
-mlflow traces archive --all-workspaces --older-than 90d
+- In **honor experiment retention** mode, `exp-long` archives at `90d`
+- In **enforce broader-scope retention** mode, `exp-long` archives at `14d`
 
-# Archive a single trace by ID
-mlflow traces archive --trace-id abc123
+| Broader scope | Experiment | Inheritance mode | Effective retention |
+| :------------ | :--------- | :--------------- | :------------------ |
+| `30d`         | unset      | any              | `30d`               |
+| `30d`         | `7d`       | any              | `7d`                |
+| `30d`         | `90d`      | honor experiment | `90d`               |
+| `30d`         | `90d`      | enforce broader  | `30d`               |
 
-# Archive traces older than 30 days in a specific experiment
-mlflow traces archive --older-than 30d --experiment-id 42
-
-# Cron job: use CLI value only, ignore per-experiment retention
-mlflow traces archive --workspace my-workspace --older-than 30d --override-experiment-retention
-```
-
-#### Python API
-
-Existing trace retrieval APIs (`get_trace`, `search_traces`) require no changes — they continue to work transparently regardless of whether traces are stored in the database or archived to the trace repository.
-
-A new `archive_traces()` method is added to `TracingClient` (and exposed via `MlflowClient`) so that archival can be triggered programmatically in addition to the CLI. The method accepts the same parameters as the CLI command (`workspace`, `all_workspaces`, `older_than_days`, `trace_id`, `experiment_id`, `honor_experiment_retention`, `override_experiment_retention`) and returns the number of traces archived.
-
-The workspace Python API (`mlflow.create_workspace()`, `mlflow.update_workspace()`, and `MlflowClient` equivalents) accepts a new optional `trace_archival_location` parameter for per-workspace trace repository configuration.
+If an admin sets `mlflow.trace.archiveNow = true` on an experiment, that experiment is processed on the next scheduler pass before ordinary retention-based archival work. The tag is cleared after the server successfully processes that emergency archival pass. If the pass fails, the tag remains so the next scheduler pass can retry it.
 
 ## Decision Matrix
 
@@ -183,39 +175,51 @@ Each `traces.pb` file contains a single `TracesData` message with all spans for 
 
 Traces stay in `TRACKING_STORE` until archival completes (export to repository + clear DB content + set tag to `TRACES_REPO`). If the process crashes mid-archival, the trace remains `TRACKING_STORE` and will be selected again on the next run (re-export overwrites the file, then clear and set tag).
 
-The trace repository URI for archived traces (where to read `traces.pb`) continues to be recorded via the existing `mlflow.artifactLocation` tag when span data is in the trace repository, so retrieval can resolve the path. The **effective trace repository root** for a given trace is the workspace's `trace_archival_location` when set, otherwise the server's global `--trace-archival-location` (or default artifact root).
+The trace repository URI for archived traces (where to read `traces.pb`) continues to be recorded via the existing `mlflow.artifactLocation` tag. The `mlflow.trace.spansLocation` tag disambiguates how that URI is interpreted: when span data is in `ARTIFACT_REPO`, it points to the existing artifact-backed trace path; when span data is in `TRACES_REPO`, it points to the archived trace repository location for `traces.pb`. The **effective trace repository root** for a given trace is the workspace's `trace_archival_location` when set, otherwise the server's global `--trace-archival-location` (or default artifact root).
 
-**Workspaces table: per-workspace trace repository override.** Add a column to the `workspaces` table to store an optional trace archival location (server-side configuration) for each workspace. When set, it overrides the server's global trace repository for that workspace (for both archival write and retrieval). This supports multi-tenant deployments where different workspaces use different trace storage locations.
+**Workspaces table: per-workspace trace repository and retention overrides.** Add a column to the `workspaces` table to store an optional trace archival location (server-side configuration) for each workspace. When set, it overrides the server's global trace repository for that workspace (for both archival write and retrieval). This supports multi-tenant deployments where different workspaces use different trace storage locations.
+
+Add a second nullable workspace-level field for the workspace retention override (for example `trace_archival_retention`). When unset, the workspace inherits the server-level retention. The workspace retention field should use the same retention representation as the experiment-level retention tag `mlflow.trace.archivalRetention`.
 
 ```sql
 ALTER TABLE workspaces
 ADD COLUMN trace_archival_location TEXT NULL;
+
+ALTER TABLE workspaces
+ADD COLUMN trace_archival_retention TEXT NULL;
 ```
 
-- **Semantics:** For a trace in a given workspace, the trace repository root used for archival and for resolving `traces.pb` paths is `workspaces.trace_archival_location` for that workspace if non-NULL, else the server's `--trace-archival-location` (or `--artifacts-destination` when trace archival location is unset).
-- **Existing workspaces:** All existing rows have `trace_archival_location = NULL`, so they use the global trace repository; no backfill is required.
+- **Semantics:** `trace_archival_location` overrides the server trace repository root for that workspace; otherwise the server-level location is used.
+- **Retention:** `trace_archival_retention` overrides the server retention for experiments in that workspace; otherwise the server retention is used.
+- **Existing workspaces:** Existing rows may remain NULL for both fields, in which case they inherit server defaults and require no backfill.
 
-**NOTE:** traces URL resolution follows the same semantics as for artifact location on workspaces. The default, if not overridden at the workspace level, is <default traces root>/workspaces/<workspace name>.
+**NOTE:** traces URL resolution follows the same semantics as for artifact location on workspaces. When `--trace-archival-location` is unset, the default traces root is the server's effective artifact storage location; the default workspace path is `<default traces root>/workspaces/<workspace name>`.
 
-Configuring the per-workspace traces repository override will require adding a **`trace_archival_location`** parameter (or equivalent name) in:
+Configuring the per-workspace trace repository and retention overrides will require adding **`trace_archival_location`** and **`trace_archival_retention`** parameters (or equivalent names) in:
 
-- **Python API:** `mlflow.create_workspace()` and `mlflow.update_workspace()` (and the corresponding `MlflowClient` methods) must accept an optional `trace_archival_location` argument; when provided, it is persisted to the workspace record. Add field to the Workspaces base class as well.
-- **REST API:** The CreateWorkspace and UpdateWorkspace request messages (and responses) must include an optional `trace_archival_location` field so that clients can set or clear the workspace-level trace repository URI when creating or updating a workspace.
-- **UI:** The create-workspace and edit-workspace flows must include a field for the optional trace archival location (e.g. "Trace archival location"), analogous to the existing default artifact root field, so that admins can configure it when creating or updating a workspace.
+- **Python API:** `mlflow.create_workspace()` and `mlflow.update_workspace()` (and the corresponding `MlflowClient` methods) must accept optional `trace_archival_location` and `trace_archival_retention` arguments; when provided, they are persisted to the workspace record. Add fields to the Workspaces base class as well.
+- **REST API:** The CreateWorkspace and UpdateWorkspace request messages (and responses) must include optional `trace_archival_location` and `trace_archival_retention` fields so that clients can set or clear the workspace-level trace repository URI and retention when creating or updating a workspace.
+- **UI:** The create-workspace and edit-workspace flows must include fields for the optional trace archival location and trace archival retention so that admins can configure them when creating or updating a workspace.
 
 #### Archival Process
 
-**Note:** Archival is exposed as a subcommand of `mlflow traces`: `mlflow traces archive`. This aligns with other trace lifecycle commands such as `mlflow traces delete`: the client calls the tracking server via `MLFLOW_TRACKING_URI`, and a **new REST API endpoint** (`POST /mlflow/traces/archive-traces`) is required so that the server performs the archival workflow using its own backend store and trace repository. This endpoint **must** enforce that only admins or users with **MANAGE** permission on the targeted workspace(s) may invoke archival. The `archive` subcommand accepts the policy option `--older-than`, scoping options `--trace-id` (archive a single trace) and `--experiment-id` (limit to one experiment), optional retention behavior flags `--honor-experiment-retention` and `--override-experiment-retention` (see per-experiment retention above), and **workspace targeting** that mirrors `mlflow gc`: the user must specify either **`--workspace <workspace_name>`** (apply the policy to that workspace only) or **`--all-workspaces`** (apply the policy across all workspaces). If neither `--workspace` nor `--all-workspaces` is set and the server has workspaces enabled, the command **must fail** (active workspace is required). See previous examples above.
+Archival is a server-owned periodic job, not a client-triggered workflow. A Huey task runs on a fixed interval such as every 5 minutes and performs archival using the server's own configured backend store, trace repository, and policy settings.
 
-The archival process runs via `mlflow traces archive` and performs:
+At the start of each scheduler pass:
 
-1. **Select traces to archive:** Query `trace_info` for traces matching the retention policy (older than N days). For each experiment, the server resolves the effective "older than" threshold from (a) the CLI `--older-than`, (b) the experiment's retention tag (if present and parseable; e.g. `{"type": "time", "value": "30d"}`), and (c) the chosen behavior: by default use the **more aggressive** (shorter retention) of CLI and experiment value; with `--honor-experiment-retention` use the experiment value when it is longer than the CLI; with `--override-experiment-retention` use only the CLI value. Only traces older than that effective threshold and whose `mlflow.trace.spansLocation` tag is `TRACKING_STORE` (or missing, treated as TRACKING_STORE) are candidates.
-2. **Export span content:** For each trace, read all spans from the `spans` table, convert to `TracesData` protobuf, and write to the trace repository. The trace repository root used for the write is the workspace's `trace_archival_location` (if set) for that trace's experiment/workspace, else the server's global trace archival location. Record the trace repository location via the existing `mlflow.artifactLocation` tag (or equivalent) for the trace.
-3. **Clear DB span content and set tag:** Update `spans.content` to an empty string and set the trace tag `mlflow.trace.spansLocation` = `SpansLocation.TRACES_REPO`.
+1. **Resolve the workspaces to inspect:** If workspaces are enabled, collect the configured workspaces and randomize their order for the pass to improve fairness across workspaces.
+2. **Process emergency archival first:** Check each workspace for experiments marked with the admin-set experiment tag `mlflow.trace.archiveNow = true` and process those experiments before ordinary retention-based work.
+3. **Resolve the effective retention policy:** For each experiment considered for normal archival, resolve retention from server, workspace, and experiment settings using the inheritance rules described above.
+4. **Select traces to archive:** Query `trace_info` for traces older than the effective threshold whose `mlflow.trace.spansLocation` tag is `TRACKING_STORE` (or missing, treated as `TRACKING_STORE`).
+5. **Export span content:** For each trace, read all spans from the `spans` table, convert to `TracesData` protobuf, and write to the trace repository. The trace repository root used for the write is the workspace's `trace_archival_location` (if set) for that trace's experiment/workspace, else the server's global trace archival location. Record the trace repository location in trace metadata using the same unambiguous representation described above.
+6. **Clear DB span content and set tag:** Update `spans.content` to an empty string and set the trace tag `mlflow.trace.spansLocation` = `SpansLocation.TRACES_REPO`.
+7. **Clear the emergency tag:** If the archival was triggered by `archive now` and the emergency archival pass completes successfully, clear the tag so it behaves as a one-shot failsafe.
 
-**Crash recovery:** Traces remain in `TRACKING_STORE` until step 3 completes. If the process crashes after step 2 but before step 3, those traces are still `TRACKING_STORE` and will be selected again on the next run. The archival then re-exports (overwriting the file) and completes step 3. Re-running on traces already in `TRACES_REPO` is a no-op (they are not candidates). The process is thus crash-safe and idempotent without an intermediate state.
+**Crash recovery:** Traces remain in `TRACKING_STORE` until step 6 completes. If the process crashes after step 5 but before step 6, those traces are still `TRACKING_STORE` and will be selected again on the next run. The archival then re-exports (overwriting the file) and completes step 6. Re-running on traces already in `TRACES_REPO` is a no-op (they are not candidates). If an emergency-tagged experiment does not complete successfully, the tag should remain so a later scheduler pass retries the emergency archival.
 
-The archival is performed in batches to avoid locking the database for extended periods.
+**Scheduler overlap:** The periodic archival task should follow MLflow's existing lock-based periodic job pattern. If a previous archival pass is still running when the next scheduled invocation fires, the new invocation is skipped rather than starting a concurrent scheduler pass.
+
+The archival is performed in batches to avoid locking the database for extended periods, and implementations may use bounded concurrency within a pass if needed.
 
 #### Retrieval Changes
 
@@ -262,24 +266,33 @@ For `batch_get_traces`, the implementation should partition trace IDs by `SpansL
 
 ```
 --trace-archival-location URI             Destination URI for the trace repository (trace span data).
-                              If not specified, traces use --default-artifact-root.
+                              If not specified, traces use the server's effective artifact storage location
+                              (for example --artifacts-destination when configured).
                               Can be overridden per workspace via workspaces.trace_archival_location.
                               Supports the same repository backends as artifacts (S3, GCS, Azure, etc.)
                               Env var: MLFLOW_TRACE_ARCHIVAL_LOCATION
 ```
 
+The server also owns the default archival retention and the inheritance mode used when an experiment requests a longer retention than the broader-scope policy. The exact option names do not need to be fixed in this RFC, but the design requires:
+
+- a server-level default retention
+- a server-level inheritance mode for longer experiment retention
+- the default inheritance mode is to enforce the broader-scope retention
+- a workspace-level retention override
+- an experiment-level retention override
+
 **New environment variables:**
 
 | Variable                         | Description                                                                                                                               | Default                           |
 | :------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------- |
-| `MLFLOW_TRACE_ARCHIVAL_LOCATION` | Global destination URI for the trace repository (trace span storage). Overridable per workspace via `workspaces.trace_archival_location`. | Same as `--artifacts-destination` |
+| `MLFLOW_TRACE_ARCHIVAL_LOCATION` | Global destination URI for the trace repository (trace span storage). Overridable per workspace via `workspaces.trace_archival_location`. | Same as the server's effective artifact storage location |
 
 #### Strengths
 
 - Maximizes cost savings by moving the largest data (span content) to cheap object storage while retaining compact, searchable metadata in the DB
 - Follows the OTel `TracesData` standard for archival format, ensuring interoperability
 - Fully backward compatible—existing APIs work transparently
-- Leverages existing MLflow patterns (trace repository / artifact store abstraction, `mlflow traces` CLI subcommands such as `mlflow traces delete`, trace tag metadata)
+- Leverages existing MLflow patterns (trace repository / artifact store abstraction, server-owned Huey jobs, trace tag metadata)
 - Protobuf binary format is 3–10x more compact than JSON, with fast serialization
 - Idempotent archival process with clear state tracking (`SpansLocation` tag)
 - Time-based retention policy with straightforward semantics
@@ -288,9 +301,10 @@ For `batch_get_traces`, the implementation should partition trace IDs by `SpansL
 #### Risks
 
 - **Increased retrieval latency for archived traces:** Fetching span data from object storage (S3, GCS) adds latency compared to a DB read. This is acceptable for infrequent historical access but should be documented.
-- **No span-level search on archived traces:** After archival, span-level filters (e.g., `span.type = 'LLM'`) won't work against archived span content. Trace-level filters (timestamp, state, tags, metrics) continue to work. This trade-off is inherent to the tiered storage model.
+- **Reduced span-level search on archived traces:** Column-backed span filters may continue to work because span metadata stays in the DB, but JSON-based filters that depend on `spans.content` (for example `span.attributes.*`) no longer work for archived traces. This trade-off is inherent to the tiered storage model.
 - **Trace repository availability:** If the trace repository is unavailable, archived traces cannot be retrieved. This is the same availability model as run artifacts today.
 - **No direct DB size control:** Time-based archival does not directly cap database size. If trace volume or size per trace varies significantly, a time-based policy might leave more or less data in the DB than expected. A size-based policy is planned as a future enhancement (see [Future Enhancements: Size-based Archival Policy](#size-based-archival-policy)).
+- **Scheduler lag or skipped passes:** If archival work routinely takes longer than the scheduler interval, later passes are skipped by the lock-based scheduler pattern. This keeps behavior simple, but may delay non-emergency archival under sustained load.
 
 #### Trace Deletion and Archived File Cleanup
 
@@ -366,19 +380,19 @@ Protobuf binary offers the best combination of size reduction, speed, standards 
 
 | Component            | Impact   | Changes Required                                                                                                                                                                                                                                                                                                        |
 | :------------------- | :------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SqlAlchemyStore`    | Moderate | Add `SpansLocation` tag awareness to `get_trace`, `batch_get_traces`; add `_get_traces_repository_uri`, `_load_spans_from_repository`; add archival methods; when selecting candidates, resolve effective retention from experiment tag (e.g. `{"type": "time", "value": "30d"}`) and CLI/flags (see Archival Process). |
+| `SqlAlchemyStore`    | Moderate | Add `SpansLocation` tag awareness to `get_trace`, `batch_get_traces`; add `_get_traces_repository_uri`, `_load_spans_from_repository`; add archival methods; when selecting candidates, resolve effective retention from server, workspace, and experiment policy (see Archival Process). |
 | `FileStore`          | None     | Not supported for archival (archival requires `SqlAlchemyStore`); no changes needed                                                                                                                                                                                                                                     |
-| `AbstractStore`      | Moderate | Add `archive_traces` method and archival primitives (`collect_archive_candidates`, `read_trace_for_archive`, `mark_trace_archived`, `find_archived_trace_uris`, `get_trace_repository_artifact_uri`)                                                                                                                    |
-| `mlflow traces` CLI  | Low      | Add `archive` subcommand with `--older-than`, `--trace-id`, `--experiment-id`, optional `--honor-experiment-retention` and `--override-experiment-retention`, and workspace targeting: `--workspace <name>` or `--all-workspaces` (mirroring `mlflow gc`); fail when workspaces are enabled and neither is set.         |
-| `mlflow server` CLI  | Low      | Add `--trace-archival-location` option                                                                                                                                                                                                                                                                                  |
-| REST API handlers    | Low      | Add new endpoint (e.g. `POST /mlflow/traces/archive-traces`) so that archival is invoked by the client and executed server-side; handler calls tracking store's archive method. Endpoint **must** require MANAGE permission at workspace level (or admin).                                                              |
+| `AbstractStore`      | Moderate | Add archival primitives used by the server-owned scheduler (`collect_archive_candidates`, `read_trace_for_archive`, `mark_trace_archived`, `find_archived_trace_uris`, `get_trace_repository_artifact_uri`)                                                                                                              |
+| Server jobs / Huey   | Moderate | Add a periodic archival task that resolves policy, prioritizes emergency `archive now` work, randomizes workspace order when workspaces are enabled, and skips overlapping runs via the existing lock-based scheduler pattern                                                                                              |
+| `mlflow server` CLI  | Low      | Add `--trace-archival-location` and server-owned archival policy configuration                                                                                                                                                                                                                                          |
+| REST API handlers    | Low      | No new client-triggered archival endpoint is required, but existing retrieval handlers gain dispatch logic for archived traces                                                                                                                                                                                           |
 | Proto definitions    | Low      | Extend `SpansLocation` enum (TRACES_REPO); trace tags already expose `mlflow.trace.spansLocation` in `TraceInfoV3`                                                                                                                                                                                                      |
-| DB migrations        | Low      | Alembic migration: add `trace_archival_location` (TEXT, nullable) on `workspaces` for per-workspace trace repository override.                                                                                                                                                                                          |
-| `search_traces`      | Low      | Span-level filters naturally exclude archived traces (empty `content`)                                                                                                                                                                                                                                                  |
-| Python client        | Low      | `get_trace` / `search_traces` APIs unchanged; add `TracingClient.archive_traces()` (and `MlflowClient` equivalent) for programmatic archival                                                                                                                                                                            |
-| Workspace Python API | Low      | Add optional `trace_archival_location` parameter to `mlflow.create_workspace()` and `mlflow.update_workspace()` (and `MlflowClient` equivalents) for per-workspace trace repository override.                                                                                                                           |
-| Workspace REST API   | Low      | Add optional `trace_archival_location` field to CreateWorkspace and UpdateWorkspace request/response messages and handlers.                                                                                                                                                                                             |
-| UI (workspaces)      | Low      | Add optional "Trace archival location" field to create-workspace and edit-workspace flows, analogous to default artifact root.                                                                                                                                                                                          |
+| DB migrations        | Low      | Alembic migration: add `trace_archival_location` (TEXT, nullable) and `trace_archival_retention` (TEXT, nullable) on `workspaces` for per-workspace trace repository and retention overrides.                                                                                                                          |
+| `search_traces`      | Low      | Trace-level and column-backed span filters continue to work from retained DB metadata; JSON-based span filters naturally exclude archived traces once `spans.content` is cleared                                                                                                                                         |
+| Python client        | Low      | `get_trace` / `search_traces` APIs unchanged; no new archival trigger API required                                                                                                                                                                                                                                       |
+| Workspace Python API | Low      | Add optional `trace_archival_location` and `trace_archival_retention` parameters to `mlflow.create_workspace()` and `mlflow.update_workspace()` (and `MlflowClient` equivalents) for per-workspace trace repository and retention overrides.                                                                         |
+| Workspace REST API   | Low      | Add optional `trace_archival_location` and `trace_archival_retention` fields to CreateWorkspace and UpdateWorkspace request/response messages and handlers.                                                                                                                                                            |
+| UI (workspaces)      | Low      | Add optional "Trace archival location" and "Trace archival retention" fields to create-workspace and edit-workspace flows, analogous to existing workspace-level storage configuration.                                                                                                                                 |
 | UI                   | None     | Trace detail view works transparently                                                                                                                                                                                                                                                                                   |
 
 ---
@@ -387,16 +401,7 @@ Protobuf binary offers the best combination of size reduction, speed, standards 
 
 ### Size-based Archival Policy
 
-Phase 1 supports only time-based archival (`--older-than`). A future enhancement would add a size-based policy that archives traces when total span content in the DB exceeds a configurable cap.
-
-**CLI:**
-
-```bash
-# Archive oldest traces until DB span content is under 10 GB
-mlflow traces archive --workspace my-workspace --max-db-size 10GB
-```
-
-**Python API:** Add `max_db_size_mb` parameter to `TracingClient.archive_traces()` and `MlflowClient.archive_traces()`.
+Phase 1 supports only time-based archival. A future enhancement could add a size-based server policy that archives traces when total span content in the DB exceeds a configurable cap.
 
 **Schema change:** Add a `content_size` column (`BIGINT`, default 0) on the `spans` table to store the byte length of `content` at write time, so size-based archival can use `SUM(content_size)` instead of `SUM(LENGTH(content))` for efficiency. An Alembic migration would add the column and backfill existing rows.
 
@@ -405,7 +410,7 @@ ALTER TABLE spans
 ADD COLUMN content_size BIGINT NOT NULL DEFAULT 0;
 ```
 
-**Selection logic:** Compute total span content size per workspace/experiment, determine how much to reduce, then select the oldest traces (ordered by `timestamp_ms` ascending) until the reduction target is met.
+**Selection logic:** Compute total span content size per workspace or experiment, determine how much to reduce, then select the oldest traces (ordered by `timestamp_ms` ascending) until the reduction target is met.
 
 **Key considerations:**
 
