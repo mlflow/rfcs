@@ -26,7 +26,7 @@ into three layers: the `@job` decorator declares job metadata, the
 `AbstractJobExecutor` interface defines the backend contract, and an
 MLflow-owned framework handles routing, lifecycle, locking, retries, scheduling,
 and recovery. Huey will no longer be the core abstraction. Instead, core MLflow
-will ship with a lightweight `SubprocessJobExecutor`, while remote executors
+will ship with a lightweight `LocalJobExecutor`, while remote executors
 such as Docker and Kubernetes will be defined in a follow-up RFC against the
 same framework.
 
@@ -176,7 +176,11 @@ The core types are also simplified around that split:
   `_PythonEnv` shape rather than introducing a separate parallel configuration
   object. If pip index configuration or similar settings need to be modeled,
   they should be added by extending `_PythonEnv` rather than by defining a new
-  executor-specific config type.
+  executor-specific config type. For executors in this RFC, the `python` field
+  in `_PythonEnv` should be treated as advisory for now: each deployment pins to
+  one baseline Python version and uses `_PythonEnv` primarily for extra package
+  installation. Support for multiple Python versions per deployment can be added
+  later if there is a strong need.
 
 The framework-level enums used by the interface are intentionally small:
 
@@ -305,11 +309,10 @@ The initial routing model is intentionally small:
 
 The router is configured by these framework-level settings:
 
-- `MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND`, which defaults to `subprocess`
+- `MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND`, which defaults to `local`
 - `MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND`, which is optional and controls
   where custom scorers run
-- `MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS`, which defaults to `false`; the matching
-  CLI flag is `mlflow server --enable-custom-scorers`
+- `MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS`, which defaults to `false`
 
 Any number of executor entrypoints may be installed in the environment, but the
 supported routing model is intentionally smaller: one required active backend
@@ -356,12 +359,12 @@ existing job row:
 | `jobs`             | `executor_backend`                                     | Persisted backend selection for retry, cancellation, and recovery                   |
 | `jobs`             | `lease_expires_at`                                     | Short-lived lease for `RUNNING` jobs so stale work can enter recovery               |
 | `jobs`             | `status_message`, progress fields                      | Optional latest progress metadata for operators and UI                              |
-| `job_locks`        | `lock_key`, `job_id`, `acquired_at`                    | Exclusive job locking across replicas such as for exclusive locks on experiment IDs |
+| `job_locks`        | `lock_key`, `job_id`, `acquired_at`                    | Exclusive job locking across replicas; `lock_key` is framework-computed per type    |
 | `scheduler_leases` | `lease_key`, `holder_id`, `acquired_at`, `ttl_seconds` | Single-leader scheduler lease for discovery                                         |
 
 The table above summarizes the new shared framework tables and job-row fields.
-For optional progress reporting, the added progress fields are
-`progress_payload` and `progress_updated_at`. Additional auth-specific job-row
+For optional progress reporting, the added fields are `status_message`,
+`progress_payload`, and `progress_updated_at`. Additional auth-specific job-row
 state for remote execution is defined later in this RFC as part of the remote
 executor contract.
 
@@ -425,9 +428,12 @@ The framework path replaces Huey's role as the lifecycle owner.
    `JobExecutorRouter`.
 3. Create the job row in `PENDING`, storing `executor_backend`.
 4. Instead of spawning a new background thread for each submitted job, each
-   replica has a long-lived worker loop that acquires a job row claim via a
-   conditional `PENDING -> RUNNING` transition, then invokes
-   `framework_run_job(job_id)`.
+   replica runs long-lived worker capacity that claims queued jobs and invokes
+   `framework_run_job(job_id)`. Claiming is capacity-aware by job type: a
+   worker only claims jobs for types whose local `max_workers` budget still has
+   free capacity, so one busy job type cannot monopolize execution slots for
+   another. The exact implementation may use a shared worker loop or separate
+   per-job-type loops; that is an implementation detail outside this RFC.
 
 `framework_run_job(job_id)` is the single lifecycle loop for all backends:
 
@@ -444,7 +450,9 @@ The framework path replaces Huey's role as the lifecycle owner.
    the queued job, while the exclusivity lock protects the higher-level key,
    such as one experiment's scoring work. If the exclusivity lock cannot be
    acquired, mark the claimed job `CANCELED` and exit without launching backend
-   work.
+   work. That cancellation is terminal for that job row and is not retried; if
+   the underlying scheduled work still exists, a later scheduler discovery cycle
+   creates a fresh `PENDING` job row.
 4. Call `executor.submit_job(...)`.
 5. While the job remains `RUNNING`, renew its short-lived job lease so the
    scheduler can distinguish healthy monitored work from stale work whose
@@ -458,7 +466,7 @@ The framework path replaces Huey's role as the lifecycle owner.
    - permanent `FAILED` results transition to failed
    - `TIMEOUT` transitions to timed out
    - `CANCELED` is treated as a no-op because the terminal state was already set
-     by the canceller
+     by the canceller. `CANCELED` jobs are never retried by the retry loop.
 8. Release the exclusive lock if the job held one.
 
 Cancellation follows the same framework-controlled ordering for all backends. The
@@ -506,8 +514,8 @@ This section uses four coordination terms:
 
 - **Job row claim**: the worker's conditional `PENDING -> RUNNING` transition
   that gives one MLflow instance ownership of a queued job row
-- **Exclusivity lock**: the higher-level lock stored in `job_locks`, typically
-  for a key such as an experiment ID
+- **Exclusivity lock**: the higher-level lock stored in `job_locks`, for a
+  framework-computed key such as an experiment ID or workspace
 - **Job lease**: the short-lived `RUNNING`-job lease tracked by
   `lease_expires_at`, used to detect stale monitored work
 - **Scheduler lease**: the single-leader discovery lease stored in
@@ -528,6 +536,8 @@ lock is already held, acquisition succeeds only when the holding job is already
 terminal or when the lock is stale based on the holding job's timeout plus the
 same 15% grace window used by stale-job recovery. If the lock cannot be
 acquired, the claimed job is marked `CANCELED` without launching backend work.
+That canceled row is not retried; later scheduler rediscovery is responsible for
+creating a fresh job row if the work still needs to run.
 Lock release happens after the framework execution loop reaches terminal state.
 The scheduler does not clear exclusivity locks directly; stale lock cleanup
 remains part of `JobLockManager.acquire()` so there is only one place that
@@ -548,7 +558,7 @@ in-process, and uses the new `scheduler_leases` table to acquire the scheduler
 lease for discovery work. The scheduler-lease holder is responsible for finding
 new work and creating `PENDING` job rows. Every replica then runs its own worker
 loop that can win job row claims from the shared queue and execute them. This
-preserves horizontal execution scale for backends such as subprocess and Docker
+preserves horizontal execution scale for backends such as local and Docker
 even though discovery itself is single-leader. `MLFLOW_DISABLE_SCHEDULER=true`
 remains the escape hatch for API-only replicas.
 
@@ -605,19 +615,21 @@ flowchart TD
     exclusive -->|yes| lock["Acquire exclusivity lock"]
     exclusive -->|no| submit["Submit to executor"]
     lock -->|lock acquired| submit
-    lock -->|lock busy| cancel["Mark CANCELED"]
+    lock -->|lock busy| cancel["Mark CANCELED (terminal)"]
     submit --> wait["Wait for result"]
     wait --> terminal["Persist outcome"]
 ```
 
 ### Built-in executor and the Huey refactor
 
-The built-in executor is `SubprocessJobExecutor`. It is the default backend for
+The built-in executor is `LocalJobExecutor`. It is the default backend for
 core MLflow and is intended to be zero-dependency.
 
 Its responsibilities are intentionally narrow:
 
 - `submit_job()` spawns a subprocess that runs the existing job entry point
+- the subprocess uses the deployment's baseline Python version rather than
+  provisioning a per-job Python version from `_PythonEnv.python`
 - `wait_for_job()` blocks on process exit and translates the outcome into
   `JobResult`
 - `cancel_job()` terminates the subprocess
@@ -627,12 +639,15 @@ Its responsibilities are intentionally narrow:
 
 Per-job-type concurrency is still respected through `max_workers`, but the
 control point moves from Huey's worker pool to framework-managed semaphores keyed
-by job type.
+by job type. This is also the intended fairness boundary: one hot job type
+should not consume slots reserved for another. The RFC does not require a
+literal one-loop-per-job-type design as long as the claim logic remains
+capacity-aware by job type.
 
 This refactor removes Huey as a required internal dependency for the job
 system. Huey consumer entry points, queue dispatch logic, and the periodic task
 consumer are replaced by framework-managed threads and the
-`SubprocessJobExecutor`. The behavioral goal is not to change the user-facing
+`LocalJobExecutor`. The behavioral goal is not to change the user-facing
 scheduling model. Architecturally, the goal is to stop treating Huey as the
 abstraction that defines what a job backend is.
 
@@ -965,7 +980,7 @@ but delegates the shared queue and normal exclusivity locking to Huey. In this
 model, MLflow would still own the scheduler lease and use it to perform
 leader-elected discovery and stale-lock cleanup, while `SqlHuey` could provide
 shared dispatch on PostgreSQL and MySQL/MariaDB deployments and `lock_task()`
-could provide exclusive locking. `SubprocessJobExecutor` could remain the
+could provide exclusive locking. `LocalJobExecutor` could remain the
 built-in executor, with Huey acting only as the dispatch layer in front of it.
 
 The main benefit of this alternative is that it avoids introducing a custom
@@ -1024,8 +1039,8 @@ security model in exactly the path where MLflow needs a clearer boundary.
 The intended rollout is:
 
 1. Land the core framework, router, lock manager, scheduler, and
-   `SubprocessJobExecutor`.
-2. Keep `subprocess` as the built-in default for
+   `LocalJobExecutor`.
+2. Keep `local` as the built-in default for
    `MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND`.
 3. Leave `MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS` disabled by default and
    `MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND` unset by default so the current
@@ -1047,10 +1062,4 @@ is introduced by the core design.
 
 # Open questions
 
-1. Should remote backends honor the `python` field inside `_PythonEnv`, or
-   should they treat it as advisory and pin to a single worker baseline Python
-   version? The current `python_env` shape still seems useful for extra package
-   installation, but fully honoring the Python-version field increases the
-   complexity of remote backends because Docker and Kubernetes would then need
-   an image strategy for multiple Python versions rather than a single baseline.
-2. Should we adopt the hybrid Huey approach or remove Huey as a dependency?
+1. Should we adopt the hybrid Huey approach or remove Huey as a dependency?
