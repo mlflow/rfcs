@@ -215,6 +215,14 @@ class JobResult:
 
 
 @dataclass
+class JobProgress:
+    phase: str | None = None
+    completed: int | None = None
+    total: int | None = None
+    unit: str | None = None
+
+
+@dataclass
 class JobExecutionContext:
     job_id: str
     tracking_uri: str
@@ -347,12 +355,15 @@ existing job row:
 | `jobs`             | `error_message`                                        | Human-readable terminal error for operators and UI                                  |
 | `jobs`             | `executor_backend`                                     | Persisted backend selection for retry, cancellation, and recovery                   |
 | `jobs`             | `lease_expires_at`                                     | Short-lived lease for `RUNNING` jobs so stale work can enter recovery               |
+| `jobs`             | `status_message`, progress fields                      | Optional latest progress metadata for operators and UI                              |
 | `job_locks`        | `lock_key`, `job_id`, `acquired_at`                    | Exclusive job locking across replicas such as for exclusive locks on experiment IDs |
 | `scheduler_leases` | `lease_key`, `holder_id`, `acquired_at`, `ttl_seconds` | Single-leader scheduler lease for discovery                                         |
 
 The table above summarizes the new shared framework tables and job-row fields.
-Additional auth-specific job-row state for remote execution is defined later in
-this RFC as part of the remote executor contract.
+For optional progress reporting, the added progress fields are
+`progress_payload` and `progress_updated_at`. Additional auth-specific job-row
+state for remote execution is defined later in this RFC as part of the remote
+executor contract.
 
 The framework state machine also introduces a non-terminal `NEEDS_RECOVERY`
 status for jobs whose backend work may still exist but whose current monitoring
@@ -361,7 +372,8 @@ needing per-replica owner fields on the job row.
 
 ### Store interface changes
 
-The framework also relies on one explicit store-level API for result reporting:
+The framework relies on one explicit store-level API for terminal result
+reporting and one optional API for in-flight progress reporting:
 
 ```python
 def report_job_result(
@@ -379,6 +391,22 @@ reports its result back to MLflow. Remote executors reach it through the
 framework result-reporting endpoint defined later in this RFC. The built-in
 local executor may instead return a `JobResult` directly to the framework
 without persisting it first.
+
+```python
+def report_job_progress(
+    self,
+    job_id: str,
+    message: str | None = None,
+    progress: JobProgress | None = None,
+) -> None: ...
+```
+
+This API is optional and exists only for jobs that want to surface best-effort
+progress while they are still `RUNNING`. It does not change the framework-owned
+lifecycle state, retry behavior, or terminal outcome. Progress updates replace
+the latest stored progress metadata rather than appending history. When the
+framework records a terminal outcome, it clears any stored progress metadata for
+that job.
 
 This design also replaces the old bundled `retry_or_fail_job(...)` behavior.
 Retry classification still comes from the job result, but the retry decision is
@@ -422,7 +450,7 @@ The framework path replaces Huey's role as the lifecycle owner.
    scheduler can distinguish healthy monitored work from stale work whose
    monitoring loop has disappeared.
 6. Block on `executor.wait_for_job(job_id)`.
-7. Apply the returned `JobResult`:
+7. Apply the returned `JobResult` and clear any stored progress metadata:
    - `SUCCEEDED` transitions the job to finished and persists any checkpoint
      passed in `params`
    - transient `FAILED` results re-enter `PENDING` and become eligible for
@@ -435,7 +463,8 @@ The framework path replaces Huey's role as the lifecycle owner.
 
 Cancellation follows the same framework-controlled ordering for all backends. The
 framework first sets the job row to `CANCELED`, which immediately invalidates
-any token-backed access for remote execution, and then calls
+any token-backed access for remote execution, clears any stored progress
+metadata, and then calls
 `executor.cancel_job(job_id)` to stop the backend work. `wait_for_job()`
 unblocks as a consequence of the backend work terminating, and the framework
 treats the eventual return as a no-op because the terminal state is already
@@ -763,6 +792,39 @@ on a local executor.
 The frontend should learn that state from a new field on the `server-info`
 endpoint rather than inferring it locally. That field should explicitly indicate
 whether direct (non-Gateway) model usage is supported for these flows.
+
+If a job type uses optional progress reporting, the UI may also surface the
+latest job `status_message` or structured `progress_payload`. The structured
+payload should follow the `JobProgress` shape so shared UI can render common
+progress indicators consistently. The exact UX for displaying in-progress job
+progress is deferred from this RFC because it needs separate UX design.
+
+#### Optional progress reporting
+
+Long-running jobs may optionally report best-effort progress through a dedicated
+framework endpoint while they are still running:
+
+```json
+{
+  "message": "Processed 42 / 100 traces",
+  "progress": {
+    "phase": "scoring",
+    "completed": 42,
+    "total": 100,
+    "unit": "traces"
+  }
+}
+```
+
+The endpoint is `POST /api/3.0/jobs/{job_id}/progress`. It is authenticated
+with the same job ID and token headers as the result-reporting endpoint and is
+a thin wrapper around `job_store.report_job_progress(...)`.
+
+This endpoint is optional. Jobs that do not report progress continue to work
+normally. Progress updates are best-effort, do not change `JobStatus`, and
+overwrite the latest stored progress metadata rather than appending a full
+history. When the framework records a terminal outcome, it clears
+`status_message`, `progress_payload`, and `progress_updated_at` for that job.
 
 #### Result reporting
 
