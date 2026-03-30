@@ -8,7 +8,7 @@ rfc_pr:
 
 | Author(s)                      | Edson Tirelli, Matt Prahl |
 | :----------------------------- | :------------------------ |
-| **Date Last Modified**         | 2026-03-26                |
+| **Date Last Modified**         | 2026-03-30                |
 | **AI Assistant(s)**            | Claude Code, Cursor       |
 
 ## Intro
@@ -36,17 +36,18 @@ Users need the ability to offload span content to a cheaper archival repository 
   - Retention policies **must** be set globally; they **may** be overridden per workspace or per experiment
   - The effective retention for a given experiment **must** be resolved from server, workspace, and experiment settings
   - If an experiment retention is shorter than the broader-scope retention, the shorter experiment value **must** always be honored
-  - If an experiment retention is longer than the broader-scope retention, the server **must** expose a configuration option to either honor the experiment value or enforce the broader-scope value
-  - The default inheritance behavior **must** be to enforce the broader-scope value rather than honor the longer experiment value
-  - Per-experiment retention **may** be stored as an experiment tag `mlflow.trace.archivalRetention` with a defined schema where the `value` field uses the duration grammar `<int><unit>`, with `<unit>` one of `ms`, `s`, `m`, `h`, or `d` (e.g. `{"type": "duration", "value": "30d"}`)
-  - The archival process **must** support a time-based policy expressed as an age duration or cutoff timestamp (for example, archive traces older than `30d` or `100000s`)
+  - If an experiment retention is longer than the broader-scope retention, the server **must** expose an environment-variable allowlist of experiment IDs whose longer retention values may be honored
+  - Experiments not present in that allowlist **must** use the broader-scope retention instead of their longer experiment-level value
+  - Per-experiment retention **may** be stored as an experiment tag `mlflow.trace.archivalRetention` with a defined schema where the `value` field uses the duration grammar `<int><unit>`, with `<unit>` one of `m`, `h`, or `d` (e.g. `{"type": "duration", "value": "30d"}`)
+  - The archival process **must** support a time-based policy expressed as an age duration or cutoff timestamp (for example, archive traces older than `30d` or `12h`)
   - The archival process **must** run automatically as a periodic server-side job using the existing MLflow job mechanisms
   - The archival scheduler interval **must** be configurable by the admin and **should** default to a reasonable fixed interval such as every 5 minutes
   - The server **must** provide a configuration switch to disable the trace archival scheduler on a given MLflow instance
-  - The feature **must** support an experiment tag `mlflow.trace.archiveNow` with value `true` that causes the experiment to be archived on the next scheduler pass, ahead of ordinary policy-based archival work
-  - Because this uses normal experiment-tag mutation semantics, any user who can edit experiment tags may set it; this is acceptable because it accelerates archival rather than deleting trace records
+  - The feature **must** support an experiment tag `mlflow.trace.archiveNow` whose value is a JSON object; the object may include an optional `older_than` field using the same duration grammar, and it causes the experiment to be archived on the next scheduler pass ahead of ordinary policy-based archival work
+  - Because this uses normal experiment-tag mutation semantics, any user who can edit experiment tags may set it; this is acceptable because it archives span content without deleting trace records, archived traces remain retrievable, and trace metadata stays searchable
   - When MLflow's Prometheus exporter is enabled, the archival scheduler **should** publish high-level archival metrics through the existing `/metrics` endpoint
   - The archival scheduler **should** emit a summary log message for each pass (for example, archived X traces in Y minutes)
+  - The feature **must** mark malformed traces as not archivable, surface that state to users via trace metadata, and exclude those traces from automatic retries until manual intervention clears the failure marker
 - The feature **must** store archived span data in OTLP-compatible protobuf format (`TracesData` message)
 - The feature **must** maintain backward compatibility
   - Retrieving an archived trace **must** transparently fetch span data from the archival repository
@@ -108,33 +109,46 @@ mlflow experiments create \
 # Update archival retention on an existing experiment
 mlflow experiments update \
   --experiment-id 42 \
-  --trace-archival-retention 100000s
+  --trace-archival-retention 12h
 
 # Mark an experiment for priority archival on the next scheduler pass
 mlflow experiments update \
   --experiment-id 42 \
   --trace-archive-now
+
+# Mark only traces older than 1 day in an experiment for priority archival
+mlflow experiments update \
+  --experiment-id 42 \
+  --trace-archive-now-older-than 1d
 ```
 
 #### Policy Resolution Example
 
-Retention durations use the grammar `<int><unit>`, where `unit` is one of `ms`, `s`, `m`, `h`, or `d`. Examples include `30d`, `7d`, and `100000s`. The same representation should be used consistently across server, workspace, and experiment retention settings.
+Retention durations use the grammar `<int><unit>`, where `unit` is one of `m`, `h`, or `d`. Examples include `30d`, `7d`, and `12h`. The same representation should be used consistently across server, workspace, and experiment retention settings.
 
 Assume the server default retention is `30d`, workspace `team-a` overrides to `14d`, and experiment `exp-fast` sets `7d`. That experiment archives at `7d`.
 
-If experiment `exp-long` sets `90d`, the effective retention depends on the server's inheritance mode. The default is to **enforce broader-scope retention**:
+If experiment `exp-long` sets `90d`, the effective retention depends on whether its experiment ID is present in the server's `MLFLOW_TRACE_ARCHIVAL_LONG_RETENTION_ALLOWLIST` environment variable:
 
-- In **honor experiment retention** mode, `exp-long` archives at `90d`
-- In **enforce broader-scope retention** mode, `exp-long` archives at `14d`
+- If `exp-long` is allowlisted, it archives at `90d`
+- If `exp-long` is not allowlisted, the broader-scope retention is enforced and it archives at `14d`
 
-| Broader scope | Experiment | Inheritance mode | Effective retention |
-| :------------ | :--------- | :--------------- | :------------------ |
-| `30d`         | unset      | any              | `30d`               |
-| `30d`         | `7d`       | any              | `7d`                |
-| `30d`         | `90d`      | honor experiment | `90d`               |
-| `30d`         | `90d`      | enforce broader  | `30d`               |
+| Broader scope | Experiment | Allowlisted? | Effective retention |
+| :------------ | :--------- | :----------- | :------------------ |
+| `30d`         | unset      | n/a          | `30d`               |
+| `30d`         | `7d`       | n/a          | `7d`                |
+| `30d`         | `90d`      | yes          | `90d`               |
+| `30d`         | `90d`      | no           | `30d`               |
 
-If a user with permission to edit experiment tags sets `mlflow.trace.archiveNow = true` on an experiment, that experiment is processed on the next scheduler pass before ordinary retention-based archival work. The tag is cleared after the server successfully processes that emergency archival pass. If the pass fails, the tag remains so the next scheduler pass can retry it.
+If a user with permission to edit experiment tags sets `mlflow.trace.archiveNow = {}` on an experiment, that experiment is processed on the next scheduler pass before ordinary retention-based archival work. If the user instead sets `mlflow.trace.archiveNow = {"older_than": "1d"}`, the emergency pass only targets traces in that experiment older than the requested threshold. The tag is cleared after the server successfully processes that emergency archival pass. If the pass fails, the tag remains so the next scheduler pass can retry it.
+
+#### UI: Surface Resolved Retention
+
+Because retention inheritance is implicit, the server should compute the resolved trace archival retention for each experiment and surface it through the get and list experiments APIs. The experiment UI should display that resolved value so users can see which retention is actually in effect, even when the final answer comes from server or workspace configuration rather than from an experiment tag.
+
+The experiment info popover shown below is a reasonable place to surface a field such as `Resolved trace archival retention: 14d`.
+
+![Experiment info popover placement for resolved trace archival retention](./experiments-info.png)
 
 ## Decision Matrix
 
@@ -223,6 +237,8 @@ Configuring the per-workspace archival repository and retention overrides will r
 - **Python API:** `mlflow.create_workspace()` and `mlflow.update_workspace()` (and the corresponding `MlflowClient` methods) must accept optional `trace_archival_location` and `trace_archival_retention` arguments; when provided, they are persisted to the workspace record. Add fields to the Workspaces base class as well.
 - **REST API:** The CreateWorkspace and UpdateWorkspace request messages (and responses) must include optional `trace_archival_location` and `trace_archival_retention` fields so that clients can set or clear the workspace-level archival repository URI and retention when creating or updating a workspace.
 - **UI:** The create-workspace and edit-workspace flows must include fields for the optional trace archival location and trace archival retention so that admins can configure them when creating or updating a workspace.
+- **Experiment APIs:** The get and list experiments APIs must include a resolved trace archival retention value computed on the server from the server, workspace, and experiment settings.
+- **UI (experiments):** The experiment details UI should display the resolved trace archival retention value returned by the server so inherited policy is visible to users.
 
 #### Archival Process
 
@@ -231,14 +247,16 @@ Archival is a server-owned periodic job, not a client-triggered workflow. A Huey
 At the start of each scheduler pass:
 
 1. **Resolve the workspaces to inspect:** If workspaces are enabled, collect the configured workspaces and randomize their order for the pass to improve fairness across workspaces.
-2. **Process emergency archival first:** Check each workspace for experiments marked with the experiment tag `mlflow.trace.archiveNow = true` and process those experiments before ordinary retention-based work.
+2. **Process emergency archival first:** Check each workspace for experiments marked with the experiment tag `mlflow.trace.archiveNow` and process those experiments before ordinary retention-based work. When the tag value is `{}` or otherwise omits `older_than`, all traces in `TRACKING_STORE` for that experiment are eligible. When the tag value includes `older_than`, only traces older than that threshold are eligible.
 3. **Resolve the effective retention policy:** For each experiment considered for normal archival, resolve retention from server, workspace, and experiment settings using the inheritance rules described above.
 4. **Select traces to archive:** Query `trace_info` for traces older than the effective threshold whose `mlflow.trace.spansLocation` tag is `TRACKING_STORE` (or missing, treated as `TRACKING_STORE`).
 5. **Export span content:** For each trace, read all spans from the `spans` table, convert to `TracesData` protobuf, and write to the archival repository. The archival repository root used for the write is the workspace's `trace_archival_location` (if set) for that trace's experiment/workspace, else the server's global trace archival location. Record the archival repository location in trace metadata using the same unambiguous representation described above.
 6. **Clear DB span content and set tag:** Update `spans.content` to an empty string and set the trace tag `mlflow.trace.spansLocation` = `SpansLocation.ARCHIVE_REPO`.
 7. **Clear the emergency tag:** If the archival was triggered by `archive now` and the emergency archival pass completes successfully, clear the tag so it behaves as a one-shot failsafe.
 
-**Crash recovery:** Traces remain in `TRACKING_STORE` until step 6 completes. If the process crashes after step 5 but before step 6, those traces are still `TRACKING_STORE` and will be selected again on the next run. The archival then re-exports (overwriting the file) and completes step 6. Re-running on traces already in `ARCHIVE_REPO` is a no-op (they are not candidates). If an emergency-tagged experiment does not complete successfully, the tag should remain so a later scheduler pass retries the emergency archival.
+**Crash recovery:** Traces remain in `TRACKING_STORE` until step 6 completes. If the process crashes after step 5 but before step 6, those traces are still `TRACKING_STORE` and will be selected again on the next run. The archival then re-exports (overwriting the file) and completes step 6. Re-running on traces already in `ARCHIVE_REPO` is a no-op (they are not candidates). If an emergency-tagged experiment does not complete successfully, the tag should remain so a later scheduler pass retries the emergency archival, unless the only remaining non-archived traces are terminal failures marked with `mlflow.trace.archivalFailure`.
+
+**Malformed traces / terminal archival failures:** Some traces may fail archival because their stored span content cannot be converted into valid `TracesData` (for example malformed JSON or invalid span structure). These traces are not archivable. When this happens, the scheduler must leave the trace in `TRACKING_STORE`, set `mlflow.trace.archivalFailure=MALFORMED_TRACE`, and exclude that trace from automatic retries until manual intervention clears that failure field. If an emergency archival pass encounters only terminal failures after exhausting all archivable traces, the server should clear `mlflow.trace.archiveNow` because no further automatic progress is possible. This gives users visibility through normal trace APIs and UI rather than only through server logs.
 
 **Scheduler overlap:** The periodic archival task should follow MLflow's existing lock-based periodic job pattern. If a previous archival pass is still running when the next scheduled invocation fires, the new invocation is skipped rather than starting a concurrent scheduler pass.
 
@@ -300,17 +318,19 @@ For `batch_get_traces`, the implementation should partition trace IDs by `SpansL
                               Env var: MLFLOW_TRACE_ARCHIVAL_LOCATION
 ```
 
-The server also owns the default archival retention and the inheritance mode used when an experiment requests a longer retention than the broader-scope policy. The exact option names do not need to be fixed in this RFC, but the design requires:
+The server also owns the default archival retention and the allowlist used when an experiment requests a longer retention than the broader-scope policy. The exact option names do not need to be fixed in this RFC, but the design requires:
 
 - a server-level default retention
 - a server-level scheduler interval
 - a server-level switch to enable or disable the trace archival scheduler on that instance
-- a server-level inheritance mode for longer experiment retention
-- the default inheritance mode is to enforce the broader-scope retention
+- a server-level environment-variable allowlist of experiment IDs whose longer retention values may exceed broader-scope retention
+- by default the allowlist is empty, so broader-scope retention is enforced
 - a workspace-level retention override
 - an experiment-level retention override
 
-Although archival execution is server-owned, the CLI should still expose experiment-level retention configuration under `mlflow experiments`. Specifically, `mlflow experiments create` and `mlflow experiments update` should accept `--trace-archival-retention <duration>`, where `<duration>` follows the `<int><unit>` grammar described above. In addition, `mlflow experiments update` should accept `--trace-archive-now` as a convenience flag that sets `mlflow.trace.archiveNow=true` on the experiment. This flag does not execute archival directly; it only marks the experiment for priority processing on the next scheduler pass.
+Using an environment variable keeps phase 1 simple, but it means changing the allowlist requires a server restart. A follow-up can move this exemption into an experiment-scoped database column that only admins may set.
+
+Although archival execution is server-owned, the CLI should still expose experiment-level retention configuration under `mlflow experiments`. Specifically, `mlflow experiments create` and `mlflow experiments update` should accept `--trace-archival-retention <duration>`, where `<duration>` follows the `<int><unit>` grammar described above. In addition, `mlflow experiments update` should accept `--trace-archive-now` as a convenience flag that sets `mlflow.trace.archiveNow={}` on the experiment, and `--trace-archive-now-older-than <duration>` as a convenience flag that sets `mlflow.trace.archiveNow` to a JSON object with an `older_than` field. These flags do not execute archival directly; they only mark the experiment for priority processing on the next scheduler pass.
 
 **New environment variables:**
 
@@ -318,6 +338,7 @@ Although archival execution is server-owned, the CLI should still expose experim
 | :------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------- |
 | `MLFLOW_TRACE_ARCHIVAL_LOCATION` | Global destination URI for the archival repository (trace span storage). Overridable per workspace via `workspaces.trace_archival_location`. | Same as the server's effective artifact storage location |
 | `MLFLOW_ENABLE_TRACE_ARCHIVAL_SCHEDULER` | Enables the trace archival scheduler on the current MLflow instance. Useful in multi-replica deployments so only selected replicas run the scheduler. | `true` |
+| `MLFLOW_TRACE_ARCHIVAL_LONG_RETENTION_ALLOWLIST` | Comma-separated experiment IDs whose longer-than-broader `mlflow.trace.archivalRetention` values may be honored. Changing this value requires a server restart in phase 1. | empty |
 
 #### Strengths
 
@@ -422,10 +443,11 @@ Protobuf binary offers the best combination of size reduction, speed, standards 
 | DB migrations        | Low      | Alembic migration: add `trace_archival_location` (TEXT, nullable) and `trace_archival_retention` (TEXT, nullable) on `workspaces` for per-workspace archival repository and retention overrides.                                                                                                                       |
 | `search_traces`      | Low      | Trace-level and column-backed span filters continue to work from retained DB metadata; JSON-based span filters naturally exclude archived traces once `spans.content` is cleared                                                                                                                                         |
 | Python client        | Low      | `get_trace` / `search_traces` APIs unchanged; no new archival trigger API required                                                                                                                                                                                                                                       |
+| Experiment APIs      | Low      | Add a resolved trace archival retention field to get and list experiment responses so clients and UI can display the effective policy                                                                                                                                                                                 |
 | Workspace Python API | Low      | Add optional `trace_archival_location` and `trace_archival_retention` parameters to `mlflow.create_workspace()` and `mlflow.update_workspace()` (and `MlflowClient` equivalents) for per-workspace archival repository and retention overrides.                                                                      |
 | Workspace REST API   | Low      | Add optional `trace_archival_location` and `trace_archival_retention` fields to CreateWorkspace and UpdateWorkspace request/response messages and handlers.                                                                                                                                                            |
 | UI (workspaces)      | Low      | Add optional "Trace archival location" and "Trace archival retention" fields to create-workspace and edit-workspace flows, analogous to existing workspace-level storage configuration.                                                                                                                                 |
-| UI                   | None     | Trace detail view works transparently                                                                                                                                                                                                                                                                                   |
+| UI                   | Low      | Experiment info should surface the resolved trace archival retention, and trace views should expose terminal archival failure metadata for malformed traces                                                                                                                                                             |
 
 ---
 
@@ -450,6 +472,14 @@ ADD COLUMN content_size BIGINT NOT NULL DEFAULT 0;
 - **Backfill required:** Existing rows will have `content_size = 0` until backfilled (e.g. batched `UPDATE spans SET content_size = LENGTH(content) WHERE content_size = 0 AND content != ''`). Until backfilled, size estimates will be inaccurate.
 - **Semantic clarity:** "Max DB size" can be misinterpreted as total database size rather than span content size. Documentation should clarify it refers to the sum of `spans.content` byte lengths.
 - **Combinable with time-based:** Both policies can be used together (e.g. archive traces older than 30 days OR when total size exceeds 10 GB).
+
+---
+
+### Admin-Managed Longer Retention Exemptions
+
+Phase 1 uses `MLFLOW_TRACE_ARCHIVAL_LONG_RETENTION_ALLOWLIST`, a server environment variable containing experiment IDs whose longer-than-broader retention values may be honored. This keeps implementation simple, but it requires a server restart whenever the exemption list changes and does not provide per-experiment auditability.
+
+A future enhancement can replace this with an experiment-scoped database column that records whether the experiment is allowed to exceed broader-scope retention. Only admins should be allowed to set or clear that field through the API and UI.
 
 ---
 
