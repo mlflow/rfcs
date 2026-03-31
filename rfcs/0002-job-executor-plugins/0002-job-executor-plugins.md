@@ -177,7 +177,7 @@ The core types are also simplified around that split:
   object. If pip index configuration or similar settings need to be modeled,
   they should be added by extending `_PythonEnv` rather than by defining a new
   executor-specific config type. For executors in this RFC, the `python` field
-  in `_PythonEnv` should be treated as advisory for now: each deployment pins to
+  in `_PythonEnv` is ignored for now: each deployment pins to
   one baseline Python version and uses `_PythonEnv` primarily for extra package
   installation. Support for multiple Python versions per deployment can be added
   later if there is a strong need.
