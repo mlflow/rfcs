@@ -734,6 +734,8 @@ Each job token is granted only the permissions needed for the job that owns it:
 
 - `EDIT` on the target experiment
 - `USE` on the specific Gateway endpoints referenced by scorer configuration
+- `READ` on any prompts referenced by scorer configuration or declared through
+  `@scorer(required_resources=...)`
 - implicit access to report results for that specific `job_id`
 
 Remote executors do not receive provider API keys in the job environment. All
@@ -745,9 +747,11 @@ backend gets a scoped token, not broad provider credentials.
 To prevent privilege escalation, MLflow should also validate at scorer creation
 or update time that the caller already holds the permissions implied by that
 scorer's stored configuration, such as experiment `EDIT` and any referenced
-Gateway endpoint `USE` permissions. A user should not be able to register or
-activate an online scorer that would later run with broader access than that
-user had when creating it.
+Gateway endpoint `USE` permissions. For custom scorers, this validation should
+also include any resources declared explicitly on the scorer, such as prompts or
+Gateway endpoints listed in `@scorer(required_resources=...)`. A user should not
+be able to register or activate an online scorer that would later run with
+broader access than that user had when creating it.
 
 #### Permission extraction
 
@@ -757,19 +761,61 @@ the scorer or invoking `exec()`. The intended model is a shallow parse of
 serialized scorer payloads to discover referenced `gateway:/endpoint-name`
 URIs.
 
+For custom scorers, this shallow parse may not be sufficient because arbitrary
+Python can reference MLflow-managed resources dynamically. To support those
+cases without expanding the job token to the caller's full permissions, the
+`@scorer` decorator may declare additional required resources explicitly:
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class RequiredResource:
+    type: Literal["gateway_endpoint", "prompt"]
+    identifier: str
+
+
+@scorer(
+    required_resources=(
+        RequiredResource(type="gateway_endpoint", identifier="endpoint-1"),
+        RequiredResource(type="gateway_endpoint", identifier="endpoint-2"),
+        RequiredResource(type="prompt", identifier="prompts://tool-grounded/1"),
+    ),
+)
+def tool_grounded(outputs, trace):
+    client = OpenAI(base_url="<gateway-url>")
+    tool_spans = trace.search_traces(span_type="TOOL")
+    judge_prompt = mlflow.genai.load_prompt("prompts://tool-grounded/1")
+    text = judge_prompt.format(output=outputs, tools=tool_spans)
+    response = client.responses.create(text)
+    return parse_result(response)
+```
+
+For remote execution, the framework should union inferred dependencies with
+declared `required_resources` rather than treating the declaration as an
+override. This keeps least-privilege behavior while allowing custom scorers to
+declare resources that are not reliably inferable from serialized source. The
+resource schema is intentionally extensible, but this RFC only requires support
+for `gateway_endpoint` and `prompt`.
+
 The per-job-type extraction rules are:
 
 - `run_online_trace_scorer_job` and `run_online_session_scorer_job`: read
-  `experiment_id` from params and extract gateway endpoints from each scorer in
-  `params.online_scorers`
+  `experiment_id` from params, extract gateway endpoints from each scorer in
+  `params.online_scorers`, and union those inferred dependencies with any
+  scorer-declared `required_resources`
 - `invoke_scorer_job`: read `experiment_id` from params and extract the gateway
-  endpoint from `params.serialized_scorer`
+  endpoint from `params.serialized_scorer`, then union it with any
+  scorer-declared `required_resources`
 - `optimize_prompts_job`: read experiment and resolved gateway dependencies from
   the submission state produced by the prompt-optimization refactor described
   below
 
-If a remote-bound job references a non-gateway model URI, submission is rejected
-before a token is generated.
+If a remote-bound job references a non-gateway model URI, or needs protected
+resources that are neither inferable nor declared through
+`required_resources`, submission is rejected before a token is generated.
 
 #### API server enforcement
 
@@ -793,6 +839,7 @@ The intended endpoint-to-permission mapping is:
 | `POST /mlflow/assessments`                                                           | experiment       | `EDIT`                   |
 | `POST /api/3.0/jobs/{job_id}/result`                                                 | job              | implicit for that job ID |
 | `POST /gateway/*`                                                                    | gateway endpoint | `USE`                    |
+| Prompt read endpoints                                                                | prompt           | `READ`                   |
 | Any other endpoint                                                                   | none             | reject                   |
 
 #### UI considerations
