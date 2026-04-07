@@ -195,7 +195,7 @@ Additionally would need changes to `from_otel_proto` and `to_otel_proto` to ensu
 
 ### Database Schema & Migration
 
-A nullable `links` column of type `MutableJSON` will be added to the `spans` table. Going off of the intersection between the OTel standard and what is currently implemented in MLFlow, each link object will be comprised of:
+A nullable `links` column of type `JSON` will be added to the `spans` table. Going off of the intersection between the OTel standard and what is currently implemented in MLFlow, each link object will be comprised of:
 - `trace_id` - an entity of `SpanContext`
 - `span_id` - an entity of `SpanContext`
 - `attributes`
@@ -247,9 +247,7 @@ This is an additive change and usage is purely opt-in (user explicitly specifies
 
 # Open questions
 
-1. If Span A links to Span B via some expected span_id, should we validate whether Span B exists at the time of linking?
-    - It might be the case that an application expects a Span to link to some other Span that is still yet to be initiated
-        - Additionally, users might want to link Spans across experiments (it is also an open question as to whether we want to allow this behavior)
+1. Q: If Span A links to Span B via some expected span_id, should we validate whether Span B exists at the time of linking? For example, it might be the case that an application expects a Span to link to some other Span that is still yet to be initiated. Additionally, users might want to link Spans across experiments (it is also an open question as to whether we want to allow this behavior)
 
-2. Should SpanLinks be bidirectional? E.g., if Span A links to Span B, should Span B be made to link to Span A? In Otel, these are unidirectional, but there might be a discussion to be had around at least enabling bidirectional span linking based on the type of workflows we expect to find this useful.
-    - If yes, it would necessitate validating that spans exist at link-time as discussed in item 1.
+2. Q: Should SpanLinks be bidirectional? E.g., if Span A links to Span B, should Span B be made to link to Span A? In Otel, these are unidirectional, but there might be a discussion to be had around at least enabling bidirectional span linking based on the type of workflows we expect to find this useful. If yes, it would necessitate validating that spans exist at link-time as discussed in item 1.
+    - A: Proceed with unidirectional for now, as per OTel spec.
