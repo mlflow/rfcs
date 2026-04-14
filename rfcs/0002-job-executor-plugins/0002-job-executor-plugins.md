@@ -8,7 +8,7 @@ rfc_pr: https://github.com/mlflow/rfcs/pull/2
 
 | Author(s)              | [Matthew Prahl](https://github.com/mprahl), [Humair Khan](https://github.com/humairAK) |
 | :--------------------- | :------------------------------------------------------------------------------------- |
-| **Date Last Modified** | 2026-03-20                                                                             |
+| **Date Last Modified** | 2026-04-07                                                                             |
 
 <!-- markdownlint-disable MD025 -->
 
@@ -165,8 +165,14 @@ The core types are also simplified around that split:
   the framework retention window for terminal job rows; the exact cleanup
   mechanism is an implementation detail outside this RFC.
 - `JobResult` becomes the result object returned by `wait_for_job`, including
-  `status`, optional `result`, optional `error_message`, and
-  `is_transient_error`.
+  terminal `status`, `result`, optional `error_message`, and
+  `is_transient_error`. At the API layer, `result` remains the success payload
+  and `error_message` remains the failure payload. The persistence layer may
+  normalize either one into a single stored terminal payload field. This
+  follows the current MLflow implementation, where job entities expose
+  `error_message` without persisting a separate database column for it.
+- `JobProgress` is a small Python dataclass for typed best-effort progress
+  payloads and shared proto conversion helpers.
 - `JobExecutionContext` bundles execution metadata that the framework passes to
   the selected backend. This includes the job ID, the tracking URI the job
   should use, optional workspace information, and remote-execution auth fields
@@ -213,8 +219,8 @@ class JobExecutorConfig:
 @dataclass
 class JobResult:
     status: JobStatus  # executors return only terminal statuses from wait_for_job()
-    result: str | None = None
-    error_message: str | None = None
+    result: str | None = None  # success payload for SUCCEEDED jobs
+    error_message: str | None = None  # failure payload/message for FAILED or TIMEOUT jobs
     is_transient_error: bool = False
 
 
@@ -350,23 +356,27 @@ route them remotely.
 
 ### Data model
 
-The core framework requires a small amount of persistent state beyond the
-existing job row:
+The core framework requires a small amount of additional persistent state:
 
-| Location           | Field or table                                         | Purpose                                                                             |
-| ------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------- |
-| `jobs`             | `error_message`                                        | Human-readable terminal error for operators and UI                                  |
-| `jobs`             | `executor_backend`                                     | Persisted backend selection for retry, cancellation, and recovery                   |
-| `jobs`             | `lease_expires_at`                                     | Short-lived lease for `RUNNING` jobs so stale work can enter recovery               |
-| `jobs`             | `status_message`, progress fields                      | Optional latest progress metadata for operators and UI                              |
-| `job_locks`        | `lock_key`, `job_id`, `acquired_at`                    | Exclusive job locking across replicas; `lock_key` is framework-computed per type    |
-| `scheduler_leases` | `lease_key`, `holder_id`, `acquired_at`, `ttl_seconds` | Single-leader scheduler lease for discovery                                         |
+<!-- markdownlint-disable MD060 -->
+| Location           | Field or table                            | Purpose                                                                         |
+| ------------------ | ----------------------------------------- | ------------------------------------------------------------------------------- |
+| `jobs`             | `executor_backend`                        | Persisted backend selection for retry, cancellation, and recovery               |
+| `jobs`             | `lease_expires_at`                        | Short-lived lease for `RUNNING` jobs so stale work can enter recovery           |
+| `jobs`             | `status_message`, progress fields         | Optional latest progress metadata for operators and UI                          |
+| `job_locks`        | `lock_key`, `job_id`, `acquired_at`       | Exclusive job locking across replicas; `lock_key` is framework-computed per type |
+| `scheduler_leases` | `lease_key`, `acquired_at`, `ttl_seconds` | Single-leader scheduler lease for discovery                                     |
+<!-- markdownlint-enable MD060 -->
 
-The table above summarizes the new shared framework tables and job-row fields.
+The table above summarizes the shared framework tables and job-row fields.
 For optional progress reporting, the added fields are `status_message`,
 `progress_payload`, and `progress_updated_at`. Additional auth-specific job-row
 state for remote execution is defined later in this RFC as part of the remote
-executor contract.
+executor contract. Higher-level APIs may still expose semantic fields such as
+`error_message`, but those do not imply separately persisted terminal columns.
+This matches the current MLflow persistence model, where `jobs.result` is
+stored but `error_message` is exposed through entity and API layers rather than
+as its own database field.
 
 The framework state machine also introduces a non-terminal `NEEDS_RECOVERY`
 status for jobs whose backend work may still exist but whose current monitoring
@@ -393,7 +403,18 @@ This method is the single source of truth for persisted job outcomes when a job
 reports its result back to MLflow. Remote executors reach it through the
 framework result-reporting endpoint defined later in this RFC. The built-in
 local executor may instead return a `JobResult` directly to the framework
-without persisting it first.
+without persisting it first. The API keeps `result` and `error_message` as
+separate semantic fields, but the store implementation persists only one
+canonical terminal payload. The intended invariant is:
+
+- `SUCCEEDED`: `result` is set and `error_message` is unset
+- `FAILED` / `TIMEOUT`: `error_message` is set and `result` is unset
+
+The persistence layer then normalizes whichever terminal payload is set into
+the single stored `jobs.result` field. This is not a new storage shape proposed
+in this RFC; it follows the current MLflow implementation, which already
+stores terminal payload in `jobs.result` and exposes `error_message` at the
+entity/API layer.
 
 ```python
 def report_job_progress(
@@ -485,7 +506,7 @@ workers cannot produce duplicate final state transitions.
 
 Retries use the same pattern. The framework performs a conditional
 `retry_job(...)` transition from `RUNNING` back to `PENDING`, increments
-`retry_count`, and clears the previous attempt's `result` and `error_message`.
+`retry_count`, and clears the previous attempt's terminal `result` payload.
 Once returned to `PENDING`, the job can be claimed again by any eligible replica
 through a new job row claim. This keeps transient-failure retry safe under
 multi-replica recovery.
@@ -705,7 +726,9 @@ The token lifecycle is:
 
 1. The framework computes `scoped_permissions` from the job submission.
 2. The job row is created with the persisted executor backend and the permission
-   payload.
+   payload. For now, `scoped_permissions` remains an untyped dict on the Python
+   side and can be promoted to a dedicated dataclass later once the
+   remote-execution permission model stabilizes.
 3. The framework generates an opaque token with `secrets.token_urlsafe(32)`.
 4. The SHA-256 hash of the token is persisted on the job row. The plaintext
    token is never stored in the database.
@@ -855,6 +878,11 @@ The frontend should learn that state from a new field on the `server-info`
 endpoint rather than inferring it locally. That field should explicitly indicate
 whether direct (non-Gateway) model usage is supported for these flows.
 
+The generic `/ajax-api/3.0/jobs/...` responses should also include
+`error_message`, `status_message`, `progress_payload`, and
+`progress_updated_at` so existing hooks and shared types can surface terminal
+and progress metadata consistently.
+
 If a job type uses optional progress reporting, the UI may also surface the
 latest job `status_message` or structured `progress_payload`. The structured
 payload should follow the `JobProgress` shape so shared UI can render common
@@ -904,6 +932,14 @@ Remote jobs report completion through a dedicated framework endpoint:
 The endpoint is `POST /api/3.0/jobs/{job_id}/result`. It is authenticated with
 the job ID and token headers and is a thin wrapper around
 `job_store.report_job_result(...)`.
+
+This endpoint keeps `result` and `error_message` as separate semantic fields at
+the API layer: `SUCCEEDED` jobs report success data in `result`, while
+`FAILED` and `TIMEOUT` jobs report the failure message or payload in
+`error_message`. The persistence layer then normalizes whichever terminal
+payload is set into the single stored `jobs.result` field, so the API shape
+does not imply a second persisted terminal column. This mirrors the current
+MLflow implementation rather than introducing a new divergence.
 
 The job process attaches these headers automatically through
 `JobTokenRequestHeaderProvider`:
