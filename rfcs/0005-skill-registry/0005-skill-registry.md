@@ -3,7 +3,7 @@
 | start_date   | 2026-04-22 |
 | :----------- | :--------- |
 | mlflow_issue | [mlflow/mlflow#22833](https://github.com/mlflow/mlflow/issues/22833) |
-| rfc_pr       | |
+| rfc_pr       | [mlflow/rfcs#10](https://github.com/mlflow/rfcs/pull/10) |
 
 | Author(s)              | Bill Murdock (Red Hat) |
 | :--------------------- | :-- |
