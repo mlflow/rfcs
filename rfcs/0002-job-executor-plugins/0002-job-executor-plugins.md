@@ -8,7 +8,7 @@ rfc_pr: https://github.com/mlflow/rfcs/pull/2
 
 | Author(s)              | [Matthew Prahl](https://github.com/mprahl), [Humair Khan](https://github.com/humairAK) |
 | :--------------------- | :------------------------------------------------------------------------------------- |
-| **Date Last Modified** | 2026-04-07                                                                             |
+| **Date Last Modified** | 2026-04-23                                                                             |
 
 <!-- markdownlint-disable MD025 -->
 
@@ -363,14 +363,14 @@ The core framework requires a small amount of additional persistent state:
 | ------------------ | ----------------------------------------- | ------------------------------------------------------------------------------- |
 | `jobs`             | `executor_backend`                        | Persisted backend selection for retry, cancellation, and recovery               |
 | `jobs`             | `lease_expires_at`                        | Short-lived lease for `RUNNING` jobs so stale work can enter recovery           |
-| `jobs`             | `status_message`, progress fields         | Optional latest progress metadata for operators and UI                          |
+| `jobs`             | `status_message`, `progress`, `progress_updated_at` | Optional latest progress metadata for operators and UI                          |
 | `job_locks`        | `lock_key`, `job_id`, `acquired_at`       | Exclusive job locking across replicas; `lock_key` is framework-computed per type |
 | `scheduler_leases` | `lease_key`, `acquired_at`, `ttl_seconds` | Single-leader scheduler lease for discovery                                     |
 <!-- markdownlint-enable MD060 -->
 
 The table above summarizes the shared framework tables and job-row fields.
 For optional progress reporting, the added fields are `status_message`,
-`progress_payload`, and `progress_updated_at`. Additional auth-specific job-row
+`progress`, and `progress_updated_at`. Additional auth-specific job-row
 state for remote execution is defined later in this RFC as part of the remote
 executor contract. Higher-level APIs may still expose semantic fields such as
 `error_message`, but those do not imply separately persisted terminal columns.
@@ -417,7 +417,7 @@ stores terminal payload in `jobs.result` and exposes `error_message` at the
 entity/API layer.
 
 ```python
-def report_job_progress(
+def update_job_progress(
     self,
     job_id: str,
     message: str | None = None,
@@ -879,15 +879,17 @@ endpoint rather than inferring it locally. That field should explicitly indicate
 whether direct (non-Gateway) model usage is supported for these flows.
 
 The generic `/ajax-api/3.0/jobs/...` responses should also include
-`error_message`, `status_message`, `progress_payload`, and
+`error_message`, `status_message`, `progress`, and
 `progress_updated_at` so existing hooks and shared types can surface terminal
 and progress metadata consistently.
 
 If a job type uses optional progress reporting, the UI may also surface the
-latest job `status_message` or structured `progress_payload`. The structured
+latest job `status_message` or structured `progress`. The structured
 payload should follow the `JobProgress` shape so shared UI can render common
-progress indicators consistently. The exact UX for displaying in-progress job
-progress is deferred from this RFC because it needs separate UX design.
+progress indicators consistently. `status_message` is a free-form human-readable
+summary, while `JobProgress.phase` is the structured stage label used for shared
+progress rendering. The exact UX for displaying in-progress job progress is
+deferred from this RFC because it needs separate UX design.
 
 #### Optional progress reporting
 
@@ -908,13 +910,13 @@ framework endpoint while they are still running:
 
 The endpoint is `POST /api/3.0/jobs/{job_id}/progress`. It is authenticated
 with the same job ID and token headers as the result-reporting endpoint and is
-a thin wrapper around `job_store.report_job_progress(...)`.
+a thin wrapper around `job_store.update_job_progress(...)`.
 
 This endpoint is optional. Jobs that do not report progress continue to work
 normally. Progress updates are best-effort, do not change `JobStatus`, and
 overwrite the latest stored progress metadata rather than appending a full
 history. When the framework records a terminal outcome, it clears
-`status_message`, `progress_payload`, and `progress_updated_at` for that job.
+`status_message`, `progress`, and `progress_updated_at` for that job.
 
 #### Result reporting
 
