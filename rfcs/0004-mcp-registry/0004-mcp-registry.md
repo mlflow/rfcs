@@ -8,7 +8,7 @@
 | Author(s)              | [Jon Burdo](https://github.com/jonburdo), [Dan Kuc](https://github.com/dkuc), [Matthew Prahl](https://github.com/mprahl) |
 | :--------------------- | :-- |
 | **Date Last Modified** | 2026-04-23 |
-| **AI Assistant(s)**    | Claude Code |
+| **AI Assistant(s)**    | Claude Code, GPT 5.4 |
 
 **Table of contents**
 
@@ -36,7 +36,9 @@
 
 # Summary
 
-Add an MCP Registry to MLflow — a governed, versioned registry for [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server definitions. The registry stores metadata-first records aligned with the [upstream MCP registry specification](https://registry.modelcontextprotocol.io/docs), providing stable identity, versioning, status lifecycle, and workspace-scoped visibility for MCP server assets. This enables platform administrators to govern which MCP servers are available for consumption and gives downstream components (catalogs, gateways, agent frameworks) a single source of truth for MCP server metadata.
+Add an MCP Registry to MLflow — a governed, versioned registry for [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server definitions. The registry stores metadata-first records aligned with the [upstream MCP registry specification](https://registry.modelcontextprotocol.io/docs), providing stable identity, versioning, status lifecycle, workspace-scoped governance, and MLflow-native integrations for MCP server assets. This is intended to complement, not replace, the public GitHub-hosted MCP registry, adding workspace governance, stable aliases, deployment association, and traceability for MLflow-aware runtimes.
+
+MLflow stores the publisher-declared `server_json["version"]` as the canonical version of a server definition. It does not introduce a second MLflow-specific version; deployment or runtime revisions belong in mutable `runtime_metadata`.
 
 # Basic example
 
@@ -131,22 +133,29 @@ As MCP adoption grows, organizations accumulate MCP server definitions across te
 - Record which MCP servers exist and what state they are in
 - Version MCP server definitions as they evolve
 - Control which MCP servers are eligible for consumption by AI engineers
-- Trace which MCP servers are used by which agents or workflows
+- Associate traces with governed MCP server versions when runtimes participate in MLflow-aware tracing
 - Provide downstream systems (catalogs, gateways, agent frameworks) with a governed source of truth
 
 ### Use cases
 
 1. **Governed registration**: Platform administrators register MCP server definitions (both internally developed packages and external remote endpoints) as governed, versioned assets with stable identity
 2. **Lifecycle management**: MCP server versions move through statuses (active → deprecated → deleted) to control downstream surfacing
-3. **Discovery and consumption**: AI engineers and downstream systems discover active MCP servers filtered by visibility scope, status, and metadata
-4. **Deployment association**: Running MCP server instances can be associated with their governed registry records, bridging the gap between "what is governed" and "what is running"
+3. **Discovery and resolution**: MLflow-aware clients and runtimes discover active MCP servers and resolve them by name + version or alias
+4. **Deployment association**: Running MCP runtimes can publish deployment metadata back to governed registry records, bridging the gap between "what is governed" and "what is running"
 5. **Version history**: Multiple versions of an MCP server coexist with independent lifecycle states, supporting deprecation without erasing history
 6. **After-the-fact governance**: MCP servers already deployed (e.g., from a catalog without a prior registry entry) can have registry records created after the fact, associating existing deployments with governed assets without requiring redeployment
 
 ### Out of scope
 
-- **Runtime hosting or deployment** — The registry stores metadata, not runtimes. Deployment is handled by external operators
+- **Runtime execution and orchestration** — The registry may store deployment metadata, but it does not provision, host, scale, or manage MCP runtimes
+- **End-user connectivity, proxying, or usage control enforcement** — Consumers can still connect directly to an MCP endpoint unless a future MLflow gateway or proxy mediates access
 - **Upstream MCP registry API compatibility layer** — A separate router implementing the upstream `GET /v0.1/servers` API shape is deferred to [Phase 2](#adoption-strategy); this RFC defines MLflow-native APIs
+
+### Resolution and runtime boundary
+
+The registry is intentionally runtime-agnostic: MLflow-aware clients or runtimes may resolve a registered MCP server through MLflow and then connect using the canonical server definition plus any deployment-specific metadata (see `runtime_metadata` later). This RFC defines governed identity and discovery, not extending the AI Gateway.
+
+When the canonical server definition changes, publishers register a new version. When only deployment details change, operators update deployment-specific metadata without creating a new version.
 
 ## MCP registry spec alignment
 
@@ -242,6 +251,7 @@ class MCPServerVersion:
     server_json: dict  # immutable upstream MCP ServerJSON payload
     display_name: str | None = None  # mutable human-readable label
     status: MCPStatus = MCPStatus.ACTIVE
+    aliases: list[str] = field(default_factory=list)  # read-only; alias names from parent mcp_server_aliases rows currently pointing at this version
     tags: dict[str, str] = field(default_factory=dict)
     source: str | None = None  # provenance URI (e.g., git repository URL)
     run_id: str | None = None  # optional MLflow run association
@@ -256,11 +266,13 @@ class MCPServerVersion:
 
 **Immutability contract**: `name`, `version`, and `server_json` are immutable after creation. To change the MCP payload, register a new version. Mutable fields (`status`, `runtime_metadata`, `is_deployed`, `tags`) can be updated independently.
 
-**Runtime metadata**: `runtime_metadata` is an opaque `dict[str, str]` that MLflow stores but does not interpret. It exists as a convenience for enterprises to associate deployment information (e.g., endpoint URLs, cluster names, environment labels) with a registered version. MLflow should be unopinionated about which keys are used; organizations should standardize on their own conventions.
+**Runtime metadata**: `runtime_metadata` is an opaque `dict[str, str]` that MLflow stores but does not otherwise interpret. It exists as a convenience for enterprises to associate deployment information with a registered version. MLflow defines one convention: if `endpoint_url` is present, the UI may display it as the connection endpoint for that version. Beyond `endpoint_url`, MLflow remains intentionally unopinionated about key names and organizations may standardize on their own conventions.
 
 **Version uniqueness**: The combination of `(name, version)` is unique within a workspace. This means each version string can only be registered once per server.
 
 **Version string conventions**: The version string is extracted from `server_json["version"]`. Semantic versioning is recommended but not enforced — any non-empty string is accepted. For external MCP servers where version tracking is declared rather than enforced, publishers may use `"latest"` as the version string. This allows registering external servers without requiring a specific version.
+
+**Alias storage model**: Following MLflow's existing registered model design, alias rows are stored parent-scoped on `MCPServer` as alias → version mappings, while version entities also expose `MCPServerVersion.aliases` for the alias names currently targeting that version. This means users can inspect aliases directly on a version even though aliases are stored in a top-level table.
 
 **Typed payload**: The `server_json` field uses `dict` in the entity and store layers for simplicity. At the API layer, the `CreateMCPServerVersionRequest` uses a `ServerJSONPayload` Pydantic model (with `extra="allow"`) that validates the payload on ingestion and extracts typed fields. See [server_json validation](#server_json-validation).
 
@@ -315,7 +327,7 @@ class MCPServerTag:
 ```
 
 
-Aliases provide stable version pointers. For example, setting alias `"production"` to version `"1.2.0"` allows consumers to resolve `get_mcp_server_version_by_alias("my-server", "production")` without tracking specific version strings.
+Aliases provide stable version pointers. For example, setting alias `"production"` to version `"1.2.0"` allows consumers to resolve `get_mcp_server_version_by_alias("my-server", "production")` without tracking specific version strings. `MCPServer` exposes the full alias → version map, and version entities expose the subset of alias names that currently target that version.
 
 #### Future entity: MCPObservedTool (deferred)
 
@@ -424,6 +436,10 @@ FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
 | `name` | `String(256)` | PK, FK → mcp_servers |
 | `alias` | `String(256)` | PK |
 | `version` | `String(256)` | target version string |
+
+FK: `(workspace, name)` → `mcp_servers`, CASCADE delete/update.
+
+This matches MLflow's registered model alias pattern: aliases are stored in a parent-scoped table, and the target version is validated when aliases are set and projected back onto version entities when they are read.
 
 **JSON columns**: `server_json` and `runtime_metadata` use SQLAlchemy's `JSON` type (with `mssql.JSON` for SQL Server), following the pattern established by MLflow's evaluation dataset records and span dimension attributes. This maps to native `JSON` on PostgreSQL and MySQL (with database-level validation on write), and to `NVARCHAR(MAX)` / `TEXT` on MSSQL and SQLite.
 
@@ -595,7 +611,7 @@ Resource identifiers (`name`, `version`, `alias`, `key`) are path parameters, no
 Request models contain only the mutable fields — resource identifiers come from path parameters:
 
 ```python
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CreateMCPServerRequest(BaseModel):
@@ -640,8 +656,8 @@ class MCPServerResponse(BaseModel):
     latest_version_alias: str | None = None
     last_registered_version: str | None = None
     is_deployed: bool = False  # derived at query time
-    aliases: list[AliasResponse] = []
-    tags: dict[str, str] = {}
+    aliases: list[AliasResponse] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
@@ -654,10 +670,11 @@ class MCPServerVersionResponse(BaseModel):
     server_json: dict
     display_name: str | None = None
     status: str = "active"
-    tags: dict[str, str] = {}
+    aliases: list[str] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)
     source: str | None = None
     run_id: str | None = None
-    runtime_metadata: dict[str, str] = {}
+    runtime_metadata: dict[str, str] = Field(default_factory=dict)
     is_deployed: bool = False
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -812,29 +829,16 @@ The list view uses a card-based layout consistent with other MLflow pages, showi
 
 ![MCP Servers detail view](mcp-servers-details-view.png)
 
-The detail view shows the server's metadata, versions list, aliases, and tags. Individual version pages display the `server_json` payload, status, and runtime metadata.
+The detail view shows the server's metadata, versions list, aliases, and tags. Individual version pages display the `server_json` payload, aliases, status, and runtime metadata.
 
 
 ### Trace linking
 
-MCP server usage is linked to traces following the same pattern as prompt registry linking. When a registered MCP server is resolved within an active trace, the registry records the association so that traces carry a record of which MCP servers were involved.
+Each MCP server version may be associated with traces that used it. The source of truth is a trace-to-MCP-version association created when a runtime or server knows which registered `{name, version}` handled a request. This supports both trace-to-MCP and MCP-to-traces lookup.
 
-**Tag and attribute**: Traces carry an `mlflow.linkedMcpServers` tag containing a JSON array of `{name, version}` entries — the same format as `mlflow.linkedPrompts`:
+If tracing context is propagated to the runtime (for example, over HTTP with `traceparent`), caller-side and runtime-side traces can be correlated. Otherwise, the runtime can still record its own trace and associate it with the MCP server version it used. Looking up an MCP server in the registry does not by itself create a trace association.
 
-```json
-[{"name": "io.github.user/brave-search", "version": "1.0.0"}]
-```
-
-This tag is stored at both levels:
-- **Trace-level** (`TraceTagKey.LINKED_MCP_SERVERS`): aggregates all MCP servers used anywhere in the trace
-- **Span-level** (`SpanAttributeKey.LINKED_MCP_SERVERS`): records which MCP server was resolved within a specific span
-
-**Auto-linking**: When a registered MCP server is resolved within an active trace (e.g., via a `load_mcp_server()` or equivalent resolution function), the registry automatically:
-1. Registers the `{name, version}` with `InMemoryTraceManager` (following the same pattern as prompt registry linking)
-2. Updates the `mlflow.linkedMcpServers` trace tag
-3. Sets the `mlflow.linkedMcpServers` attribute on the current active span
-
-**Explicit linking**: For after-the-fact association (e.g., when MCP server resolution happens outside the traced function), an explicit API is provided:
+For after-the-fact association, or for runtimes that know the canonical `{name, version}` only after request handling begins, an explicit API is provided:
 
 ```python
 client.link_mcp_server_versions_to_trace(
@@ -843,7 +847,7 @@ client.link_mcp_server_versions_to_trace(
 )
 ```
 
-**UI**: The GenAI UI includes an "MCP Servers" tab alongside the existing "Prompts" tab, showing linked MCP server entries for each trace. The trace detail view includes a linked MCP servers table with name, version, and navigation links to the MCP server detail page — following the same component pattern as `ModelTraceExplorerLinkedPromptsTable`.
+The GenAI UI includes an "MCP Servers" tab alongside the existing "Prompts" tab, showing linked MCP server entries for each trace. The trace detail view includes a linked MCP servers table with name, version, and navigation links to the MCP server detail page. MCP server version pages may also surface related traces using the same association data.
 
 ### Impact on existing MLflow components
 
@@ -855,7 +859,7 @@ client.link_mcp_server_versions_to_trace(
 | CLI | **New command group** | `mlflow mcp-servers` subcommands. No changes to existing CLI |
 | Model registry | **None** | No changes to existing model registry |
 | Other registries | **None** | No changes to existing registries (model registry, etc.) |
-| Tracing | **Extends existing** | New `mlflow.linkedMcpServers` tag/attribute following the `mlflow.linkedPrompts` pattern. New `link_mcp_server_versions_to_trace()` API |
+| Tracing | **Extends existing** | New trace-to-MCP-version associations and `link_mcp_server_versions_to_trace()` API |
 | UI | **New page + tab** | MCP Servers page under GenAI workflow; MCP Servers tab in trace explorer alongside Prompts tab |
 | Authentication/RBAC | **Extends existing** | Adds `SqlMCPServerPermission` following the same per-resource permission pattern as `SqlRegisteredModelPermission` (workspace + name + user + permission level). FastAPI middleware validators enforce permissions on MCP server routes |
 
@@ -880,7 +884,7 @@ This is a new feature, not a breaking change. Adoption is incremental:
 
 **Phase 1: Core registry**
 - Entities, database schema, store implementation, REST API, Python SDK, CLI
-- Trace linking: `mlflow.linkedMcpServers` tag/attribute and explicit `link_mcp_server_versions_to_trace()` API, following the `mlflow.linkedPrompts` pattern
+- Trace linking: trace-to-MCP-version associations and `link_mcp_server_versions_to_trace()` API
 - Users can register, version, and publish MCP server definitions
 - Existing MLflow functionality is unaffected
 
