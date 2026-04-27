@@ -14,16 +14,28 @@ rfc_pr: https://github.com/mlflow/rfcs/pull/10
 # Summary
 
 Add a Skill Registry to MLflow: a governed, metadata-first registry for
-AI agent skills. The registry stores metadata and typed source pointers
-(to Git repos, OCI registries, ZIP archives, etc.) rather than skill
-artifacts directly. It provides enterprise governance on top of existing
-skill distribution mechanisms: lifecycle management, security scan
+AI agent capabilities. The registry stores metadata and typed source
+pointers (to Git repos, OCI registries, ZIP archives, etc.) rather
+than artifacts directly. It provides enterprise governance on top of
+existing distribution mechanisms: lifecycle management, security scan
 tracking, usage analytics via traces, and federated discovery across
 sources.
 
-The registry also introduces skill groups as a first-class concept,
-allowing related skills to be organized into coherent toolboxes or
-workflows and discovered as a unit.
+The registry tracks four capability kinds under the `mlflow skills`
+namespace:
+
+- **Skills** (SKILL.md) — reusable agent instructions
+- **Agents** (agent .md) — sub-agent definitions
+- **MCP servers** (JSON config) — tool server integrations
+- **Hooks** (harness-specific) — event-triggered actions
+
+Skill groups bundle related capabilities of any kind into versioned,
+governed units that map to the "plugin" concept in agent harnesses.
+
+`mlflow skills pull` provides a harness-agnostic way to fetch
+registered content from its source. Harness-specific installation
+(manifest generation, directory placement) is covered in a companion
+RFC (RFC-0006).
 
 # Basic example
 
@@ -60,21 +72,18 @@ mlflow.skills.set_skill_alias(
     name="code-review",
     alias="production",
     version="1.0.0",
-    source_type="git",
 )
 
 # Record a security scan result as a tag
 mlflow.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
-    source_type="git",
     key="scan.prompt-injection.status",
     value="pass",
 )
 mlflow.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
-    source_type="git",
     key="scan.prompt-injection.date",
     value="2026-04-22",
 )
@@ -97,13 +106,13 @@ group_version = mlflow.skills.create_skill_group_version(
     version="1.0.0",
     members=[
         SkillGroupVersionMembership(
-            skill_name="code-review", skill_version="1.0.0", skill_source_type="git",
+            skill_name="code-review", skill_version="1.0.0",
         ),
         SkillGroupVersionMembership(
-            skill_name="test-coverage", skill_version="2.1.0", skill_source_type="git",
+            skill_name="test-coverage", skill_version="2.1.0",
         ),
         SkillGroupVersionMembership(
-            skill_name="security-scan", skill_version="1.0.0", skill_source_type="oci",
+            skill_name="security-scan", skill_version="1.0.0",
         ),
     ],
 )
@@ -121,6 +130,105 @@ mlflow.skills.set_skill_group_alias(
     alias="production",
     version="1.0.0",
 )
+```
+
+## Register other capability kinds
+
+```python
+# Register a sub-agent
+mlflow.skills.create_skill(
+    name="security-auditor",
+    kind="agent",
+    description="Security specialist for auth and payment code",
+)
+mlflow.skills.create_skill_version(
+    name="security-auditor",
+    version="1.0.0",
+    source_type="git",
+    source="https://github.com/acme/agent-skills/tree/v1.0.0/security-auditor",
+)
+
+# Register an MCP server
+mlflow.skills.create_skill(
+    name="github-mcp",
+    kind="mcp-server",
+    description="GitHub integration via MCP",
+)
+mlflow.skills.create_skill_version(
+    name="github-mcp",
+    version="2.0.0",
+    source_type="oci",
+    source="ghcr.io/acme/github-mcp:2.0.0",
+    content_digest="sha256:b4e9f1d...",
+)
+
+# Register a hook
+mlflow.skills.create_skill(
+    name="pre-commit-scan",
+    kind="hook",
+    description="Runs security scan before tool commits",
+)
+mlflow.skills.create_skill_version(
+    name="pre-commit-scan",
+    version="1.0.0",
+    source_type="git",
+    source="https://github.com/acme/agent-skills/tree/v1.0.0/pre-commit-scan",
+)
+```
+
+## Create a skill group with mixed capability kinds
+
+```python
+from mlflow.entities import SkillGroupVersionMembership
+
+group = mlflow.skills.create_skill_group(
+    name="pr-workflow",
+    description="End-to-end pull request review workflow",
+)
+
+# A group version can bundle skills, agents, MCP servers, and hooks
+group_version = mlflow.skills.create_skill_group_version(
+    name="pr-workflow",
+    version="1.0.0",
+    members=[
+        SkillGroupVersionMembership(
+            skill_name="code-review", skill_version="1.0.0",
+        ),
+        SkillGroupVersionMembership(
+            skill_name="security-auditor", skill_version="1.0.0",
+        ),
+        SkillGroupVersionMembership(
+            skill_name="github-mcp", skill_version="2.0.0",
+        ),
+    ],
+)
+```
+
+## Pull skills to a local directory
+
+```python
+# Pull a single skill version
+mlflow.skills.pull_skill(
+    name="code-review",
+    alias="production",
+    destination="./skills/code-review",
+)
+
+# Pull an entire skill group (all members)
+mlflow.skills.pull_skill_group(
+    name="pr-workflow",
+    alias="production",
+    destination="./plugins/pr-workflow",
+)
+```
+
+```bash
+# CLI equivalents
+mlflow skills pull --name code-review --alias production \
+    --destination ./skills/code-review
+
+mlflow skills pull-group --name pr-workflow --alias production \
+    --destination ./plugins/pr-workflow
 ```
 
 ## Discover and consume skills
@@ -141,7 +249,6 @@ groups = mlflow.skills.search_skill_groups(
 version = mlflow.skills.get_skill_version(
     name="code-review",
     version="1.0.0",
-    source_type="git",
 )
 # version.source_type == "git"
 # version.source == "https://github.com/acme/agent-skills/tree/v1.0.0/code-review"
@@ -179,17 +286,17 @@ mlflow skills create-version --name code-review --version 1.0.0 \
 
 # Publish and alias
 mlflow skills update-version --name code-review --version 1.0.0 \
-    --source-type git --publish-state published
+    --publish-state published
 mlflow skills set-alias --name code-review --alias production \
-    --version 1.0.0 --source-type git
+    --version 1.0.0
 
 # Create a group and a versioned membership snapshot
 mlflow skill-groups create --name pr-workflow \
     --description "End-to-end PR review workflow"
 mlflow skill-groups create-version --name pr-workflow --version 1.0.0 \
-    --member code-review:1.0.0:git \
-    --member test-coverage:2.1.0:git \
-    --member security-scan:1.0.0:oci
+    --member code-review:1.0.0 \
+    --member test-coverage:2.1.0 \
+    --member security-scan:1.0.0
 mlflow skill-groups update-version --name pr-workflow --version 1.0.0 \
     --publish-state published
 mlflow skill-groups set-alias --name pr-workflow --alias production \
@@ -207,50 +314,64 @@ mlflow skill-groups search --filter "status = 'active'"
 
 ### The problem
 
-AI agent skills (reusable tool definitions, workflow steps, and coding
-assistant capabilities) are becoming a critical asset class in
-enterprise AI platforms. As organizations adopt agentic AI, they
-accumulate skills across teams and repositories.
+AI agent capabilities — skills, sub-agents, MCP server configurations,
+and hooks — are becoming a critical asset class in enterprise AI
+platforms. As organizations adopt agentic AI, they accumulate these
+capabilities across teams, repositories, and agent harnesses.
 
-Today, skills are managed as ad-hoc files in Git repositories. This
-works well for individual developers and small teams. GitHub provides
-versioning, collaboration, and access control.
+A cross-harness portable format is emerging around SKILL.md files (for
+skills and agents), MCP server configs (for tool integrations), and
+hooks (for event-triggered actions). Agent harnesses including Claude
+Code, Codex CLI, Cursor, GitHub Copilot, OpenClaw, Kilo Code, and
+Antigravity support overlapping subsets of these formats, with SKILL.md
+and MCP being the most broadly adopted.
+
+Today, these capabilities are managed as ad-hoc files in Git
+repositories. This works well for individual developers and small
+teams. GitHub provides versioning, collaboration, and access control.
 
 However, enterprises face governance challenges that Git alone does not
 address:
 
-1. **No publish-state lifecycle.** Git has no concept of "this skill
-   version is approved for production use" vs. "this is a draft." Teams
-   resort to branch naming conventions or external tracking to manage
-   skill promotion.
+1. **No publish-state lifecycle.** Git has no concept of "this version
+   is approved for production use" vs. "this is a draft." Teams resort
+   to branch naming conventions or external tracking to manage
+   promotion.
 
 2. **No security scan tracking.** Skills may contain executable code or
-   be vulnerable to prompt injection. There is no standard place to
-   record whether a skill version has been scanned and what the results
-   were.
+   be vulnerable to prompt injection. Hooks execute arbitrary commands.
+   There is no standard place to record whether a capability version
+   has been scanned and what the results were.
 
-3. **Fragmented discovery.** Skills may live in multiple Git repos, OCI
-   registries, or other distribution systems. There is no single
-   discovery layer across all of these.
+3. **Fragmented discovery.** Capabilities may live in multiple Git
+   repos, OCI registries, or other distribution systems. There is no
+   single discovery layer across all of these.
 
-4. **No skill grouping.** Skills often work together as coherent
-   toolboxes or multi-step workflows. Agent harnesses like Claude Code
-   support plugin-level grouping, but there is no agent-neutral way to
-   represent these relationships.
+4. **No cross-kind grouping.** Agent harnesses like Claude Code and
+   Codex CLI support plugins that bundle skills, agents, MCP servers,
+   and hooks together. But there is no agent-neutral way to represent
+   these bundles for governance and discovery.
 
 5. **No usage analytics linkage.** MLflow traces can capture skill
    metadata, but without a governed registry, there is no way to link
-   trace data back to a governed skill record to understand adoption
-   across an organization.
+   trace data back to a governed record to understand adoption across
+   an organization.
+
+6. **No pull mechanism.** Once a user discovers a capability in the
+   registry, there is no standard way to fetch its content from the
+   source system. Users must manually copy source pointers and run
+   harness-specific install steps.
 
 ### Use cases
 
-1. **Governed registration**: Platform administrators register skill
-   metadata with typed source pointers to where the skill content lives
-   (Git, OCI, ZIP). The registry governs; the source system stores.
+1. **Governed registration**: Platform administrators register
+   capability metadata with typed source pointers to where the content
+   lives (Git, OCI, ZIP). The registry governs; the source system
+   stores. All four capability kinds (skill, agent, mcp-server, hook)
+   use the same registration model.
 
-2. **Lifecycle management**: Skill versions move through publish states
-   (draft, published, deprecated, retired) to control downstream
+2. **Lifecycle management**: Capability versions move through publish
+   states (draft, published, deprecated, retired) to control downstream
    surfacing. This is the governance layer that Git lacks.
 
 3. **Security scan tracking**: Scan results (prompt injection, code
@@ -258,37 +379,45 @@ address:
    registry does not perform scans; it provides the metadata layer for
    recording and querying results.
 
-4. **Skill grouping**: Related skills are organized into groups for
-   discovery and governance. A skill can belong to multiple groups.
-   Groups have their own publish state and tags.
+4. **Cross-kind grouping**: Related capabilities of any kind are
+   organized into skill groups for discovery and governance. A skill
+   group maps to the "plugin" concept in agent harnesses — for example,
+   a "pr-workflow" group might bundle a code-review skill, a
+   security-auditor agent, and a GitHub MCP server.
 
-5. **Federated discovery**: Users discover published skills and groups
-   across all source types from a single search interface, without
-   requiring skill content to be centralized.
+5. **Federated discovery**: Users discover published capabilities and
+   groups across all source types from a single search interface,
+   filtered by kind, without requiring content to be centralized.
 
-6. **Usage analytics**: Agent traces record which skill versions were
-   used. Combined with registry metadata, this enables organizations to
-   understand adoption and make data-driven promotion decisions.
+6. **Pull**: `mlflow skills pull` fetches capability content from its
+   registered source to a local directory. This is source-type-aware
+   (git clone, OCI pull, ZIP extract) and harness-agnostic.
+
+7. **Usage analytics**: Agent traces record which capability versions
+   were used. Combined with registry metadata, this enables
+   organizations to understand adoption and make data-driven promotion
+   decisions.
 
 ### Out of scope
 
-- **Skill artifact storage.** The registry stores metadata and source
-  pointers. Skill content remains in Git, OCI, or other distribution
-  systems.
-- **Skill authoring or development tools.** The registry manages
-  published skills, not the process of writing them.
-- **Skill format specification.** The registry is format-agnostic. It
-  does not define or enforce what a skill looks like (SKILL.md, plugin
-  manifests, etc.).
-- **Security scanning execution.** The registry records scan results; it
-  does not perform scans. Scanning tools are separate.
-- **Agent harness integration.** How a specific agent harness (Claude
-  Code, Codex, Cursor, etc.) installs or loads skills from the registry
-  is outside this RFC. The registry provides the metadata; harness
-  integration layers consume it.
-- **Approval workflows or review gates.** Publish state transitions are
-  sufficient for initial governance. Approval chains can be built on top
-  via external systems.
+- **Artifact storage.** The registry stores metadata and source
+  pointers. Content remains in Git, OCI, or other distribution systems.
+  `pull` fetches from the source; the registry itself does not store
+  artifacts.
+- **Authoring or development tools.** The registry manages published
+  capabilities, not the process of writing them.
+- **Format specification.** The registry is format-agnostic. It does
+  not define or enforce what a skill, agent, MCP config, or hook looks
+  like.
+- **Security scanning execution.** The registry records scan results;
+  it does not perform scans.
+- **Harness-specific installation.** How a specific agent harness
+  (Claude Code, Codex CLI, Cursor, etc.) installs capabilities from
+  the registry — including manifest generation and directory placement
+  — is covered in a companion RFC (RFC-0006). This RFC provides the
+  registry, governance, and `pull`; RFC-0006 provides `install`.
+- **Approval workflows or review gates.** Publish state transitions
+  are sufficient for initial governance.
 - **Detailed UI/UX design.** This RFC describes the UI surface and
   placement but does not specify interaction patterns.
 
@@ -319,6 +448,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 
+class SkillKind(StrEnum):
+    SKILL = "skill"
+    AGENT = "agent"
+    MCP_SERVER = "mcp-server"
+    HOOK = "hook"
+
+
 class SkillStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
@@ -328,6 +464,7 @@ class SkillStatus(StrEnum):
 @dataclass
 class Skill:
     name: str
+    kind: SkillKind = SkillKind.SKILL
     description: str | None = None
     workspace: str | None = None
     status: SkillStatus = SkillStatus.ACTIVE
@@ -343,10 +480,16 @@ class Skill:
 | Field | Type | Description |
 |---|---|---|
 | `name` | `str` | Stable logical asset name, unique within a workspace |
+| `kind` | `SkillKind` | Capability type: `skill`, `agent`, `mcp-server`, `hook` |
 | `status` | `SkillStatus` | Skill-level lifecycle: `active`, `deprecated`, `retired` |
-| `aliases` | `list[SkillAlias]` | Stable version pointers, each resolving to a `(version, source_type)` pair |
+| `aliases` | `list[SkillAlias]` | Stable version pointers (e.g., `production` → `1.2.0`) |
 | `last_registered_version` | `str` | Most recently registered version string |
 | `workspace` | `str` | Visibility boundary |
+
+**Kind extensibility.** The `kind` enum covers the four capability
+types with broad cross-harness support. New kinds can be added without
+schema changes since the column stores a string value. `kind` is
+immutable after creation.
 
 #### SkillVersion
 
@@ -371,8 +514,8 @@ class SkillSourceType(StrEnum):
 class SkillVersion:
     name: str
     version: str
-    source_type: SkillSourceType
-    source: str
+    source_type: SkillSourceType | None = None
+    source: str | None = None
     publish_state: SkillPublishState = SkillPublishState.DRAFT
     content_digest: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
@@ -387,8 +530,8 @@ class SkillVersion:
 | Field | Type | Description |
 |---|---|---|
 | `version` | `str` | Publisher-supplied version string. Semver recommended but not enforced |
-| `source_type` | `SkillSourceType` | Distribution mechanism: `git`, `oci`, `zip` |
-| `source` | `str` | Pointer to the skill content in the source system (URL, OCI reference, etc.) |
+| `source_type` | `SkillSourceType` | Optional distribution mechanism: `git`, `oci`, `zip` |
+| `source` | `str` | Optional pointer to the content in the source system. Required for standalone pull; omit when content is only available via a group-level source |
 | `content_digest` | `str` | Optional digest for integrity verification (e.g., `sha256:abc123...`). Aligns with OCI digest terminology |
 | `publish_state` | `SkillPublishState` | Per-version surfacing lifecycle |
 | `run_id` | `str` | Optional MLflow run association for trace linkage |
@@ -398,10 +541,12 @@ small for the initial implementation. New source types (e.g., `s3`,
 `azure-blob`) can be added without schema changes since the column
 stores a string value.
 
-**Version uniqueness.** The combination of `(name, version, source_type)`
-is unique within a workspace. This allows the same skill version to be
-registered from multiple distribution mechanisms (e.g., Git and OCI)
-without requiring different version strings.
+**Version uniqueness.** The combination of `(name, version)` is unique
+within a workspace. A skill version represents a single logical
+version of a capability; `source_type` and `source` describe where to
+find it but are not part of its identity. If the same content is
+available from multiple distribution mechanisms (e.g., Git and OCI),
+register separate versions or use a group-level source.
 
 **Content integrity.** The optional `content_digest` field stores a
 digest of the skill content at registration time (e.g.,
@@ -419,8 +564,11 @@ updated independently.
 
 #### SkillGroup
 
-The logical group asset, scoped to a workspace. Follows the same
-pattern as Skill: a top-level entity with versions, tags, and aliases.
+The logical group asset, scoped to a workspace. A skill group bundles
+capabilities of any kind (skills, agents, MCP servers, hooks) into a
+governed unit that maps to the "plugin" concept in agent harnesses.
+Follows the same pattern as Skill: a top-level entity with versions,
+tags, and aliases.
 
 ```python
 class SkillGroupStatus(StrEnum):
@@ -454,6 +602,9 @@ captures a specific set of skill versions that work together.
 class SkillGroupVersion:
     name: str
     version: str
+    source_type: SkillSourceType | None = None
+    source: str | None = None
+    content_digest: str | None = None
     publish_state: SkillPublishState = SkillPublishState.DRAFT
     tags: dict[str, str] = field(default_factory=dict)
     members: list["SkillGroupVersionMembership"] = field(default_factory=list)
@@ -467,10 +618,23 @@ class SkillGroupVersion:
 **Version uniqueness.** The combination of `(name, version)` is unique
 within a workspace.
 
-**Immutability contract.** The membership list of a group version is
-immutable after creation. To change the set of skills, register a new
-group version. Mutable fields (`publish_state`, `tags`) can be updated
-independently.
+**Group-level source.** A group version can optionally have its own
+`source_type`, `source`, and `content_digest`, pointing to a single
+artifact (e.g., an OCI image or Git repo) that contains the complete
+plugin. When present, `pull` fetches the group artifact as a unit
+rather than pulling members individually. This supports distribution
+patterns where a plugin is packaged as a single image or repo.
+
+**Source resolution for pull.** When pulling a group, if the group
+version has a source, that source is used. Otherwise, each member is
+pulled individually from its own source. Members without a source are
+skipped with a warning. When pulling a standalone skill, the skill
+version's source is required.
+
+**Immutability contract.** The membership list and source fields of a
+group version are immutable after creation. To change the set of
+skills or source pointer, register a new group version. Mutable fields
+(`publish_state`, `tags`) can be updated independently.
 
 #### SkillGroupVersionMembership
 
@@ -483,7 +647,6 @@ type). The parent group identity is provided by the enclosing
 class SkillGroupVersionMembership:
     skill_name: str
     skill_version: str
-    skill_source_type: SkillSourceType
 ```
 
 A skill can appear in multiple groups and multiple group versions.
@@ -505,10 +668,9 @@ class SkillGroupAlias:
 ```python
 @dataclass(frozen=True)
 class SkillAlias:
-    name: str                       # parent Skill name
-    alias: str                      # e.g., "production", "staging"
-    version: str                    # version string this alias points to
-    source_type: SkillSourceType    # source type this alias points to
+    name: str       # parent Skill name
+    alias: str      # e.g., "production", "staging"
+    version: str    # version string this alias points to
 
 @dataclass(frozen=True)
 class SkillTag:
@@ -569,6 +731,7 @@ workspace-scoped.
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, default `'default'` |
 | `name` | `String(256)` | PK |
+| `kind` | `String(20)` | default `'skill'`; `skill`, `agent`, `mcp-server`, `hook` |
 | `description` | `String(5000)` | |
 | `status` | `String(20)` | default `'active'` |
 | `last_registered_version` | `String(256)` | |
@@ -584,8 +747,8 @@ workspace-scoped.
 | `workspace` | `String(63)` | PK, FK |
 | `name` | `String(256)` | PK, FK |
 | `version` | `String(256)` | PK, publisher-supplied |
-| `source_type` | `String(20)` | PK; `git`, `oci`, `zip`, etc. |
-| `source` | `String(2048)` | pointer to skill content |
+| `source_type` | `String(20)` | nullable; `git`, `oci`, `zip`, etc. |
+| `source` | `String(2048)` | nullable pointer to skill content |
 | `content_digest` | `String(512)` | optional integrity digest |
 | `publish_state` | `String(20)` | default `'draft'` |
 | `run_id` | `String(32)` | optional MLflow run linkage |
@@ -612,7 +775,6 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `workspace` | `String(63)` | PK, FK |
 | `name` | `String(256)` | PK, FK |
 | `version` | `String(256)` | PK, FK |
-| `source_type` | `String(20)` | PK, FK |
 | `key` | `String(256)` | PK |
 | `value` | `Text` | |
 
@@ -624,7 +786,6 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `name` | `String(256)` | PK, FK |
 | `alias` | `String(256)` | PK |
 | `version` | `String(256)` | target version string |
-| `source_type` | `String(20)` | target source type |
 
 #### `skill_groups`
 
@@ -647,6 +808,9 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `workspace` | `String(63)` | PK, FK |
 | `name` | `String(256)` | PK, FK |
 | `version` | `String(256)` | PK, publisher-supplied |
+| `source_type` | `String(20)` | optional; `git`, `oci`, `zip`, etc. |
+| `source` | `String(2048)` | optional pointer to group artifact |
+| `content_digest` | `String(512)` | optional integrity digest |
 | `publish_state` | `String(20)` | default `'draft'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
@@ -664,10 +828,9 @@ FK: `(workspace, name)` references `skill_groups`, CASCADE delete.
 | `group_version` | `String(256)` | PK, FK to `skill_group_versions` |
 | `skill_name` | `String(256)` | PK, FK to `skill_versions` |
 | `skill_version` | `String(256)` | PK, FK to `skill_versions` |
-| `skill_source_type` | `String(20)` | PK, FK to `skill_versions` |
 
 FK: `(workspace, group_name, group_version)` references `skill_group_versions`, CASCADE delete.
-FK: `(workspace, skill_name, skill_version, skill_source_type)` references `skill_versions`, RESTRICT delete.
+FK: `(workspace, skill_name, skill_version)` references `skill_versions`, RESTRICT delete.
 
 #### `skill_group_tags`
 
@@ -716,7 +879,8 @@ class AbstractSkillRegistryStore:
 
     @abstractmethod
     def create_skill(
-        self, name: str, description: str | None = None,
+        self, name: str, kind: str = "skill",
+        description: str | None = None,
     ) -> Skill: ...
 
     @abstractmethod
@@ -748,8 +912,8 @@ class AbstractSkillRegistryStore:
         self,
         name: str,
         version: str,
-        source_type: str,
-        source: str,
+        source_type: str | None = None,
+        source: str | None = None,
         publish_state: SkillPublishState = SkillPublishState.DRAFT,
         content_digest: str | None = None,
         run_id: str | None = None,
@@ -757,7 +921,7 @@ class AbstractSkillRegistryStore:
 
     @abstractmethod
     def get_skill_version(
-        self, name: str, version: str, source_type: str,
+        self, name: str, version: str,
     ) -> SkillVersion: ...
 
     @abstractmethod
@@ -782,13 +946,12 @@ class AbstractSkillRegistryStore:
         self,
         name: str,
         version: str,
-        source_type: str,
         publish_state: SkillPublishState | None = None,
     ) -> SkillVersion: ...
 
     @abstractmethod
     def delete_skill_version(
-        self, name: str, version: str, source_type: str,
+        self, name: str, version: str,
     ) -> None: ...
 
     # --- Tag operations ---
@@ -803,26 +966,43 @@ class AbstractSkillRegistryStore:
 
     @abstractmethod
     def set_skill_version_tag(
-        self, name: str, version: str, source_type: str,
+        self, name: str, version: str,
         key: str, value: str,
     ) -> None: ...
 
     @abstractmethod
     def delete_skill_version_tag(
-        self, name: str, version: str, source_type: str, key: str,
+        self, name: str, version: str, key: str,
     ) -> None: ...
 
     # --- Alias operations ---
 
     @abstractmethod
     def set_skill_alias(
-        self, name: str, alias: str, version: str, source_type: str,
+        self, name: str, alias: str, version: str,
     ) -> None: ...
 
     @abstractmethod
     def delete_skill_alias(
         self, name: str, alias: str,
     ) -> None: ...
+
+    # --- Pull operations ---
+
+    @abstractmethod
+    def pull_skill(
+        self, name: str, destination: str,
+        version: str | None = None,
+        alias: str | None = None,
+        source_type: str | None = None,
+    ) -> str: ...
+
+    @abstractmethod
+    def pull_skill_group(
+        self, name: str, destination: str,
+        version: str | None = None,
+        alias: str | None = None,
+    ) -> str: ...
 
     # --- SkillGroup operations ---
 
@@ -862,6 +1042,9 @@ class AbstractSkillRegistryStore:
         version: str,
         members: list[SkillGroupVersionMembership],
         publish_state: SkillPublishState = SkillPublishState.DRAFT,
+        source_type: str | None = None,
+        source: str | None = None,
+        content_digest: str | None = None,
     ) -> SkillGroupVersion: ...
 
     @abstractmethod
@@ -955,16 +1138,17 @@ All paths relative to `/ajax-api/3.0/mlflow/skills`.
 | `DELETE` | `/{name}` | Delete skill (cascades) |
 | `POST` | `/{name}/versions` | Create a skill version |
 | `GET` | `/{name}/versions` | Search versions |
-| `GET` | `/{name}/versions/{version}/{source_type}` | Get a specific version |
-| `PATCH` | `/{name}/versions/{version}/{source_type}` | Update version |
-| `DELETE` | `/{name}/versions/{version}/{source_type}` | Delete a version |
+| `GET` | `/{name}/versions/{version}` | Get a specific version |
+| `PATCH` | `/{name}/versions/{version}` | Update version |
+| `DELETE` | `/{name}/versions/{version}` | Delete a version |
 | `POST` | `/{name}/tags` | Set a skill-level tag |
 | `DELETE` | `/{name}/tags/{key}` | Delete a skill-level tag |
-| `POST` | `/{name}/versions/{version}/{source_type}/tags` | Set a version-level tag |
-| `DELETE` | `/{name}/versions/{version}/{source_type}/tags/{key}` | Delete a version tag |
+| `POST` | `/{name}/versions/{version}/tags` | Set a version-level tag |
+| `DELETE` | `/{name}/versions/{version}/tags/{key}` | Delete a version tag |
 | `POST` | `/{name}/aliases` | Set an alias |
-| `GET` | `/{name}/aliases/{alias}` | Resolve alias to `SkillVersion` (returns version and source_type) |
+| `GET` | `/{name}/aliases/{alias}` | Resolve alias to `SkillVersion` |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
+| `POST` | `/{name}/pull` | Pull skill content from source to a local destination |
 
 #### Skill group endpoints
 
@@ -989,6 +1173,7 @@ All paths relative to `/ajax-api/3.0/mlflow/skill-groups`.
 | `POST` | `/{name}/aliases` | Set a group alias |
 | `GET` | `/{name}/aliases/{alias}` | Resolve group alias to version |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete a group alias |
+| `POST` | `/{name}/pull` | Pull all group members from their sources |
 
 #### Pagination and filtering
 
@@ -996,7 +1181,7 @@ Search endpoints use page-token-based pagination and `filter_string`
 expressions following existing MLflow conventions.
 
 **Skills and skill groups:** `name LIKE '%review%'`, `status = 'active'`,
-`tags.team = 'platform'`
+`kind = 'agent'`, `tags.team = 'platform'`
 
 **Skill versions:** `publish_state = 'published'`,
 `source_type = 'git'`, `tags.scan.prompt-injection.status = 'pass'`
@@ -1011,6 +1196,40 @@ The `mlflow.skills` module exposes top-level functions delegating to
 Two CLI command groups (`mlflow skills` and `mlflow skill-groups`)
 provide the same operations from the command line. See the basic
 examples at the top of this RFC for usage.
+
+### Pull semantics
+
+`pull` resolves a skill or skill group to its source pointer(s) and
+fetches content to a local destination directory. It is
+source-type-aware:
+
+| Source type | Pull behavior |
+|---|---|
+| `git` | `git clone` or `git archive` of the referenced path/ref |
+| `oci` | `oci pull` of the referenced image/tag |
+| `zip` | HTTP download and extract |
+
+**Single skill pull.** Fetches the content at the skill version's
+`source` to the destination directory. Returns an error if the skill
+version has no `source`.
+
+**Skill group pull.** Source resolution:
+1. If the group version has a `source`, fetch the group artifact as a
+   single unit to the destination directory.
+2. Otherwise, pull each member individually from its own `source` to
+   a subdirectory of the destination, named by the member's skill name.
+   Members without a `source` are skipped with a warning.
+
+This supports both distribution patterns: a monolithic plugin artifact
+(single OCI image or Git repo) and an assembled plugin (members from
+different sources).
+
+If `content_digest` is set, `pull` verifies the fetched content
+matches the digest and returns an error on mismatch.
+
+`pull` is harness-agnostic — it downloads content but does not generate
+harness-specific manifests or place files in harness-specific
+directories. Harness-specific installation is covered in RFC-0006.
 
 ### Error handling
 
@@ -1122,18 +1341,23 @@ The two approaches are complementary.
 
 This is a new feature, not a breaking change. Adoption is incremental:
 
-**Initial release:**
+**This RFC (RFC-0005):**
 - Entities, database schema, store implementation, REST API, Python SDK,
   CLI, and basic UI.
-- Users can register skills with source pointers, manage publish state,
-  record scan results as tags, organize skills into groups, and discover
-  published skills.
+- Users can register capabilities of any kind (skill, agent, mcp-server,
+  hook), manage publish state, record scan results as tags, organize
+  capabilities into skill groups, and discover published capabilities.
+- `mlflow skills pull` fetches content from registered sources.
 - Existing MLflow functionality is unaffected.
+
+**Companion RFC (RFC-0006):**
+- Harness-specific installation: `mlflow skills install` generates
+  manifests and places files for specific agent harnesses.
+- Initial targets: Claude Code, Codex CLI, Cursor, with additional
+  harnesses based on demand.
 
 **Follow-up:**
 - Agent trace integration: traces automatically record which registered
-  skill version was used, linking back to the registry.
+  capability version was used, linking back to the registry.
 - Usage analytics dashboard based on trace metadata.
-- Shared base extraction across AI asset registries (skills, MCP
-  servers, etc.) once patterns are validated.
-- Additional source types as demand emerges.
+- Additional source types and capability kinds as demand emerges.
