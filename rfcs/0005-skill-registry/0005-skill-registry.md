@@ -97,15 +97,12 @@ group_version = mlflow.skills.create_skill_group_version(
     version="1.0.0",
     members=[
         SkillGroupVersionMembership(
-            group_name="pr-workflow", group_version="1.0.0",
             skill_name="code-review", skill_version="1.0.0", skill_source_type="git",
         ),
         SkillGroupVersionMembership(
-            group_name="pr-workflow", group_version="1.0.0",
             skill_name="test-coverage", skill_version="2.1.0", skill_source_type="git",
         ),
         SkillGroupVersionMembership(
-            group_name="pr-workflow", group_version="1.0.0",
             skill_name="security-scan", skill_version="1.0.0", skill_source_type="oci",
         ),
     ],
@@ -478,17 +475,15 @@ independently.
 #### SkillGroupVersionMembership
 
 Each membership entry pins a specific skill version (including source
-type).
+type). The parent group identity is provided by the enclosing
+`SkillGroupVersion`; the storage layer adds those columns as FKs.
 
 ```python
 @dataclass(frozen=True)
 class SkillGroupVersionMembership:
-    group_name: str
-    group_version: str
     skill_name: str
     skill_version: str
     skill_source_type: SkillSourceType
-    workspace: str | None = None
 ```
 
 A skill can appear in multiple groups and multiple group versions.
