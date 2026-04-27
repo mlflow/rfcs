@@ -1,13 +1,14 @@
-# RFC: Skill Registry
+---
+start_date: 2026-04-22
+mlflow_issue: https://github.com/mlflow/mlflow/issues/22833
+rfc_pr: https://github.com/mlflow/rfcs/pull/10
+---
 
-| start_date   | 2026-04-22 |
-| :----------- | :--------- |
-| mlflow_issue | [mlflow/mlflow#22833](https://github.com/mlflow/mlflow/issues/22833) |
-| rfc_pr       | [mlflow/rfcs#10](https://github.com/mlflow/rfcs/pull/10) |
+# RFC: Skill Registry
 
 | Author(s)              | Bill Murdock (Red Hat) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-04-22 |
+| **Date Last Modified** | 2026-04-27 |
 | **AI Assistant(s)**    | Claude Code (Opus 4.6) |
 
 # Summary
@@ -42,8 +43,8 @@ version = mlflow.skills.create_skill_version(
     name="code-review",
     version="1.0.0",
     source_type="git",
-    source_url="https://github.com/acme/agent-skills/tree/v1.0.0/code-review",
-    content_hash="sha256:a3f2b8c...",
+    source="https://github.com/acme/agent-skills/tree/v1.0.0/code-review",
+    content_digest="sha256:a3f2b8c...",
 )
 # version.publish_state == "draft"
 
@@ -128,8 +129,9 @@ mlflow.skills.set_skill_group_alias(
 ## Discover and consume skills
 
 ```python
-# Search for published skills
-skills = mlflow.skills.search_skills(
+# Search for published skill versions
+versions = mlflow.skills.search_skill_versions(
+    name="code-review",
     filter_string="publish_state = 'published'",
 )
 
@@ -145,7 +147,7 @@ version = mlflow.skills.get_skill_version(
     source_type="git",
 )
 # version.source_type == "git"
-# version.source_url == "https://github.com/acme/agent-skills/tree/v1.0.0/code-review"
+# version.source == "https://github.com/acme/agent-skills/tree/v1.0.0/code-review"
 
 # Resolve by alias
 version = mlflow.skills.get_skill_version_by_alias(
@@ -175,8 +177,8 @@ mlflow skills create --name code-review \
     --description "Reviews pull requests"
 mlflow skills create-version --name code-review --version 1.0.0 \
     --source-type git \
-    --source-url https://github.com/acme/agent-skills/tree/v1.0.0/code-review \
-    --content-hash sha256:a3f2b8c...
+    --source https://github.com/acme/agent-skills/tree/v1.0.0/code-review \
+    --content-digest sha256:a3f2b8c...
 
 # Publish and alias
 mlflow skills update-version --name code-review --version 1.0.0 \
@@ -196,8 +198,9 @@ mlflow skill-groups update-version --name pr-workflow --version 1.0.0 \
 mlflow skill-groups set-alias --name pr-workflow --alias production \
     --version 1.0.0
 
-# Search published skills
-mlflow skills search --filter "publish_state = 'published'"
+# Search published skill versions
+mlflow skills search-versions --name code-review \
+    --filter "publish_state = 'published'"
 
 # Search active groups
 mlflow skill-groups search --filter "status = 'active'"
@@ -214,9 +217,7 @@ accumulate skills across teams and repositories.
 
 Today, skills are managed as ad-hoc files in Git repositories. This
 works well for individual developers and small teams. GitHub provides
-versioning, collaboration, and access control. As Databricks engineers
-have noted after dogfooding an MLflow skill registry prototype, GitHub
-is sufficient for the typical developer use case.
+versioning, collaboration, and access control.
 
 However, enterprises face governance challenges that Git alone does not
 address:
@@ -272,26 +273,6 @@ address:
    used. Combined with registry metadata, this enables organizations to
    understand adoption and make data-driven promotion decisions.
 
-### Relationship to other AI asset registries
-
-The MCP Server Registry proposal
-([#22625](https://github.com/mlflow/mlflow/issues/22625)) establishes
-the pattern for governed, metadata-first AI asset registries in MLflow.
-The skill registry is the next concrete instance of this pattern,
-following the same conventions (entity/version/alias/tag, abstract
-store, SQL storage, REST API, workspace scoping).
-
-Skill-specific design decisions include:
-
-- Typed source pointers (git/oci/zip) instead of an embedded payload
-  (MCP stores a `server_json` payload; skills point to external content)
-- Skill groups as a first-class entity for organizing related skills
-- Security scan tracking via tags as an explicit use case
-
-This RFC focuses on delivering the skill registry. Shared abstractions
-across asset types can be extracted once multiple concrete registries
-exist and the common patterns are well understood.
-
 ### Out of scope
 
 - **Skill artifact storage.** The registry stores metadata and source
@@ -318,7 +299,8 @@ exist and the common patterns are well understood.
 
 ### Entities and data model
 
-```
+```mermaid
+erDiagram
 Skill ||--o{ SkillVersion : "has versions"
 Skill ||--o{ SkillTag : "has tags"
 Skill ||--o{ SkillAlias : "has aliases"
@@ -353,7 +335,7 @@ class Skill:
     workspace: str | None = None
     status: SkillStatus = SkillStatus.ACTIVE
     tags: dict[str, str] = field(default_factory=dict)
-    aliases: dict[str, str] = field(default_factory=dict)
+    aliases: list[SkillAlias] = field(default_factory=list)
     last_registered_version: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -365,7 +347,7 @@ class Skill:
 |---|---|---|
 | `name` | `str` | Stable logical asset name, unique within a workspace |
 | `status` | `SkillStatus` | Skill-level lifecycle: `active`, `deprecated`, `retired` |
-| `aliases` | `dict[str, str]` | Stable version pointers, e.g. `{"production": "1.2.0"}` |
+| `aliases` | `list[SkillAlias]` | Stable version pointers, each resolving to a `(version, source_type)` pair |
 | `last_registered_version` | `str` | Most recently registered version string |
 | `workspace` | `str` | Visibility boundary |
 
@@ -393,9 +375,9 @@ class SkillVersion:
     name: str
     version: str
     source_type: SkillSourceType
-    source_url: str
+    source: str
     publish_state: SkillPublishState = SkillPublishState.DRAFT
-    content_hash: str | None = None
+    content_digest: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
     run_id: str | None = None
     workspace: str | None = None
@@ -409,8 +391,8 @@ class SkillVersion:
 |---|---|---|
 | `version` | `str` | Publisher-supplied version string. Semver recommended but not enforced |
 | `source_type` | `SkillSourceType` | Distribution mechanism: `git`, `oci`, `zip` |
-| `source_url` | `str` | URL pointing to the skill content in the source system |
-| `content_hash` | `str` | Optional content digest for integrity verification (e.g., `sha256:abc123...`) |
+| `source` | `str` | Pointer to the skill content in the source system (URL, OCI reference, etc.) |
+| `content_digest` | `str` | Optional digest for integrity verification (e.g., `sha256:abc123...`). Aligns with OCI digest terminology |
 | `publish_state` | `SkillPublishState` | Per-version surfacing lifecycle |
 | `run_id` | `str` | Optional MLflow run association for trace linkage |
 
@@ -424,19 +406,19 @@ is unique within a workspace. This allows the same skill version to be
 registered from multiple distribution mechanisms (e.g., Git and OCI)
 without requiring different version strings.
 
-**Content integrity.** The optional `content_hash` field stores a
+**Content integrity.** The optional `content_digest` field stores a
 digest of the skill content at registration time (e.g.,
 `sha256:abc123...`). Consumers can use this to verify that the content
-at `source_url` has not changed since registration. For OCI sources,
-this is the native image digest. For Git sources, this is a hash of
+at `source` has not changed since registration. For OCI sources,
+this is the native image digest. For Git sources, this is a digest of
 the skill file contents at the pinned commit. For ZIP sources, this is
-a hash of the archive. The registry stores the hash but does not
+a digest of the archive. The registry stores the digest but does not
 verify it on read; verification is the consumer's responsibility.
 
-**Immutability contract.** `source_type`, `source_url`, `content_hash`,
-and `version` are immutable after creation. To point to different
-content, register a new version. Mutable fields (`publish_state`,
-`tags`) can be updated independently.
+**Immutability contract.** `source_type`, `source`, `content_digest`,
+and `version` are immutable after creation. To point to different content,
+register a new version. Mutable fields (`publish_state`, `tags`) can be
+updated independently.
 
 #### SkillGroup
 
@@ -457,7 +439,7 @@ class SkillGroup:
     workspace: str | None = None
     status: SkillGroupStatus = SkillGroupStatus.ACTIVE
     tags: dict[str, str] = field(default_factory=dict)
-    aliases: dict[str, str] = field(default_factory=dict)
+    aliases: list["SkillGroupAlias"] = field(default_factory=list)
     last_registered_version: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -505,7 +487,7 @@ class SkillGroupVersionMembership:
     group_version: str
     skill_name: str
     skill_version: str
-    skill_source_type: str
+    skill_source_type: SkillSourceType
     workspace: str | None = None
 ```
 
@@ -528,10 +510,10 @@ class SkillGroupAlias:
 ```python
 @dataclass(frozen=True)
 class SkillAlias:
-    name: str         # parent Skill name
-    alias: str        # e.g., "production", "staging"
-    version: str      # version string this alias points to
-    source_type: str  # source type this alias points to
+    name: str                       # parent Skill name
+    alias: str                      # e.g., "production", "staging"
+    version: str                    # version string this alias points to
+    source_type: SkillSourceType    # source type this alias points to
 
 @dataclass(frozen=True)
 class SkillTag:
@@ -608,8 +590,8 @@ workspace-scoped.
 | `name` | `String(256)` | PK, FK |
 | `version` | `String(256)` | PK, publisher-supplied |
 | `source_type` | `String(20)` | PK; `git`, `oci`, `zip`, etc. |
-| `source_url` | `String(2048)` | URL to skill content |
-| `content_hash` | `String(512)` | optional content digest |
+| `source` | `String(2048)` | pointer to skill content |
+| `content_digest` | `String(512)` | optional integrity digest |
 | `publish_state` | `String(20)` | default `'draft'` |
 | `run_id` | `String(32)` | optional MLflow run linkage |
 | `created_by` | `String(256)` | |
@@ -772,9 +754,9 @@ class AbstractSkillRegistryStore:
         name: str,
         version: str,
         source_type: str,
-        source_url: str,
+        source: str,
         publish_state: SkillPublishState = SkillPublishState.DRAFT,
-        content_hash: str | None = None,
+        content_digest: str | None = None,
         run_id: str | None = None,
     ) -> SkillVersion: ...
 
@@ -986,7 +968,7 @@ All paths relative to `/ajax-api/3.0/mlflow/skills`.
 | `POST` | `/{name}/versions/{version}/{source_type}/tags` | Set a version-level tag |
 | `DELETE` | `/{name}/versions/{version}/{source_type}/tags/{key}` | Delete a version tag |
 | `POST` | `/{name}/aliases` | Set an alias |
-| `GET` | `/{name}/aliases/{alias}` | Resolve alias to version |
+| `GET` | `/{name}/aliases/{alias}` | Resolve alias to `SkillVersion` (returns version and source_type) |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
 
 #### Skill group endpoints
@@ -1016,114 +998,24 @@ All paths relative to `/ajax-api/3.0/mlflow/skill-groups`.
 #### Pagination and filtering
 
 Search endpoints use page-token-based pagination and `filter_string`
-expressions following existing MLflow conventions:
+expressions following existing MLflow conventions.
 
-- `name LIKE '%review%'`
-- `publish_state = 'published'`
-- `tags.team = 'platform'`
-- `source_type = 'git'`
+**Skills and skill groups:** `name LIKE '%review%'`, `status = 'active'`,
+`tags.team = 'platform'`
 
-### Python SDK
+**Skill versions:** `publish_state = 'published'`,
+`source_type = 'git'`, `tags.scan.prompt-injection.status = 'pass'`
+
+**Skill group versions:** `publish_state = 'published'`,
+`tags.approved = 'true'`
+
+### Python SDK and CLI
 
 The `mlflow.skills` module exposes top-level functions delegating to
-`MlflowClient`:
-
-```python
-import mlflow
-
-# Skills
-mlflow.skills.create_skill(name, description=None)
-mlflow.skills.get_skill(name)
-mlflow.skills.search_skills(filter_string=None, max_results=100, page_token=None)
-mlflow.skills.update_skill(name, description=None, status=None)
-mlflow.skills.delete_skill(name)
-
-# Skill versions
-mlflow.skills.create_skill_version(name, version, source_type, source_url, publish_state="draft", content_hash=None, run_id=None)
-mlflow.skills.get_skill_version(name, version, source_type)
-mlflow.skills.get_skill_version_by_alias(name, alias)
-mlflow.skills.get_latest_skill_version(name)
-mlflow.skills.search_skill_versions(name, filter_string=None, max_results=100, page_token=None)
-mlflow.skills.update_skill_version(name, version, source_type, publish_state=None)
-mlflow.skills.delete_skill_version(name, version, source_type)
-
-# Tags
-mlflow.skills.set_skill_tag(name, key, value)
-mlflow.skills.delete_skill_tag(name, key)
-mlflow.skills.set_skill_version_tag(name, version, source_type, key, value)
-mlflow.skills.delete_skill_version_tag(name, version, source_type, key)
-
-# Aliases
-mlflow.skills.set_skill_alias(name, alias, version, source_type)
-mlflow.skills.delete_skill_alias(name, alias)
-
-# Skill groups
-mlflow.skills.create_skill_group(name, description=None)
-mlflow.skills.get_skill_group(name)
-mlflow.skills.search_skill_groups(filter_string=None, max_results=100, page_token=None)
-mlflow.skills.update_skill_group(name, description=None, status=None)
-mlflow.skills.delete_skill_group(name)
-
-# Skill group versions
-mlflow.skills.create_skill_group_version(name, version, members, publish_state="draft")
-mlflow.skills.get_skill_group_version(name, version)
-mlflow.skills.get_skill_group_version_by_alias(name, alias)
-mlflow.skills.get_latest_skill_group_version(name)
-mlflow.skills.search_skill_group_versions(name, filter_string=None, max_results=100, page_token=None)
-mlflow.skills.update_skill_group_version(name, version, publish_state=None)
-mlflow.skills.delete_skill_group_version(name, version)
-
-# Skill group tags
-mlflow.skills.set_skill_group_tag(name, key, value)
-mlflow.skills.delete_skill_group_tag(name, key)
-mlflow.skills.set_skill_group_version_tag(name, version, key, value)
-mlflow.skills.delete_skill_group_version_tag(name, version, key)
-
-# Skill group aliases
-mlflow.skills.set_skill_group_alias(name, alias, version)
-mlflow.skills.delete_skill_group_alias(name, alias)
-```
-
-### CLI commands
-
-| Command | Description |
-|---|---|
-| `mlflow skills create` | Create a skill |
-| `mlflow skills get` | Get a skill by name |
-| `mlflow skills search` | Search skills |
-| `mlflow skills update` | Update skill description or status |
-| `mlflow skills delete` | Delete a skill and all versions |
-| `mlflow skills create-version` | Create a version with source pointer |
-| `mlflow skills get-version` | Get a specific version |
-| `mlflow skills get-version-by-alias` | Resolve an alias |
-| `mlflow skills get-latest-version` | Get the most recent version |
-| `mlflow skills search-versions` | Search versions |
-| `mlflow skills update-version` | Update publish state |
-| `mlflow skills delete-version` | Delete a version |
-| `mlflow skills set-tag` | Set a skill-level tag |
-| `mlflow skills delete-tag` | Delete a skill-level tag |
-| `mlflow skills set-version-tag` | Set a version-level tag |
-| `mlflow skills delete-version-tag` | Delete a version-level tag |
-| `mlflow skills set-alias` | Set a version alias |
-| `mlflow skills delete-alias` | Delete a version alias |
-| `mlflow skill-groups create` | Create a skill group |
-| `mlflow skill-groups get` | Get a group by name |
-| `mlflow skill-groups search` | Search groups |
-| `mlflow skill-groups update` | Update group description or status |
-| `mlflow skill-groups delete` | Delete a group and all versions |
-| `mlflow skill-groups create-version` | Create a group version with members |
-| `mlflow skill-groups get-version` | Get a specific group version |
-| `mlflow skill-groups get-version-by-alias` | Resolve a group alias |
-| `mlflow skill-groups get-latest-version` | Get the most recent group version |
-| `mlflow skill-groups search-versions` | Search group versions |
-| `mlflow skill-groups update-version` | Update group version publish state |
-| `mlflow skill-groups delete-version` | Delete a group version |
-| `mlflow skill-groups set-tag` | Set a group-level tag |
-| `mlflow skill-groups delete-tag` | Delete a group-level tag |
-| `mlflow skill-groups set-version-tag` | Set a group version tag |
-| `mlflow skill-groups delete-version-tag` | Delete a group version tag |
-| `mlflow skill-groups set-alias` | Set a group version alias |
-| `mlflow skill-groups delete-alias` | Delete a group version alias |
+`MlflowClient`, with a 1:1 mapping to the abstract store methods above.
+Two CLI command groups (`mlflow skills` and `mlflow skill-groups`)
+provide the same operations from the command line. See the basic
+examples at the top of this RFC for usage.
 
 ### Error handling
 
@@ -1136,7 +1028,8 @@ mlflow.skills.delete_skill_group_alias(name, alias)
 | Alias references non-existent version | `RESOURCE_DOES_NOT_EXIST` | 404 |
 | Group version member references non-existent skill version | `RESOURCE_DOES_NOT_EXIST` | 404 |
 | Delete skill version referenced by a group version | `INVALID_PARAMETER_VALUE` | 400 |
-| Delete skill or group with existing versions | Cascading delete (succeeds) | 200 |
+| Delete skill with versions referenced by a group | `INVALID_PARAMETER_VALUE` | 400 |
+| Delete skill or group with no group references | Cascading delete (succeeds) | 200 |
 
 ### Workspace scoping
 
@@ -1197,89 +1090,38 @@ a skill version stays in `draft` until scans pass, then is moved to
 `published`. The registry does not enforce this workflow, but the
 combination of publish state and scan tags makes it easy to implement.
 
-### Impact on existing MLflow components
-
-| Component | Impact | Description |
-|---|---|---|
-| Database schema | **New tables** | 12 new tables via Alembic migration |
-| Tracking server | **New routes** | New FastAPI routers for skills and skill groups |
-| Python client | **New module** | `mlflow.skills` module |
-| CLI | **New command groups** | `mlflow skills` and `mlflow skill-groups` |
-| Model registry | **None** | No changes |
-| Other registries | **None** | No changes |
-| UI | **New page** | Skills page under GenAI workflow |
-| Authentication/RBAC | **Leverages existing** | Uses existing workspace and permission infrastructure |
-
 ## Drawbacks
 
-- **New database tables.** Twelve new tables and an Alembic migration add
-  to the schema surface. This is more than a minimal registry, but the
-  additional tables support versioned skill groups with full tag and
-  alias support.
-- **Pattern duplication.** Some duplication with the MCP Server Registry
-  until shared abstractions are extracted. The consistent design approach
-  mitigates this.
-- **Source URL validity.** The registry stores source pointers but cannot
-  guarantee they remain valid. Broken links are possible. The optional
-  `content_hash` field mitigates content tampering but does not prevent
-  link rot. This is inherent to a metadata-first design and is the
-  same tradeoff as any catalog that points to external content.
-- **No artifact storage.** Unlike the Databricks skill registry
-  prototype (which stores skill bundles as MLflow artifacts), this design
-  does not provide a self-contained backup of skill content. If the
-  source system goes away, the metadata remains but the content is lost.
+- **Source pointer validity.** The registry stores source pointers but
+  cannot guarantee they remain valid. The optional `content_digest`
+  field mitigates content tampering but does not prevent link rot. This
+  is inherent to a metadata-first design.
+- **No artifact storage.** This design does not provide a self-contained
+  backup of skill content. If the source system goes away, the metadata
+  remains but the content is lost.
 
 # Alternatives
 
 ## Store skill artifacts directly in MLflow
 
 Store skill bundles (SKILL.md + scripts + assets) as MLflow artifacts
-alongside the metadata, similar to how the Databricks prototype works.
+alongside the metadata.
 
-Rejected because:
-- Skills are already versioned and stored in Git, OCI, or other systems.
-  Duplicating content into MLflow artifact storage adds complexity
-  without clear value.
-- Metadata-first aligns with the MCP Server Registry design, which
-  stores a `server_json` payload but not the MCP server runtime itself.
-- Source pointers federate across distribution mechanisms naturally.
-  Artifact storage forces centralization.
-- Organizations that want artifact backup can use OCI registries, which
-  already provide versioned, content-addressable storage.
-
-## Reuse the Model Registry for skills
-
-Store skill metadata as model registry entries with skill-specific tags.
-
-Rejected because:
-- Model registry uses auto-incremented integer versions; skills use
-  publisher-supplied version strings.
-- Model registry lifecycle (staging/production/archived) does not match
-  the publish-state lifecycle needed for skills.
-- Conceptual confusion: skills are not models.
-- No support for skill groups.
-
-## Build a standalone skill registry outside MLflow
-
-Build a separate service for skill governance, independent of MLflow.
-
-Rejected because:
-- Duplicates the registry infrastructure MLflow already provides.
-- No integration with MLflow traces for usage analytics.
-- Forces users to manage another service.
-- Contradicts the emerging pattern of MLflow as the governance layer for
-  AI assets.
+Rejected because skills are already versioned and stored in Git, OCI, or
+other systems. Source pointers federate across distribution mechanisms
+naturally; artifact storage forces centralization. Organizations that
+want artifact backup can use OCI registries, which already provide
+versioned, content-addressable storage.
 
 ## Use Git alone (no registry)
 
 Continue using Git repositories as the sole mechanism for skill
 management.
 
-This is sufficient for individual developers and small teams. It is not
-rejected as a bad approach; rather, this RFC proposes a governance layer
-on top of Git for enterprises that need publish-state lifecycle, security
-scan tracking, and federated discovery. The two approaches are
-complementary.
+This is sufficient for individual developers and small teams. This RFC
+proposes a governance layer on top of Git for enterprises that need
+publish-state lifecycle, security scan tracking, and federated discovery.
+The two approaches are complementary.
 
 # Adoption strategy
 
