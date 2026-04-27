@@ -92,7 +92,7 @@ mlflow.genai.set_mcp_server_alias(
 ## Discover and consume MCP servers
 
 ```python
-# Search for active MCP servers
+# Search for active MCP servers (status is derived from latest version)
 servers = mlflow.genai.search_mcp_servers(
     filter_string="status = 'active'",
 )
@@ -133,7 +133,7 @@ As MCP adoption grows, organizations accumulate MCP server definitions across te
 
 - Record which MCP servers exist and what state they are in
 - Version MCP server definitions as they evolve
-- Control which MCP servers are eligible for consumption by AI engineers
+- Control which MCP servers are available to specific users, teams, or agents
 - Associate traces with governed MCP server versions when runtimes participate in MLflow-aware tracing
 - Provide downstream systems (catalogs, gateways, agent frameworks) with a governed source of truth
 
@@ -263,7 +263,6 @@ class MCPServerVersion:
     aliases: list[str] = field(default_factory=list)  # read-only; alias names from parent mcp_server_aliases rows currently pointing at this version
     tags: dict[str, str] = field(default_factory=dict)
     source: str | None = None  # provenance URI (e.g., git repository URL)
-    run_id: str | None = None  # optional MLflow run association
     is_deployed: bool = False  # read-only; derived at query time from active hosted bindings targeting this version, including alias-targeted bindings resolved to this version
     workspace: str | None = None
     created_by: str | None = None
@@ -273,6 +272,12 @@ class MCPServerVersion:
 ```
 
 **Immutability contract**: `name`, `version`, and `server_json` are immutable after creation. To change the MCP payload, register a new version. Mutable fields (`status`, `tags`) can be updated independently. Hosted connectivity is modeled separately via `MCPHostedBinding`.
+
+Retaining older versions enables:
+
+- **Trace provenance**: show exactly which `server_json` was in effect when a trace ran
+- **Deprecation signaling**: consumers see a deprecated version and know to migrate
+- **Audit / compliance**: know which tool definitions were available to agents at a given point in time
 
 **Version uniqueness**: The combination of `(name, version)` is unique within a workspace. This means each version string can only be registered once per server.
 
@@ -455,7 +460,6 @@ Seven tables, created via a single Alembic migration. All tables are workspace-s
 | `display_name` | `String(256)` | mutable human-readable label |
 | `status` | `String(20)` | default `'active'` |
 | `source` | `String(512)` | provenance URI |
-| `run_id` | `String(32)` | optional MLflow run linkage |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -598,7 +602,6 @@ class MCPServerRegistryMixin:
         server_json: dict,
         display_name: str | None = None,
         source: str | None = None,
-        run_id: str | None = None,
         status: MCPStatus | None = None,  # defaults to ACTIVE
     ) -> MCPServerVersion:
         raise NotImplementedError(self.__class__.__name__)
@@ -781,7 +784,6 @@ class CreateMCPServerVersionRequest(BaseModel):
     display_name: str | None = None
     status: str = "active"
     source: str | None = None
-    run_id: str | None = None
 
 
 class UpdateMCPServerVersionRequest(BaseModel):
@@ -841,7 +843,6 @@ class MCPServerVersionResponse(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     source: str | None = None
-    run_id: str | None = None
     is_deployed: bool = False  # derived at query time from active hosted bindings
     created_by: str | None = None
     last_updated_by: str | None = None
