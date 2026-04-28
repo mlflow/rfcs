@@ -26,35 +26,35 @@ This RFC proposes a `Preset` class that packages a named collection of scorers. 
 
 ```python
 import mlflow
-from mlflow.genai.scorers import AGENT
+from mlflow.genai.scorers import Agent
 
-# Use a built-in preset directly
+# Use a built-in preset directly -- each call creates fresh scorer instances
 result = mlflow.genai.evaluate(
     data=eval_dataset,
     predict_fn=predict_fn,
-    scorers=[AGENT],
+    scorers=[Agent()],
 )
 ```
 
 ```python
 # Mix presets and individual scorers
-from mlflow.genai.scorers import AGENT, Guidelines
+from mlflow.genai.scorers import Agent, Guidelines
 
 result = mlflow.genai.evaluate(
     data=eval_dataset,
     predict_fn=predict_fn,
-    scorers=[AGENT, Guidelines(name="tone", guidelines=["Respond professionally"])],
+    scorers=[Agent(), Guidelines(name="tone", guidelines=["Respond professionally"])],
 )
 ```
 
 ```python
 # Combine presets -- duplicates are resolved automatically
-from mlflow.genai.scorers import AGENT, SAFETY
+from mlflow.genai.scorers import Agent, SafetyPreset
 
 # Both contain Safety(); it runs once, not twice
 result = mlflow.genai.evaluate(
     data=eval_dataset,
-    scorers=[AGENT, SAFETY],
+    scorers=[Agent(), SafetyPreset()],
 )
 ```
 
@@ -187,10 +187,74 @@ class Preset:
 
 **Key design decisions:**
 
-- **Immutable.** Scorers are stored as a tuple and exposed via a read-only property. Built-in presets are module-level constants and must not be mutated.
+- **Immutable.** Scorers are stored as a tuple and exposed via a read-only property.
 - **Not a `Scorer` subclass.** A preset doesn't produce feedback -- it's a container. The evaluation loop assumes one scorer = one result column. Making `Preset` a scorer would require changes throughout the pipeline (aggregation, telemetry, serialization).
-- **Iterable.** Supports `__iter__`, `__len__`, and `__add__`/`__radd__` so it composes naturally: `AGENT + [my_scorer]`, `[my_scorer] + AGENT`, or `AGENT + SAFETY`.
+- **Iterable.** Supports `__iter__`, `__len__`, and `__add__`/`__radd__` so it composes naturally: `Agent() + [my_scorer]`, `[my_scorer] + Agent()`, or `Agent() + SafetyPreset()`.
 - **Stores instances, not classes.** Users pass already-configured scorer instances.
+
+### Built-in Presets as Subclasses
+
+Each built-in preset is a subclass of `Preset` that hardcodes its scorer list. This means each call creates **fresh scorer instances** (no shared mutable singletons) and opens the door for preset-specific configuration and control flow in the future.
+
+```python
+class Agent(Preset):
+    def __init__(self):
+        super().__init__("agent", [
+            ToolCallCorrectness(),
+            ToolCallEfficiency(),
+            RelevanceToQuery(),
+            Safety(),
+            Completeness(),
+        ])
+
+class Rag(Preset):
+    def __init__(self):
+        super().__init__("rag", [
+            RetrievalRelevance(),
+            RetrievalSufficiency(),
+            RetrievalGroundedness(),
+            RelevanceToQuery(),
+            Safety(),
+            Completeness(),
+        ])
+
+class ConversationalAgent(Preset):
+    def __init__(self):
+        super().__init__("conversational-agent", [
+            ToolCallCorrectness(),
+            ToolCallEfficiency(),
+            RelevanceToQuery(),
+            Safety(),
+            Completeness(),
+            UserFrustration(),
+            ConversationCompleteness(),
+            ConversationalSafety(),
+            ConversationalToolCallEfficiency(),
+            KnowledgeRetention(),
+        ])
+
+class SafetyPreset(Preset):
+    def __init__(self):
+        super().__init__("safety", [
+            Safety(),
+            ConversationalSafety(),
+        ])
+
+class Quality(Preset):
+    def __init__(self):
+        super().__init__("quality", [
+            RelevanceToQuery(),
+            Fluency(),
+            Completeness(),
+        ])
+```
+
+**Why subclasses over instances:**
+
+- **Fresh instances every time.** `Agent()` creates new scorer instances on each call. No shared mutable state — the singleton problem is eliminated entirely.
+- **Preset-specific configuration.** Each preset can accept its own parameters in the future (e.g., `Agent(model="openai:/gpt-4o")` to set the judge model for all scorers).
+- **Type checking.** `isinstance(preset, Agent)` works — code can distinguish which preset is being used.
+- **Custom control flow.** Each preset can override methods for preset-specific validation or behavior.
 
 ### Deduplication
 
@@ -235,7 +299,7 @@ def validate_scorers(scorers: list[Any]) -> list[Scorer]:
     if not isinstance(scorers, list):
         raise MlflowException.invalid_parameter_value(
             "The `scorers` argument must be a list of scorers or presets. "
-            "You can use a built-in preset like `scorers=[AGENT]`, or "
+            "You can use a built-in preset like `scorers=[Agent()]`, or "
             "`scorers=get_all_scorers()` for all available built-in scorers."
         )
 
@@ -263,20 +327,19 @@ def validate_scorers(scorers: list[Any]) -> list[Scorer]:
 
 `evaluate()` itself does not change. By the time scorers reach the evaluation loop, they are all individual `Scorer` instances.
 
-### Built-in Presets
+### Built-in Preset Summary
 
-MLflow ships five built-in presets as module-level constants. All contained scorers use default constructors.
+MLflow ships five built-in preset subclasses. Each call creates fresh scorer instances.
 
-> **Note:** `**TaskSuccess`** is a new scorer proposed in [mlflow/mlflow#22972](https://github.com/mlflow/mlflow/issues/22972). It evaluates whether an agent successfully accomplished the user's task without requiring ground truth data — unlike `Correctness`, which requires an `expectations` column. This scorer would be added to the `AGENT`, `CONVERSATIONAL_AGENT`, and `QUALITY` presets. This work can be part of this RFC or be a future addition after this RFC is completed.
+> **Note:** **`TaskSuccess`** is a new scorer proposed in [mlflow/mlflow#22972](https://github.com/mlflow/mlflow/issues/22972). It evaluates whether an agent successfully accomplished the user's task without requiring ground truth data — unlike `Correctness`, which requires an `expectations` column. This scorer would be added to `Agent`, `ConversationalAgent`, and `Quality`. This work can be part of this RFC or be a future addition after this RFC is completed.
 
-
-| Preset                 | Scorers                                                                                                                                | Use Case                                                  |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| `RAG`                  | RetrievalRelevance, RetrievalSufficiency, RetrievalGroundedness, RelevanceToQuery, Safety, Completeness                                | Retrieval-augmented generation pipelines                  |
-| `AGENT`                | ToolCallCorrectness, ToolCallEfficiency, RelevanceToQuery, Safety, Completeness, **TaskSuccess**                                       | Single-turn tool-calling agents                           |
-| `CONVERSATIONAL_AGENT` | All of `AGENT` + UserFrustration, ConversationCompleteness, ConversationalSafety, ConversationalToolCallEfficiency, KnowledgeRetention | Multi-turn conversational agents                          |
-| `SAFETY`               | Safety, ConversationalSafety                                                                                                           | Safety-focused evaluation (composable with other presets) |
-| `QUALITY`              | RelevanceToQuery, Fluency, Completeness, **TaskSuccess**                                                                               | Architecture-independent output quality                   |
+| Preset                 | Scorers                                                                                                                                 | Use Case                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `Rag()`                | RetrievalRelevance, RetrievalSufficiency, RetrievalGroundedness, RelevanceToQuery, Safety, Completeness                                 | Retrieval-augmented generation pipelines                 |
+| `Agent()`              | ToolCallCorrectness, ToolCallEfficiency, RelevanceToQuery, Safety, Completeness, **TaskSuccess**                                        | Single-turn tool-calling agents                          |
+| `ConversationalAgent()`| All of `Agent` + UserFrustration, ConversationCompleteness, ConversationalSafety, ConversationalToolCallEfficiency, KnowledgeRetention  | Multi-turn conversational agents                         |
+| `SafetyPreset()`       | Safety, ConversationalSafety                                                                                                            | Safety-focused evaluation (composable with other presets) |
+| `Quality()`            | RelevanceToQuery, Fluency, Completeness, **TaskSuccess**                                                                                | Architecture-independent output quality                  |
 
 
 #### Design Rationale
@@ -355,62 +418,39 @@ class Preset:
         return f"Preset('{self._name}', [{', '.join(scorer_names)}])"
 
 
-RAG = Preset("rag", [
-    RetrievalRelevance(),
-    RetrievalSufficiency(),
-    RetrievalGroundedness(),
-    RelevanceToQuery(),
-    Safety(),
-    Completeness(),
-])
+class Rag(Preset):
+    def __init__(self):
+        super().__init__("rag", [
+            RetrievalRelevance(), RetrievalSufficiency(), RetrievalGroundedness(),
+            RelevanceToQuery(), Safety(), Completeness(),
+        ])
 
-AGENT = Preset("agent", [
-    ToolCallCorrectness(),
-    ToolCallEfficiency(),
-    RelevanceToQuery(),
-    Safety(),
-    Completeness(),
-])
+class Agent(Preset):
+    def __init__(self):
+        super().__init__("agent", [
+            ToolCallCorrectness(), ToolCallEfficiency(),
+            RelevanceToQuery(), Safety(), Completeness(),
+        ])
 
-CONVERSATIONAL_AGENT = Preset("conversational-agent", [
-    ToolCallCorrectness(),
-    ToolCallEfficiency(),
-    RelevanceToQuery(),
-    Safety(),
-    Completeness(),
-    UserFrustration(),
-    ConversationCompleteness(),
-    ConversationalSafety(),
-    ConversationalToolCallEfficiency(),
-    KnowledgeRetention(),
-])
+class ConversationalAgent(Preset):
+    def __init__(self):
+        super().__init__("conversational-agent", [
+            ToolCallCorrectness(), ToolCallEfficiency(),
+            RelevanceToQuery(), Safety(), Completeness(),
+            UserFrustration(), ConversationCompleteness(),
+            ConversationalSafety(), ConversationalToolCallEfficiency(),
+            KnowledgeRetention(),
+        ])
 
-SAFETY = Preset("safety", [
-    Safety(),
-    ConversationalSafety(),
-])
+class SafetyPreset(Preset):
+    def __init__(self):
+        super().__init__("safety", [Safety(), ConversationalSafety()])
 
-QUALITY = Preset("quality", [
-    RelevanceToQuery(),
-    Fluency(),
-    Completeness(),
-    Correctness(),
-])
-
-_BUILTIN_PRESETS = {
-    "rag": RAG,
-    "agent": AGENT,
-    "conversational-agent": CONVERSATIONAL_AGENT,
-    "safety": SAFETY,
-    "quality": QUALITY,
-}
-
-
-def list_presets() -> dict[str, list[str]]:
-    return {
-        name: [type(s).__name__ for s in preset]
-        for name, preset in _BUILTIN_PRESETS.items()
-    }
+class Quality(Preset):
+    def __init__(self):
+        super().__init__("quality", [
+            RelevanceToQuery(), Fluency(), Completeness(),
+        ])
 ```
 
 No circular dependency risk: `presets.py` imports from `builtin_scorers.py`, and nothing in the existing chain imports from `presets.py`.
@@ -421,8 +461,8 @@ Add `Preset`, the built-in preset constants, and `list_presets` to `_LAZY_IMPORT
 
 ```python
 _LAZY_IMPORTS_PRESETS = {
-    "Preset", "RAG", "AGENT", "CONVERSATIONAL_AGENT",
-    "SAFETY", "QUALITY", "list_presets",
+    "Preset", "Rag", "Agent", "ConversationalAgent",
+    "SafetyPreset", "Quality", "list_presets",
 }
 
 def __getattr__(name):
@@ -444,7 +484,7 @@ def validate_scorers(scorers: list[Any]) -> list[Scorer]:
     if not isinstance(scorers, list):
         raise MlflowException.invalid_parameter_value(
             "The `scorers` argument must be a list of scorers or presets. "
-            "You can use a built-in preset like `scorers=[AGENT]`, or "
+            "You can use a built-in preset like `scorers=[Agent()]`, or "
             "`scorers=get_all_scorers()` for all available built-in scorers."
         )
 
@@ -478,24 +518,32 @@ New file: `tests/genai/scorers/test_presets.py`
 | ---------------------------------------- | --------------------------------------------------------- |
 | `test_builtin_preset_{rag,agent,...}`    | Exact scorer types in each built-in preset                |
 | `test_custom_preset`                     | Users can create a `Preset` with arbitrary scorers        |
-| `test_preset_in_validate_scorers`        | `validate_scorers([AGENT, my_scorer])` flattens correctly |
-| `test_preset_deduplication`              | `[AGENT, SAFETY]` deduplicates shared `Safety()`          |
+| `test_preset_in_validate_scorers`        | `validate_scorers([Agent(), my_scorer])` flattens correctly |
+| `test_preset_deduplication`              | `[Agent(), SafetyPreset()]` deduplicates shared `Safety()` |
 | `test_dedup_preserves_different_names`   | Two `Guidelines` with different names are both kept       |
-| `test_preset_add_list`                   | `AGENT + [Fluency()]` returns a combined list             |
-| `test_list_add_preset`                   | `[Fluency()] + AGENT` returns a combined list             |
-| `test_preset_add_preset`                 | `AGENT + SAFETY` returns a combined list                  |
-| `test_preset_iter_and_len`               | `list(AGENT)` and `len(AGENT)` work correctly             |
+| `test_preset_add_list`                   | `Agent() + [Fluency()]` returns a combined list           |
+| `test_list_add_preset`                   | `[Fluency()] + Agent()` returns a combined list           |
+| `test_preset_add_preset`                 | `Agent() + SafetyPreset()` returns a combined list        |
+| `test_preset_iter_and_len`               | `list(Agent())` and `len(Agent())` work correctly         |
 | `test_preset_invalid_scorer_in_validate` | A preset containing a non-scorer raises `MlflowException` |
 | `test_list_presets`                      | Returns correct dict with correct class names             |
-| `test_preset_repr`                       | `repr(AGENT)` shows name and scorer class names           |
+| `test_preset_repr`                       | `repr(Agent())` shows name and scorer class names         |
+| `test_preset_fresh_instances`            | `Agent()` creates new scorer instances each time          |
 
 
 ```python
-@pytest.mark.parametrize("preset", [RAG, AGENT, CONVERSATIONAL_AGENT, SAFETY, QUALITY])
-def test_builtin_preset_contains_valid_scorers(preset):
+@pytest.mark.parametrize("preset_cls", [Rag, Agent, ConversationalAgent, SafetyPreset, Quality])
+def test_builtin_preset_contains_valid_scorers(preset_cls):
+    preset = preset_cls()
     assert len(preset) > 0
     assert all(isinstance(s, BuiltInScorer) for s in preset)
     assert len(list(preset)) == len(set(type(s) for s in preset))  # no duplicates
+
+def test_preset_fresh_instances():
+    a1 = Agent()
+    a2 = Agent()
+    # Each call creates new scorer instances
+    assert a1.scorers[0] is not a2.scorers[0]
 ```
 
 ### Files Changed
@@ -640,13 +688,13 @@ This is an **additive, non-breaking change**. Existing code continues to work un
 
 - Update documentation and templates to show `Preset` usage alongside the manual import pattern.
 - Update the `validate_scorers()` error message to mention presets for discoverability.
-- Databricks agent templates can simplify from 9 imports + 9 instantiations to `scorers=[CONVERSATIONAL_AGENT]`.
+- Databricks agent templates can simplify from 9 imports + 9 instantiations to `scorers=[ConversationalAgent()]`.
 
 # Open Questions
 
 1. **Should `ConversationalRoleAdherence` be in `CONVERSATIONAL_AGENT`?** Currently excluded because it requires a defined persona. **Open for discussion.**
-2. **Should `Correctness` be in `AGENT` or `RAG`?** Currently only in `QUALITY` because it requires `expectations` data. **Open for discussion.**
-3. **Should there be an `ALL` preset?** `get_all_scorers()` already serves this role. **Recommendation:** Do not add.
+2. **Should `Correctness` be in `Agent` or `Rag`?** Currently excluded from all presets because it requires `expectations` data. **Open for discussion.**
+3. **Should there be an `All` preset?** `get_all_scorers()` already serves this role. **Recommendation:** Do not add.
 4. **Deduplication key.** Should deduplication use `type(scorer)` alone, or `(type(scorer), scorer.name)`? The latter preserves multiple instances of the same class with different names (e.g., two `Guidelines` with different rules).
-5. **Future: parameterized presets?** e.g., `AGENT.with_model("openai:/gpt-4o")` returning a new preset with the model set on all scorers. Deferred to keep the initial API simple.
+5. **Future: parameterized presets?** e.g., `Agent(model="openai:/gpt-4o")` to set the judge model for all scorers in the preset. Can be a future addition.
 
