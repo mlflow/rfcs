@@ -20,7 +20,7 @@ rfc_pr:
 
 MLflow provides 21 built-in scorers for evaluating GenAI outputs, but users have no way to select a coherent subset for a specific evaluation pattern. Today, evaluating an agent requires importing and instantiating 9+ individual scorer classes -- boilerplate that gets copy-pasted across teams and templates.
 
-This RFC proposes a `Preset` class that packages a named collection of scorers. MLflow ships built-in presets for common evaluation patterns (`RAG`, `AGENT`, `CONVERSATIONAL_AGENT`, `SAFETY`, `QUALITY`), and users can define their own. Presets can be passed directly in the `scorers` list alongside individual scorers, with automatic deduplication when presets overlap.
+This RFC proposes a `Preset` class that packages a named collection of scorers. MLflow ships built-in preset subclasses for common evaluation patterns (`Rag`, `Agent`, `ConversationalAgent`, `SafetyPreset`, `Quality`), and users can define their own. Presets can be passed directly in the `scorers` list alongside individual scorers, with automatic deduplication when presets overlap.
 
 # Basic Example
 
@@ -258,7 +258,7 @@ class Quality(Preset):
 
 ### Deduplication
 
-When multiple presets are combined, the same scorer type can appear more than once. For example, `AGENT` and `SAFETY` both contain `Safety()`. Running the same scorer twice wastes LLM API calls and produces duplicate result columns.
+When multiple presets are combined, the same scorer type can appear more than once. For example, `Agent()` and `SafetyPreset()` both contain `Safety()`. Running the same scorer twice wastes LLM API calls and produces duplicate result columns.
 
 `validate_scorers()` deduplicates by scorer type after flattening:
 
@@ -274,7 +274,7 @@ def _deduplicate_scorers(scorers: list[Scorer]) -> list[Scorer]:
     return result
 ```
 
-This uses first-occurrence-wins: if `AGENT` appears before `SAFETY` in the list, the `Safety()` instance from `AGENT` is kept and the one from `SAFETY` is dropped. For built-in scorers with default constructors, the instances are interchangeable, so the choice is arbitrary.
+This uses first-occurrence-wins: if `Agent()` appears before `SafetyPreset()` in the list, the `Safety()` instance from `Agent()` is kept and the one from `SafetyPreset()` is dropped. For built-in scorers with default constructors, the instances are interchangeable, so the choice is arbitrary.
 
 Custom scorers with the same type but different configurations (e.g., two `Guidelines` instances with different `guidelines` args) should **not** be deduplicated, since they produce different results. The deduplication uses `type(scorer)` as the key, but scorers with different `name` attributes are kept:
 
@@ -344,10 +344,10 @@ MLflow ships five built-in preset subclasses. Each call creates fresh scorer ins
 
 #### Design Rationale
 
-- **Safety is in `RAG` and `AGENT`** because these presets aim to be complete starting points. Most users want safety checks without composing two presets.
-- **Fluency is excluded from `AGENT`** because agent evaluation emphasizes tool usage and task completion. Users who need it can compose: `AGENT + [Fluency()]`.
-- **`CONVERSATIONAL_AGENT` excludes `ConversationalRoleAdherence`** because it requires a defined persona in the system prompt, which not all agents have.
-- **`Correctness` is excluded from all presets** because it requires `expectations` (ground truth) data. Users who have ground truth can add it manually: `QUALITY + [Correctness()]`.
+- **Safety is in `Rag` and `Agent`** because these presets aim to be complete starting points. Most users want safety checks without composing two presets.
+- **Fluency is excluded from `Agent`** because agent evaluation emphasizes tool usage and task completion. Users who need it can compose: `Agent() + [Fluency()]`.
+- **`ConversationalAgent` excludes `ConversationalRoleAdherence`** because it requires a defined persona in the system prompt, which not all agents have.
+- **`Correctness` is excluded from all presets** because it requires `expectations` (ground truth) data. Users who have ground truth can add it manually: `Quality() + [Correctness()]`.
 - **`Guidelines` and `ConversationalGuidelines` are excluded from all presets** because both require a `guidelines` constructor argument.
 
 ### `list_presets()`
@@ -692,7 +692,7 @@ This is an **additive, non-breaking change**. Existing code continues to work un
 
 # Open Questions
 
-1. **Should `ConversationalRoleAdherence` be in `CONVERSATIONAL_AGENT`?** Currently excluded because it requires a defined persona. **Open for discussion.**
+1. **Should `ConversationalRoleAdherence` be in `ConversationalAgent`?** Currently excluded because it requires a defined persona. **Open for discussion.**
 2. **Should `Correctness` be in `Agent` or `Rag`?** Currently excluded from all presets because it requires `expectations` data. **Open for discussion.**
 3. **Should there be an `All` preset?** `get_all_scorers()` already serves this role. **Recommendation:** Do not add.
 4. **Deduplication key.** Should deduplication use `type(scorer)` alone, or `(type(scorer), scorer.name)`? The latter preserves multiple instances of the same class with different names (e.g., two `Guidelines` with different rules).
