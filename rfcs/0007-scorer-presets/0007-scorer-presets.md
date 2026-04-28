@@ -70,14 +70,6 @@ result = mlflow.genai.evaluate(
 )
 ```
 
-```python
-# Discover available built-in presets
-from mlflow.genai.scorers import list_presets
-
-for name, scorer_names in list_presets().items():
-    print(f"{name}: {', '.join(scorer_names)}")
-```
-
 ## Motivation
 
 ### The Problem
@@ -350,15 +342,6 @@ MLflow ships five built-in preset subclasses. Each call creates fresh scorer ins
 - **`Correctness` is excluded from all presets** because it requires `expectations` (ground truth) data. Users who have ground truth can add it manually: `Quality() + [Correctness()]`.
 - **`Guidelines` and `ConversationalGuidelines` are excluded from all presets** because both require a `guidelines` constructor argument.
 
-### `list_presets()`
-
-A companion function for discovering available built-in presets:
-
-```python
-def list_presets() -> dict[str, list[str]]:
-    """Return a mapping of built-in preset names to their scorer class names."""
-```
-
 ### Implementation
 
 #### New file: `mlflow/genai/scorers/presets.py`
@@ -457,12 +440,12 @@ No circular dependency risk: `presets.py` imports from `builtin_scorers.py`, and
 
 #### Updated: `mlflow/genai/scorers/__init__.py`
 
-Add `Preset`, the built-in preset constants, and `list_presets` to `_LAZY_IMPORTS`, `__all__`, and the `TYPE_CHECKING` block. The `__getattr__` function dispatches to the `presets` module:
+Add `Preset` and the built-in preset subclasses to `_LAZY_IMPORTS`, `__all__`, and the `TYPE_CHECKING` block. The `__getattr__` function dispatches to the `presets` module:
 
 ```python
 _LAZY_IMPORTS_PRESETS = {
     "Preset", "Rag", "Agent", "ConversationalAgent",
-    "SafetyPreset", "Quality", "list_presets",
+    "SafetyPreset", "Quality",
 }
 
 def __getattr__(name):
@@ -506,7 +489,7 @@ def validate_scorers(scorers: list[Any]) -> list[Scorer]:
 Re-export for convenience:
 
 ```python
-from mlflow.genai.scorers import Preset, list_presets
+from mlflow.genai.scorers import Preset
 ```
 
 ### Testing Plan
@@ -526,7 +509,6 @@ New file: `tests/genai/scorers/test_presets.py`
 | `test_preset_add_preset`                 | `Agent() + SafetyPreset()` returns a combined list        |
 | `test_preset_iter_and_len`               | `list(Agent())` and `len(Agent())` work correctly         |
 | `test_preset_invalid_scorer_in_validate` | A preset containing a non-scorer raises `MlflowException` |
-| `test_list_presets`                      | Returns correct dict with correct class names             |
 | `test_preset_repr`                       | `repr(Agent())` shows name and scorer class names         |
 | `test_preset_fresh_instances`            | `Agent()` creates new scorer instances each time          |
 
@@ -551,9 +533,9 @@ def test_preset_fresh_instances():
 
 | File                                  | Change                                                           |
 | ------------------------------------- | ---------------------------------------------------------------- |
-| `mlflow/genai/scorers/presets.py`     | **New.** `Preset` class, built-in presets, `list_presets()`.     |
-| `mlflow/genai/scorers/__init__.py`    | Add lazy imports for `Preset`, built-in presets, `list_presets`. |
-| `mlflow/genai/__init__.py`            | Re-export `Preset`, `list_presets`.                              |
+| `mlflow/genai/scorers/presets.py`     | **New.** `Preset` class and built-in preset subclasses.          |
+| `mlflow/genai/scorers/__init__.py`    | Add lazy imports for `Preset` and built-in presets.              |
+| `mlflow/genai/__init__.py`            | Re-export `Preset`.                                              |
 | `mlflow/genai/scorers/validation.py`  | Flatten presets and deduplicate in `validate_scorers()`.         |
 | `tests/genai/scorers/test_presets.py` | **New.** Tests for `Preset` class and built-in presets.          |
 
