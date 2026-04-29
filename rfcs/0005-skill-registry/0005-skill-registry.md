@@ -67,7 +67,7 @@ mlflow.genai.skills.set_skill_alias(
     version="1.0.0",
 )
 
-# Record a security scan result as a tag
+# Record security scan results (see "Security scan tracking" for convention)
 mlflow.genai.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
@@ -78,7 +78,13 @@ mlflow.genai.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
     key="scan.prompt-injection.date",
-    value="2026-04-22",
+    value="2026-04-29",
+)
+mlflow.genai.skills.set_skill_version_tag(
+    name="code-review",
+    version="1.0.0",
+    key="scan.prompt-injection.tool",
+    value="promptfoo/1.2.0",
 )
 ```
 
@@ -361,39 +367,28 @@ address:
 
 ### Use cases
 
-1. **Governed registration**: Platform administrators register
-   capability metadata with typed source pointers to where the content
-   lives (Git, OCI, ZIP). The registry governs; the source system
-   stores. All four capability kinds (skill, agent, mcp-server, hook)
-   use the same registration model.
+**Platform administrator** — A platform admin at Acme Corp registers
+their team's code-review skill, pointing to its Git source. They
+create a version, record a prompt-injection scan result as a tag, and
+group it with a security-auditor agent and a GitHub MCP server into a
+"pr-workflow" skill group. They set the group's `production` alias to
+the tested version. When a newer version introduces a vulnerability,
+they deprecate it — downstream consumers resolving `production` are
+unaffected because the alias still points to the safe version.
 
-2. **Lifecycle management**: Capability versions move through status
-   states (active, deprecated, deleted) to control downstream
-   surfacing. This is the governance layer that Git lacks.
+**Developer** — A developer starting a new project searches the
+registry for active skills filtered by `kind = 'skill'`. They find
+the `pr-workflow` group, resolve its `production` alias, and run
+`mlflow skills pull --group pr-workflow --alias production` to fetch
+all member content locally. They can also browse and install directly
+from their agent harness if marketplace integration is configured
+([RFC-0006](../0006-skill-harness-integration/0006-skill-harness-integration.md)).
 
-3. **Security scan tracking**: Scan results (prompt injection, code
-   vulnerabilities, etc.) are recorded as version-level tags. The
-   registry does not perform scans; it provides the metadata layer for
-   recording and querying results.
-
-4. **Cross-kind grouping**: Related capabilities of any kind are
-   organized into skill groups for discovery and governance. A skill
-   group maps to the "plugin" concept in agent harnesses — for example,
-   a "pr-workflow" group might bundle a code-review skill, a
-   security-auditor agent, and a GitHub MCP server.
-
-5. **Federated discovery**: Users discover published capabilities and
-   groups across all source types from a single search interface,
-   filtered by kind, without requiring content to be centralized.
-
-6. **Pull**: `mlflow skills pull` fetches capability content from its
-   registered source to a local directory. This is source-type-aware
-   (git clone, OCI pull, ZIP extract) and harness-agnostic.
-
-7. **Usage analytics**: Agent traces record which capability versions
-   were used. Combined with registry metadata, this enables
-   organizations to understand adoption and make data-driven promotion
-   decisions.
+**Security engineer** — A security engineer queries scan tags across
+all skill versions to find capabilities that haven't been scanned
+recently (`tags.scan.prompt-injection.date < '2026-01-01'`). They
+deprecate versions that fail re-scanning and track compliance posture
+across the organization's registered capabilities.
 
 ### Out of scope
 
@@ -1340,6 +1335,36 @@ and other AI asset registries. It is expected to be solved at the
 platform level across all MLflow registries rather than piecemeal in
 each one.
 
+### Permissions
+
+The skill registry integrates with MLflow's existing permission
+framework (READ / EDIT / MANAGE), applied at the `Skill` and
+`SkillGroup` level. Versions, tags, aliases, and memberships inherit
+permissions from their parent entity.
+
+| Permission | Operations |
+|---|---|
+| `READ` | Search skills and groups, get versions, resolve aliases, list tags and memberships |
+| `EDIT` | Create skills and groups, create versions, set and delete tags, update description |
+| `MANAGE` | Status transitions (deprecate, delete), set and delete aliases, delete versions, delete skills and groups, manage permissions |
+
+Key design choices:
+
+- **Status transitions require MANAGE.** Deprecating or deleting a
+  capability version affects all downstream consumers. This is a
+  governance action, not a routine edit, and should require elevated
+  permissions.
+- **Alias management requires MANAGE.** Aliases like `production`
+  control which version downstream consumers resolve to. Changing an
+  alias has the same blast radius as a status transition.
+- **Tag edits require EDIT.** Tags (including scan result tags) are
+  operational metadata. Requiring MANAGE for scan tags would create
+  friction for CI/CD scan integrations that need to record results
+  automatically.
+- **Creator gets MANAGE.** When a user creates a skill or group, they
+  automatically receive MANAGE permission, following the MLflow model
+  registry pattern.
+
 ### UI
 
 The Skills page lives under the GenAI workflow in the MLflow sidebar,
@@ -1360,26 +1385,60 @@ pinned member versions it contains.
 ### Security scan tracking
 
 The registry does not perform security scans. It provides a metadata
-layer for recording and querying scan results using version-level tags.
+layer for recording and querying scan results using version-level tags
+with a reserved `scan.*` namespace.
 
-Recommended tag conventions:
+**Tag namespace convention.** All security scan tags use the pattern
+`scan.{scan-type}.{field}`, where `{scan-type}` identifies the scan
+(e.g., `prompt-injection`, `code-vulnerability`, `secrets-detection`)
+and `{field}` is one of the following defined keys:
 
-| Tag key | Example value | Description |
+| Field | Expected values | Description |
 |---|---|---|
-| `scan.prompt-injection.status` | `pass`, `fail`, `warning` | Scan result |
-| `scan.prompt-injection.date` | `2026-04-22` | When the scan was run |
-| `scan.prompt-injection.tool` | `garak-0.9` | Which tool performed the scan |
-| `scan.code-vuln.status` | `pass` | Code vulnerability scan result |
-| `scan.code-vuln.date` | `2026-04-22` | When the scan was run |
+| `status` | `pass`, `fail`, `error` | Scan outcome |
+| `date` | ISO 8601 date (e.g., `2026-04-29`) | When the scan was run |
+| `tool` | Tool name/version (e.g., `promptfoo/1.2.0`) | Which tool performed the scan |
+| `details` | URL or free text | Link to full results or summary |
 
-These are conventions, not enforced schema. Organizations can define
-additional scan tag prefixes for their own scanning tools and criteria.
+**Example tags on a skill version:**
 
-The status lifecycle supports scan-gated deprecation workflows:
-organizations can deprecate versions that fail scans and use scan
-result tags to filter for safe versions. The registry does not enforce
-this workflow, but the combination of status and scan tags makes it
-easy to implement.
+| Tag key | Value |
+|---|---|
+| `scan.prompt-injection.status` | `pass` |
+| `scan.prompt-injection.date` | `2026-04-29` |
+| `scan.prompt-injection.tool` | `promptfoo/1.2.0` |
+| `scan.code-vulnerability.status` | `fail` |
+| `scan.code-vulnerability.date` | `2026-04-28` |
+| `scan.code-vulnerability.tool` | `semgrep/1.67.0` |
+| `scan.code-vulnerability.details` | `https://scans.acme.com/results/abc123` |
+
+**Convention, not schema.** These are documented conventions, not
+server-enforced schema. The registry does not validate that `status`
+is one of the expected values or that `date` is a valid ISO 8601
+string. This is a deliberate tradeoff: the scan tool landscape is
+evolving rapidly, and a flexible convention allows organizations to
+adopt new scan types without schema changes. Organizations can define
+additional `scan.{type}` prefixes for their own scanning tools.
+
+**UI rendering.** The convention gives the UI enough structure to
+detect `scan.*.status` tags and render a scan summary (e.g., a green
+check or red X per scan type) without requiring a dedicated entity.
+
+**Querying.** Scan results are queryable using the existing filter
+syntax: `tags.scan.prompt-injection.status = 'pass'` or
+`tags.scan.code-vulnerability.date < '2026-01-01'`.
+
+**Scan-gated workflows.** The status lifecycle supports scan-gated
+deprecation: organizations can deprecate versions that fail scans and
+use scan result tags to filter for safe versions. The registry does
+not enforce this workflow, but the combination of status and scan tags
+makes it straightforward to implement.
+
+**Future evolution.** If scan patterns stabilize and the convention
+proves insufficient (e.g., organizations need server-side validation,
+separate permissions for scan results, or richer scan metadata),
+structured scan metadata can be added as a first-class entity in a
+follow-up without breaking the tag-based approach.
 
 ## Drawbacks
 
