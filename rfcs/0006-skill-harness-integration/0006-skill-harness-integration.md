@@ -8,7 +8,7 @@ rfc_pr: https://github.com/mlflow/rfcs/pull/10
 
 | Author(s)              | Bill Murdock (Red Hat) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-04-27 |
+| **Date Last Modified** | 2026-04-29 |
 | **AI Assistant(s)**    | Claude Code (Opus 4.6) |
 
 # Summary
@@ -66,7 +66,7 @@ mlflow skills install --group pr-workflow --alias production \
 ```python
 import mlflow
 
-mlflow.skills.install_skill_group(
+mlflow.genai.skills.install_skill_group(
     name="pr-workflow",
     alias="production",
     harness="claude-code",
@@ -330,10 +330,9 @@ use the adapter-based `mlflow skills install` command instead.
 ### Store interface
 
 ```python
-class AbstractSkillRegistryStore:
+class SkillRegistryMixin:
     # ... (existing methods from RFC-0005) ...
 
-    @abstractmethod
     def install_skill(
         self,
         name: str,
@@ -342,9 +341,9 @@ class AbstractSkillRegistryStore:
         version: str | None = None,
         alias: str | None = None,
         source_type: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        raise NotImplementedError
 
-    @abstractmethod
     def install_skill_group(
         self,
         name: str,
@@ -352,14 +351,15 @@ class AbstractSkillRegistryStore:
         destination: str,
         version: str | None = None,
         alias: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        raise NotImplementedError
 
-    @abstractmethod
     def generate_marketplace(
         self,
         harness: str,
         filter_string: str | None = None,
-    ) -> dict: ...
+    ) -> dict:
+        raise NotImplementedError
 ```
 
 ### REST API

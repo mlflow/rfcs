@@ -8,7 +8,7 @@ rfc_pr: https://github.com/mlflow/rfcs/pull/10
 
 | Author(s)              | Bill Murdock (Red Hat) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-04-27 |
+| **Date Last Modified** | 2026-04-29 |
 | **AI Assistant(s)**    | Claude Code (Opus 4.6) |
 
 # Summary
@@ -21,8 +21,8 @@ existing distribution mechanisms: lifecycle management, security scan
 tracking, usage analytics via traces, and federated discovery across
 sources.
 
-The registry tracks four capability kinds under the `mlflow skills`
-namespace:
+The registry tracks four capability kinds under the `mlflow.genai.skills`
+SDK namespace (CLI: `mlflow skills`):
 
 - **Skills** (SKILL.md) — reusable agent instructions
 - **Agents** (agent .md) — sub-agent definitions
@@ -45,43 +45,36 @@ RFC (RFC-0006).
 import mlflow
 
 # Create the logical skill asset
-skill = mlflow.skills.create_skill(
+skill = mlflow.genai.skills.create_skill(
     name="code-review",
     description="Reviews pull requests for correctness, style, and security",
 )
 
 # Register a version pointing to a Git source
-version = mlflow.skills.create_skill_version(
+version = mlflow.genai.skills.create_skill_version(
     name="code-review",
     version="1.0.0",
     source_type="git",
     source="https://github.com/acme/agent-skills/tree/v1.0.0/code-review",
     content_digest="sha256:a3f2b8c...",
 )
-# version.publish_state == "draft"
-
-# Publish the version so downstream consumers can discover it
-mlflow.skills.update_skill_version(
-    name="code-review",
-    version="1.0.0",
-    publish_state="published",
-)
+# version.status == "active"
 
 # Set an alias for stable resolution
-mlflow.skills.set_skill_alias(
+mlflow.genai.skills.set_skill_alias(
     name="code-review",
     alias="production",
     version="1.0.0",
 )
 
 # Record a security scan result as a tag
-mlflow.skills.set_skill_version_tag(
+mlflow.genai.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
     key="scan.prompt-injection.status",
     value="pass",
 )
-mlflow.skills.set_skill_version_tag(
+mlflow.genai.skills.set_skill_version_tag(
     name="code-review",
     version="1.0.0",
     key="scan.prompt-injection.date",
@@ -95,37 +88,30 @@ mlflow.skills.set_skill_version_tag(
 from mlflow.entities import SkillGroupVersionMembership
 
 # Create a group for related skills
-group = mlflow.skills.create_skill_group(
+group = mlflow.genai.skills.create_skill_group(
     name="pr-workflow",
     description="End-to-end pull request review workflow",
 )
 
 # Create a group version that pins specific skill versions
-group_version = mlflow.skills.create_skill_group_version(
+group_version = mlflow.genai.skills.create_skill_group_version(
     name="pr-workflow",
     version="1.0.0",
     members=[
         SkillGroupVersionMembership(
-            skill_name="code-review", skill_version="1.0.0",
+            member_name="code-review", member_version="1.0.0",
         ),
         SkillGroupVersionMembership(
-            skill_name="test-coverage", skill_version="2.1.0",
+            member_name="test-coverage", member_version="2.1.0",
         ),
         SkillGroupVersionMembership(
-            skill_name="security-scan", skill_version="1.0.0",
+            member_name="security-scan", member_version="1.0.0",
         ),
     ],
 )
 
-# Publish the group version
-mlflow.skills.update_skill_group_version(
-    name="pr-workflow",
-    version="1.0.0",
-    publish_state="published",
-)
-
 # Set an alias for stable resolution
-mlflow.skills.set_skill_group_alias(
+mlflow.genai.skills.set_skill_group_alias(
     name="pr-workflow",
     alias="production",
     version="1.0.0",
@@ -136,12 +122,12 @@ mlflow.skills.set_skill_group_alias(
 
 ```python
 # Register a sub-agent
-mlflow.skills.create_skill(
+mlflow.genai.skills.create_skill(
     name="security-auditor",
     kind="agent",
     description="Security specialist for auth and payment code",
 )
-mlflow.skills.create_skill_version(
+mlflow.genai.skills.create_skill_version(
     name="security-auditor",
     version="1.0.0",
     source_type="git",
@@ -149,12 +135,12 @@ mlflow.skills.create_skill_version(
 )
 
 # Register an MCP server
-mlflow.skills.create_skill(
+mlflow.genai.skills.create_skill(
     name="github-mcp",
     kind="mcp-server",
     description="GitHub integration via MCP",
 )
-mlflow.skills.create_skill_version(
+mlflow.genai.skills.create_skill_version(
     name="github-mcp",
     version="2.0.0",
     source_type="oci",
@@ -163,12 +149,12 @@ mlflow.skills.create_skill_version(
 )
 
 # Register a hook
-mlflow.skills.create_skill(
+mlflow.genai.skills.create_skill(
     name="pre-commit-scan",
     kind="hook",
     description="Runs security scan before tool commits",
 )
-mlflow.skills.create_skill_version(
+mlflow.genai.skills.create_skill_version(
     name="pre-commit-scan",
     version="1.0.0",
     source_type="git",
@@ -181,24 +167,26 @@ mlflow.skills.create_skill_version(
 ```python
 from mlflow.entities import SkillGroupVersionMembership
 
-group = mlflow.skills.create_skill_group(
+group = mlflow.genai.skills.create_skill_group(
     name="pr-workflow",
     description="End-to-end pull request review workflow",
 )
 
-# A group version can bundle skills, agents, MCP servers, and hooks
-group_version = mlflow.skills.create_skill_group_version(
+# A group version can bundle skills, agents, and MCP server references
+group_version = mlflow.genai.skills.create_skill_group_version(
     name="pr-workflow",
     version="1.0.0",
     members=[
         SkillGroupVersionMembership(
-            skill_name="code-review", skill_version="1.0.0",
+            member_name="code-review", member_version="1.0.0",
         ),
         SkillGroupVersionMembership(
-            skill_name="security-auditor", skill_version="1.0.0",
+            member_name="security-auditor", member_version="1.0.0",
         ),
+        # Reference an MCP server from the MCP registry (RFC-0004)
         SkillGroupVersionMembership(
-            skill_name="github-mcp", skill_version="2.0.0",
+            member_name="github-mcp", member_version="2.0.0",
+            registry="mcp",
         ),
     ],
 )
@@ -208,14 +196,14 @@ group_version = mlflow.skills.create_skill_group_version(
 
 ```python
 # Pull a single skill version
-mlflow.skills.pull_skill(
+mlflow.genai.skills.pull_skill(
     name="code-review",
     alias="production",
     destination="./skills/code-review",
 )
 
 # Pull an entire skill group (all members)
-mlflow.skills.pull_skill_group(
+mlflow.genai.skills.pull_skill_group(
     name="pr-workflow",
     alias="production",
     destination="./plugins/pr-workflow",
@@ -234,19 +222,19 @@ mlflow skills pull-group --name pr-workflow --alias production \
 ## Discover and consume skills
 
 ```python
-# Search for published skill versions
-versions = mlflow.skills.search_skill_versions(
+# Search for active skill versions
+versions = mlflow.genai.skills.search_skill_versions(
     name="code-review",
-    filter_string="publish_state = 'published'",
+    filter_string="status = 'active'",
 )
 
 # Search for active skill groups
-groups = mlflow.skills.search_skill_groups(
+groups = mlflow.genai.skills.search_skill_groups(
     filter_string="status = 'active'",
 )
 
 # Get a specific version
-version = mlflow.skills.get_skill_version(
+version = mlflow.genai.skills.get_skill_version(
     name="code-review",
     version="1.0.0",
 )
@@ -254,20 +242,20 @@ version = mlflow.skills.get_skill_version(
 # version.source == "https://github.com/acme/agent-skills/tree/v1.0.0/code-review"
 
 # Resolve by alias
-version = mlflow.skills.get_skill_version_by_alias(
+version = mlflow.genai.skills.get_skill_version_by_alias(
     name="code-review",
     alias="production",
 )
 
 # Get a group version and its pinned skill versions
-group_version = mlflow.skills.get_skill_group_version(
+group_version = mlflow.genai.skills.get_skill_group_version(
     name="pr-workflow",
     version="1.0.0",
 )
 # group_version.members == [SkillGroupVersionMembership(...), ...]
 
 # Resolve a group alias
-group_version = mlflow.skills.get_skill_group_version_by_alias(
+group_version = mlflow.genai.skills.get_skill_group_version_by_alias(
     name="pr-workflow",
     alias="production",
 )
@@ -284,9 +272,7 @@ mlflow skills create-version --name code-review --version 1.0.0 \
     --source https://github.com/acme/agent-skills/tree/v1.0.0/code-review \
     --content-digest sha256:a3f2b8c...
 
-# Publish and alias
-mlflow skills update-version --name code-review --version 1.0.0 \
-    --publish-state published
+# Alias
 mlflow skills set-alias --name code-review --alias production \
     --version 1.0.0
 
@@ -296,15 +282,14 @@ mlflow skill-groups create --name pr-workflow \
 mlflow skill-groups create-version --name pr-workflow --version 1.0.0 \
     --member code-review:1.0.0 \
     --member test-coverage:2.1.0 \
-    --member security-scan:1.0.0
-mlflow skill-groups update-version --name pr-workflow --version 1.0.0 \
-    --publish-state published
+    --member security-scan:1.0.0 \
+    --member mcp:github-mcp:2.0.0
 mlflow skill-groups set-alias --name pr-workflow --alias production \
     --version 1.0.0
 
-# Search published skill versions
+# Search active skill versions
 mlflow skills search-versions --name code-review \
-    --filter "publish_state = 'published'"
+    --filter "status = 'active'"
 
 # Search active groups
 mlflow skill-groups search --filter "status = 'active'"
@@ -319,12 +304,24 @@ and hooks — are becoming a critical asset class in enterprise AI
 platforms. As organizations adopt agentic AI, they accumulate these
 capabilities across teams, repositories, and agent harnesses.
 
-A cross-harness portable format is emerging around SKILL.md files (for
-skills and agents), MCP server configs (for tool integrations), and
-hooks (for event-triggered actions). Agent harnesses including Claude
-Code, Codex CLI, Cursor, GitHub Copilot, OpenClaw, Kilo Code, and
-Antigravity support overlapping subsets of these formats, with SKILL.md
-and MCP being the most broadly adopted.
+A cross-harness portable format is emerging around these capabilities.
+The registry is format-agnostic but is designed to interoperate with
+the conventions gaining adoption across agent harnesses:
+
+- **SKILL.md** — a markdown file with structured instructions for the
+  agent. Supported by Claude Code, Codex CLI, Cursor, GitHub Copilot,
+  OpenClaw, Kilo Code, and Antigravity. This is the most broadly
+  portable format for skills and agents.
+- **MCP server configs** — JSON configuration for Model Context
+  Protocol servers. MCP is a universal tool extension protocol
+  supported by nearly all major harnesses.
+- **Hooks** — event-triggered shell commands or scripts. Less
+  standardized; Claude Code and Codex CLI have the most mature hook
+  support.
+- **Plugin bundles** — harness-specific packaging of skills, agents,
+  MCP configs, and hooks into a single installable unit. Claude Code
+  and Codex CLI use `plugin.json` manifests; other harnesses use
+  directory conventions.
 
 Today, these capabilities are managed as ad-hoc files in Git
 repositories. This works well for individual developers and small
@@ -333,8 +330,8 @@ teams. GitHub provides versioning, collaboration, and access control.
 However, enterprises face governance challenges that Git alone does not
 address:
 
-1. **No publish-state lifecycle.** Git has no concept of "this version
-   is approved for production use" vs. "this is a draft." Teams resort
+1. **No status lifecycle.** Git has no concept of "this version is
+   approved for production use" vs. "this is deprecated." Teams resort
    to branch naming conventions or external tracking to manage
    promotion.
 
@@ -370,8 +367,8 @@ address:
    stores. All four capability kinds (skill, agent, mcp-server, hook)
    use the same registration model.
 
-2. **Lifecycle management**: Capability versions move through publish
-   states (draft, published, deprecated, retired) to control downstream
+2. **Lifecycle management**: Capability versions move through status
+   states (active, deprecated, deleted) to control downstream
    surfacing. This is the governance layer that Git lacks.
 
 3. **Security scan tracking**: Scan results (prompt injection, code
@@ -416,8 +413,8 @@ address:
   the registry — including manifest generation and directory placement
   — is covered in a companion RFC (RFC-0006). This RFC provides the
   registry, governance, and `pull`; RFC-0006 provides `install`.
-- **Approval workflows or review gates.** Publish state transitions
-  are sufficient for initial governance.
+- **Approval workflows or review gates.** Status transitions are
+  sufficient for initial governance.
 - **Detailed UI/UX design.** This RFC describes the UI surface and
   placement but does not specify interaction patterns.
 
@@ -434,9 +431,10 @@ SkillVersion ||--o{ SkillVersionTag : "has tags"
 SkillGroup ||--o{ SkillGroupVersion : "has versions"
 SkillGroup ||--o{ SkillGroupTag : "has tags"
 SkillGroup ||--o{ SkillGroupAlias : "has aliases"
-SkillGroupVersion ||--o{ SkillGroupVersionMembership : "contains skills"
+SkillGroupVersion ||--o{ SkillGroupVersionMembership : "contains members"
 SkillGroupVersion ||--o{ SkillGroupVersionTag : "has tags"
-SkillGroupVersionMembership }o--|| SkillVersion : "references"
+SkillGroupVersionMembership }o--o| SkillVersion : "references (registry=skill)"
+SkillGroupVersionMembership }o--o| MCPServerVersion : "references (registry=mcp)"
 ```
 
 #### Skill
@@ -458,7 +456,7 @@ class SkillKind(StrEnum):
 class SkillStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
-    RETIRED = "retired"
+    DELETED = "deleted"
 
 
 @dataclass
@@ -471,6 +469,7 @@ class Skill:
     tags: dict[str, str] = field(default_factory=dict)
     aliases: list[SkillAlias] = field(default_factory=list)
     last_registered_version: str | None = None
+    latest_version_alias: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
@@ -481,9 +480,10 @@ class Skill:
 |---|---|---|
 | `name` | `str` | Stable logical asset name, unique within a workspace |
 | `kind` | `SkillKind` | Capability type: `skill`, `agent`, `mcp-server`, `hook` |
-| `status` | `SkillStatus` | Skill-level lifecycle: `active`, `deprecated`, `retired` |
+| `status` | `SkillStatus` | Read-only, derived from the latest version's status |
 | `aliases` | `list[SkillAlias]` | Stable version pointers (e.g., `production` → `1.2.0`) |
-| `last_registered_version` | `str` | Most recently registered version string |
+| `last_registered_version` | `str` | Most recently registered version string (read-only, auto-updated) |
+| `latest_version_alias` | `str` | Optional alias name to resolve as "latest" (e.g., `"production"`). If unset, `get_latest_skill_version` falls back to `creation_timestamp` |
 | `workspace` | `str` | Visibility boundary |
 
 **Kind extensibility.** The `kind` enum covers the four capability
@@ -491,19 +491,26 @@ types with broad cross-harness support. New kinds can be added without
 schema changes since the column stores a string value. `kind` is
 immutable after creation.
 
+**MCP servers: two registration paths.** The MCP server registry
+(RFC-0004) is the default and recommended path for registering MCP
+servers. It provides deployment tracking via hosted bindings,
+deduplication across skill groups, and the full MCP governance model.
+Skill groups reference MCP registry entries via `registry="mcp"` in
+their membership.
+
+`kind=mcp-server` in this registry is reserved for MCP configs that
+are embedded in a group-level artifact (e.g., an OCI image containing
+a complete plugin with an `.mcp.json` file). These are not
+independently managed and exist only as part of their containing
+artifact. Standalone MCP servers should always be registered in the
+MCP registry, not as skills.
+
 #### SkillVersion
 
-A versioned record containing a typed source pointer, publish state,
-and tags.
+A versioned record containing a typed source pointer, status, and
+tags.
 
 ```python
-class SkillPublishState(StrEnum):
-    DRAFT = "draft"
-    PUBLISHED = "published"
-    DEPRECATED = "deprecated"
-    RETIRED = "retired"
-
-
 class SkillSourceType(StrEnum):
     GIT = "git"
     OCI = "oci"
@@ -516,9 +523,10 @@ class SkillVersion:
     version: str
     source_type: SkillSourceType | None = None
     source: str | None = None
-    publish_state: SkillPublishState = SkillPublishState.DRAFT
+    status: SkillStatus = SkillStatus.ACTIVE
     content_digest: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
+    aliases: list[str] = field(default_factory=list)
     run_id: str | None = None
     workspace: str | None = None
     created_by: str | None = None
@@ -533,7 +541,8 @@ class SkillVersion:
 | `source_type` | `SkillSourceType` | Optional distribution mechanism: `git`, `oci`, `zip` |
 | `source` | `str` | Optional pointer to the content in the source system. Required for standalone pull; omit when content is only available via a group-level source |
 | `content_digest` | `str` | Optional digest for integrity verification (e.g., `sha256:abc123...`). Aligns with OCI digest terminology |
-| `publish_state` | `SkillPublishState` | Per-version surfacing lifecycle |
+| `status` | `SkillStatus` | Per-version lifecycle: `active`, `deprecated`, `deleted` |
+| `aliases` | `list[str]` | Alias names currently pointing at this version (read-only, projected from alias table) |
 | `run_id` | `str` | Optional MLflow run association for trace linkage |
 
 **Source type extensibility.** The `source_type` enum is intentionally
@@ -559,7 +568,7 @@ verify it on read; verification is the consumer's responsibility.
 
 **Immutability contract.** `source_type`, `source`, `content_digest`,
 and `version` are immutable after creation. To point to different content,
-register a new version. Mutable fields (`publish_state`, `tags`) can be
+register a new version. Mutable fields (`status`, `tags`) can be
 updated independently.
 
 #### SkillGroup
@@ -571,26 +580,46 @@ Follows the same pattern as Skill: a top-level entity with versions,
 tags, and aliases.
 
 ```python
-class SkillGroupStatus(StrEnum):
-    ACTIVE = "active"
-    DEPRECATED = "deprecated"
-    RETIRED = "retired"
-
-
 @dataclass
 class SkillGroup:
     name: str
     description: str | None = None
     workspace: str | None = None
-    status: SkillGroupStatus = SkillGroupStatus.ACTIVE
+    status: SkillStatus = SkillStatus.ACTIVE
     tags: dict[str, str] = field(default_factory=dict)
     aliases: list["SkillGroupAlias"] = field(default_factory=list)
     last_registered_version: str | None = None
+    latest_version_alias: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
     last_updated_timestamp: int | None = None
 ```
+
+`SkillGroup.status` is read-only, derived from the latest group
+version's status. `latest_version_alias` works the same as on `Skill`.
+
+**Why groups instead of tags?** Tags on individual skills could
+express "these skills are related" but cannot provide:
+
+- **Versioned membership snapshots.** A group version pins specific
+  member versions, so "pr-workflow v1.0.0" always means the same set
+  of capabilities. Tags are mutable and cannot capture a reproducible
+  point-in-time combination.
+- **Cross-registry references.** A group version can reference both
+  skill registry members and MCP server registry members (RFC-0004).
+  Tags on individual skills cannot express this cross-registry
+  relationship.
+- **Group-level source.** A group version can have its own source
+  pointer (e.g., a single OCI image containing a complete plugin).
+  Tags cannot carry source metadata.
+- **Independent lifecycle.** A group version has its own status,
+  aliases, and tags. The group can be deprecated independently of its
+  members. With tags, lifecycle management would have to be inferred
+  from individual skill states.
+- **Plugin mapping.** Agent harnesses (Claude Code, Codex CLI) model
+  plugins as bundles of capabilities with a manifest. Skill groups
+  map directly to this concept; tags do not.
 
 #### SkillGroupVersion
 
@@ -605,9 +634,10 @@ class SkillGroupVersion:
     source_type: SkillSourceType | None = None
     source: str | None = None
     content_digest: str | None = None
-    publish_state: SkillPublishState = SkillPublishState.DRAFT
+    status: SkillStatus = SkillStatus.ACTIVE
     tags: dict[str, str] = field(default_factory=dict)
     members: list["SkillGroupVersionMembership"] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
     workspace: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -634,24 +664,56 @@ version's source is required.
 **Immutability contract.** The membership list and source fields of a
 group version are immutable after creation. To change the set of
 skills or source pointer, register a new group version. Mutable fields
-(`publish_state`, `tags`) can be updated independently.
+(`status`, `tags`) can be updated independently.
 
 #### SkillGroupVersionMembership
 
-Each membership entry pins a specific skill version (including source
-type). The parent group identity is provided by the enclosing
-`SkillGroupVersion`; the storage layer adds those columns as FKs.
+Each membership entry pins a specific versioned asset from either the
+skill registry or the MCP server registry (RFC-0004). The `registry`
+field indicates which registry the member comes from. The parent group
+identity is provided by the enclosing `SkillGroupVersion`; the storage
+layer adds those columns as FKs.
 
 ```python
 @dataclass(frozen=True)
 class SkillGroupVersionMembership:
-    skill_name: str
-    skill_version: str
+    member_name: str
+    member_version: str
+    registry: str = "skill"  # "skill" or "mcp"
 ```
 
-A skill can appear in multiple groups and multiple group versions.
-Membership is at the skill version level, so a group version is a
-reproducible snapshot of "these specific skill versions work together."
+| Field | Type | Description |
+|---|---|---|
+| `member_name` | `str` | Name of the member asset in the target registry |
+| `member_version` | `str` | Version of the member asset |
+| `registry` | `str` | Which registry the member comes from: `skill` (this registry) or `mcp` (MCP server registry, RFC-0004) |
+
+When `registry="skill"`, the member references a `SkillVersion` in
+this registry. When `registry="mcp"`, the member references an
+`MCPServerVersion` in the MCP server registry (RFC-0004). This
+cross-registry reference enables:
+
+- **Deduplication.** Two skill groups that both need `github-mcp`
+  reference the same MCP registry entry. No duplicate configs.
+- **Runtime status.** The MCP registry tracks deployment state via
+  hosted bindings (`is_deployed`, `endpoint_url`). Install-time
+  tooling can check whether a referenced MCP server is already
+  running rather than starting a duplicate.
+- **Single source of truth.** MCP server definitions are governed in
+  the MCP registry; skill groups reference them rather than carrying
+  standalone copies.
+
+A member can appear in multiple groups and multiple group versions.
+Membership is at the version level, so a group version is a
+reproducible snapshot of "these specific asset versions work together."
+
+**Group-level source and embedded MCP configs.** When a group version
+has a group-level source (e.g., a single OCI image containing a
+complete plugin), the artifact may include MCP configs alongside
+skills and agents. In this case, MCP servers do not need separate
+membership entries or MCP registry references — they are part of the
+artifact. Cross-registry MCP references are for the case where MCP
+servers are independently registered and managed.
 
 #### SkillGroupAlias
 
@@ -682,43 +744,51 @@ Tags use the same structure for skill-level, version-level, and
 group-level tags. The distinction is maintained at the storage and API
 layer (separate tables, separate endpoints).
 
-### Publish state and lifecycle
+### Status and lifecycle
 
-#### Per-version publish state
+This lifecycle aligns with the MCP Server Registry (RFC-0004).
 
-Each `SkillVersion` has an independent publish state:
+#### Per-version status
+
+Each `SkillVersion` and `SkillGroupVersion` has an independent status:
 
 | State | Meaning | Downstream surfacing |
 |---|---|---|
-| `draft` | Registered but not ready for consumption | Not surfaced |
-| `published` | Ready for downstream use | Surfaced to discovery, traces, consumers |
+| `active` | Ready for downstream use | Surfaced to discovery, traces, consumers |
 | `deprecated` | Still functional but no longer recommended | Surfaced with deprecation signal |
-| `retired` | Preserved for history, no longer active | Not surfaced |
+| `deleted` | Soft-deleted; preserved for history, no longer active | Not surfaced |
+
+New versions default to `active` upon creation.
 
 Allowed transitions:
 
 | From | To |
 |---|---|
-| `draft` | `published`, `retired` |
-| `published` | `deprecated` |
-| `deprecated` | `published`, `retired` |
+| `active` | `deprecated` |
+| `deprecated` | `active`, `deleted` |
 
-`published` cannot return to `draft`. `deprecated` can return to
-`published` (re-publish) for cases where a deprecation was premature.
+`deprecated` can return to `active` (re-activate) for cases where a
+deprecation was premature.
 
-#### Skill group version publish state
+#### Skill-level and group-level status
 
-Each `SkillGroupVersion` has its own publish state lifecycle, following
-the same transitions as `SkillVersion`. A group version's publish state
-is independent of its member skills' publish states. Publishing a group
-version does not require its member skill versions to be published,
-though consumers will typically want to verify this.
+`Skill.status` and `SkillGroup.status` are read-only, derived from the
+latest version's status. This follows the MCP Server Registry pattern
+where the parent entity's status reflects its latest version.
 
-#### Skill-level status
+#### `latest_version_alias` resolution
 
-`Skill.status` is a separate lifecycle for the logical asset as a whole
-(`active`, `deprecated`, `retired`). Setting a skill to `deprecated`
-does not automatically change individual version publish states.
+`get_latest_skill_version(name)` resolves the "latest" version:
+
+1. If `Skill.latest_version_alias` is set, resolve that alias to a
+   version.
+2. If unset, fall back to the version with the most recent
+   `creation_timestamp`.
+
+`latest_version_alias` is mutable via `update_skill()`. It stores an
+alias name (e.g., `"production"`), providing a level of indirection:
+the user says "latest means whatever `production` points to." The same
+pattern applies to `SkillGroup` and `get_latest_skill_group_version`.
 
 ### Database schema
 
@@ -733,8 +803,8 @@ workspace-scoped.
 | `name` | `String(256)` | PK |
 | `kind` | `String(20)` | default `'skill'`; `skill`, `agent`, `mcp-server`, `hook` |
 | `description` | `String(5000)` | |
-| `status` | `String(20)` | default `'active'` |
 | `last_registered_version` | `String(256)` | |
+| `latest_version_alias` | `String(256)` | optional; alias name to resolve as "latest" |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -750,7 +820,7 @@ workspace-scoped.
 | `source_type` | `String(20)` | nullable; `git`, `oci`, `zip`, etc. |
 | `source` | `String(2048)` | nullable pointer to skill content |
 | `content_digest` | `String(512)` | optional integrity digest |
-| `publish_state` | `String(20)` | default `'draft'` |
+| `status` | `String(20)` | default `'active'` |
 | `run_id` | `String(32)` | optional MLflow run linkage |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
@@ -794,8 +864,8 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `workspace` | `String(63)` | PK, default `'default'` |
 | `name` | `String(256)` | PK |
 | `description` | `String(5000)` | |
-| `status` | `String(20)` | default `'active'` |
 | `last_registered_version` | `String(256)` | |
+| `latest_version_alias` | `String(256)` | optional; alias name to resolve as "latest" |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -811,7 +881,7 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `source_type` | `String(20)` | optional; `git`, `oci`, `zip`, etc. |
 | `source` | `String(2048)` | optional pointer to group artifact |
 | `content_digest` | `String(512)` | optional integrity digest |
-| `publish_state` | `String(20)` | default `'draft'` |
+| `status` | `String(20)` | default `'active'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -826,11 +896,20 @@ FK: `(workspace, name)` references `skill_groups`, CASCADE delete.
 | `workspace` | `String(63)` | PK |
 | `group_name` | `String(256)` | PK, FK to `skill_group_versions` |
 | `group_version` | `String(256)` | PK, FK to `skill_group_versions` |
-| `skill_name` | `String(256)` | PK, FK to `skill_versions` |
-| `skill_version` | `String(256)` | PK, FK to `skill_versions` |
+| `member_name` | `String(256)` | PK |
+| `member_version` | `String(256)` | PK |
+| `registry` | `String(20)` | PK, default `'skill'`; `skill` or `mcp` |
 
 FK: `(workspace, group_name, group_version)` references `skill_group_versions`, CASCADE delete.
-FK: `(workspace, skill_name, skill_version)` references `skill_versions`, RESTRICT delete.
+FK: `(workspace, member_name, member_version)` references `skill_versions`, RESTRICT delete. Only applies when `registry='skill'`.
+
+**Cross-registry references (`registry='mcp'`).** There is no
+database-level FK for MCP registry references. Referential integrity
+is enforced at the application layer: the store validates that the
+referenced `MCPServerVersion` exists when creating a group version
+and returns `RESOURCE_DOES_NOT_EXIST` if it does not. This avoids
+deployment-ordering dependencies between RFC-0004 and RFC-0005
+migrations and allows either registry to be deployed independently.
 
 #### `skill_group_tags`
 
@@ -866,258 +945,243 @@ primary key components. Single-tenant deployments use `'default'`.
 **Timestamps.** Set at the application layer via
 `get_current_time_millis()`, not via DDL defaults.
 
-### Abstract store interface
+### Store interface
 
-The store interface follows MLflow's abstract store pattern.
+The store interface follows the mixin pattern established by the MCP
+Server Registry (RFC-0004). Methods raise `NotImplementedError` rather
+than using `@abstractmethod`, allowing stores that don't support skills
+(e.g., `FileStore`) to work without stubbing every method.
 
 ```python
-from abc import abstractmethod
-
-
-class AbstractSkillRegistryStore:
+class SkillRegistryMixin:
     # --- Skill operations ---
 
-    @abstractmethod
     def create_skill(
         self, name: str, kind: str = "skill",
         description: str | None = None,
-    ) -> Skill: ...
+    ) -> Skill:
+        raise NotImplementedError
 
-    @abstractmethod
-    def get_skill(self, name: str) -> Skill: ...
+    def get_skill(self, name: str) -> Skill:
+        raise NotImplementedError
 
-    @abstractmethod
     def search_skills(
         self,
         filter_string: str | None = None,
         max_results: int = 100,
+        order_by: list[str] | None = None,
         page_token: str | None = None,
-    ) -> PagedList[Skill]: ...
+    ) -> PagedList[Skill]:
+        raise NotImplementedError
 
-    @abstractmethod
     def update_skill(
         self,
         name: str,
         description: str | None = None,
-        status: SkillStatus | None = None,
-    ) -> Skill: ...
+        latest_version_alias: str | None = None,
+    ) -> Skill:
+        raise NotImplementedError
 
-    @abstractmethod
-    def delete_skill(self, name: str) -> None: ...
+    def delete_skill(self, name: str) -> None:
+        raise NotImplementedError
 
     # --- SkillVersion operations ---
 
-    @abstractmethod
     def create_skill_version(
         self,
         name: str,
         version: str,
         source_type: str | None = None,
         source: str | None = None,
-        publish_state: SkillPublishState = SkillPublishState.DRAFT,
         content_digest: str | None = None,
         run_id: str | None = None,
-    ) -> SkillVersion: ...
+    ) -> SkillVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def get_skill_version(
         self, name: str, version: str,
-    ) -> SkillVersion: ...
+    ) -> SkillVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def get_skill_version_by_alias(
         self, name: str, alias: str,
-    ) -> SkillVersion: ...
+    ) -> SkillVersion:
+        raise NotImplementedError
 
-    @abstractmethod
-    def get_latest_skill_version(self, name: str) -> SkillVersion: ...
+    def get_latest_skill_version(self, name: str) -> SkillVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def search_skill_versions(
         self,
         name: str,
         filter_string: str | None = None,
         max_results: int = 100,
+        order_by: list[str] | None = None,
         page_token: str | None = None,
-    ) -> PagedList[SkillVersion]: ...
+    ) -> PagedList[SkillVersion]:
+        raise NotImplementedError
 
-    @abstractmethod
     def update_skill_version(
         self,
         name: str,
         version: str,
-        publish_state: SkillPublishState | None = None,
-    ) -> SkillVersion: ...
+        status: SkillStatus | None = None,
+    ) -> SkillVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_version(
         self, name: str, version: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
     # --- Tag operations ---
 
-    @abstractmethod
     def set_skill_tag(
         self, name: str, key: str, value: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
-    def delete_skill_tag(self, name: str, key: str) -> None: ...
+    def delete_skill_tag(self, name: str, key: str) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def set_skill_version_tag(
         self, name: str, version: str,
         key: str, value: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_version_tag(
         self, name: str, version: str, key: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
     # --- Alias operations ---
 
-    @abstractmethod
     def set_skill_alias(
         self, name: str, alias: str, version: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_alias(
         self, name: str, alias: str,
-    ) -> None: ...
-
-    # --- Pull operations ---
-
-    @abstractmethod
-    def pull_skill(
-        self, name: str, destination: str,
-        version: str | None = None,
-        alias: str | None = None,
-        source_type: str | None = None,
-    ) -> str: ...
-
-    @abstractmethod
-    def pull_skill_group(
-        self, name: str, destination: str,
-        version: str | None = None,
-        alias: str | None = None,
-    ) -> str: ...
+    ) -> None:
+        raise NotImplementedError
 
     # --- SkillGroup operations ---
 
-    @abstractmethod
     def create_skill_group(
         self, name: str, description: str | None = None,
-    ) -> SkillGroup: ...
+    ) -> SkillGroup:
+        raise NotImplementedError
 
-    @abstractmethod
-    def get_skill_group(self, name: str) -> SkillGroup: ...
+    def get_skill_group(self, name: str) -> SkillGroup:
+        raise NotImplementedError
 
-    @abstractmethod
     def search_skill_groups(
         self,
         filter_string: str | None = None,
         max_results: int = 100,
+        order_by: list[str] | None = None,
         page_token: str | None = None,
-    ) -> PagedList[SkillGroup]: ...
+    ) -> PagedList[SkillGroup]:
+        raise NotImplementedError
 
-    @abstractmethod
     def update_skill_group(
         self,
         name: str,
         description: str | None = None,
-        status: SkillGroupStatus | None = None,
-    ) -> SkillGroup: ...
+        latest_version_alias: str | None = None,
+    ) -> SkillGroup:
+        raise NotImplementedError
 
-    @abstractmethod
-    def delete_skill_group(self, name: str) -> None: ...
+    def delete_skill_group(self, name: str) -> None:
+        raise NotImplementedError
 
     # --- SkillGroupVersion operations ---
 
-    @abstractmethod
     def create_skill_group_version(
         self,
         name: str,
         version: str,
         members: list[SkillGroupVersionMembership],
-        publish_state: SkillPublishState = SkillPublishState.DRAFT,
         source_type: str | None = None,
         source: str | None = None,
         content_digest: str | None = None,
-    ) -> SkillGroupVersion: ...
+    ) -> SkillGroupVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def get_skill_group_version(
         self, name: str, version: str,
-    ) -> SkillGroupVersion: ...
+    ) -> SkillGroupVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def get_skill_group_version_by_alias(
         self, name: str, alias: str,
-    ) -> SkillGroupVersion: ...
+    ) -> SkillGroupVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def get_latest_skill_group_version(
         self, name: str,
-    ) -> SkillGroupVersion: ...
+    ) -> SkillGroupVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def search_skill_group_versions(
         self,
         name: str,
         filter_string: str | None = None,
         max_results: int = 100,
+        order_by: list[str] | None = None,
         page_token: str | None = None,
-    ) -> PagedList[SkillGroupVersion]: ...
+    ) -> PagedList[SkillGroupVersion]:
+        raise NotImplementedError
 
-    @abstractmethod
     def update_skill_group_version(
         self,
         name: str,
         version: str,
-        publish_state: SkillPublishState | None = None,
-    ) -> SkillGroupVersion: ...
+        status: SkillStatus | None = None,
+    ) -> SkillGroupVersion:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_group_version(
         self, name: str, version: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
     # --- SkillGroup tag operations ---
 
-    @abstractmethod
     def set_skill_group_tag(
         self, name: str, key: str, value: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_group_tag(
         self, name: str, key: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def set_skill_group_version_tag(
         self, name: str, version: str,
         key: str, value: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_group_version_tag(
         self, name: str, version: str, key: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
     # --- SkillGroup alias operations ---
 
-    @abstractmethod
     def set_skill_group_alias(
         self, name: str, alias: str, version: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 
-    @abstractmethod
     def delete_skill_group_alias(
         self, name: str, alias: str,
-    ) -> None: ...
+    ) -> None:
+        raise NotImplementedError
 ```
 
 ### REST API
@@ -1148,7 +1212,6 @@ All paths relative to `/ajax-api/3.0/mlflow/skills`.
 | `POST` | `/{name}/aliases` | Set an alias |
 | `GET` | `/{name}/aliases/{alias}` | Resolve alias to `SkillVersion` |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
-| `POST` | `/{name}/pull` | Pull skill content from source to a local destination |
 
 #### Skill group endpoints
 
@@ -1164,7 +1227,7 @@ All paths relative to `/ajax-api/3.0/mlflow/skill-groups`.
 | `POST` | `/{name}/versions` | Create a group version with members |
 | `GET` | `/{name}/versions` | Search group versions |
 | `GET` | `/{name}/versions/{version}` | Get a specific group version |
-| `PATCH` | `/{name}/versions/{version}` | Update group version publish state |
+| `PATCH` | `/{name}/versions/{version}` | Update group version status |
 | `DELETE` | `/{name}/versions/{version}` | Delete a group version |
 | `POST` | `/{name}/tags` | Set a group-level tag |
 | `DELETE` | `/{name}/tags/{key}` | Delete a group-level tag |
@@ -1173,7 +1236,6 @@ All paths relative to `/ajax-api/3.0/mlflow/skill-groups`.
 | `POST` | `/{name}/aliases` | Set a group alias |
 | `GET` | `/{name}/aliases/{alias}` | Resolve group alias to version |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete a group alias |
-| `POST` | `/{name}/pull` | Pull all group members from their sources |
 
 #### Pagination and filtering
 
@@ -1183,24 +1245,32 @@ expressions following existing MLflow conventions.
 **Skills and skill groups:** `name LIKE '%review%'`, `status = 'active'`,
 `kind = 'agent'`, `tags.team = 'platform'`
 
-**Skill versions:** `publish_state = 'published'`,
+**Skill versions:** `status = 'active'`,
 `source_type = 'git'`, `tags.scan.prompt-injection.status = 'pass'`
 
-**Skill group versions:** `publish_state = 'published'`,
+**Skill group versions:** `status = 'active'`,
 `tags.approved = 'true'`
 
 ### Python SDK and CLI
 
-The `mlflow.skills` module exposes top-level functions delegating to
-`MlflowClient`, with a 1:1 mapping to the abstract store methods above.
+The `mlflow.genai.skills` module exposes top-level functions delegating to
+`MlflowClient`, with a 1:1 mapping to the store mixin methods above.
 Two CLI command groups (`mlflow skills` and `mlflow skill-groups`)
 provide the same operations from the command line. See the basic
 examples at the top of this RFC for usage.
 
+`pull` is implemented in the SDK/CLI layer, not the store mixin. The
+client calls `get_skill_version` (or resolves an alias) to obtain the
+source pointer, then fetches content locally using source-type-specific
+logic (git clone, OCI pull, ZIP download). This keeps the store as a
+pure data-access layer.
+
 ### Pull semantics
 
-`pull` resolves a skill or skill group to its source pointer(s) and
-fetches content to a local destination directory. It is
+`pull` is a client-side operation. The SDK reads the source pointer
+from the registry via the REST API, then fetches content directly
+from the source system to the caller's local filesystem. The registry
+server is not involved in content transfer. `pull` is
 source-type-aware:
 
 | Source type | Pull behavior |
@@ -1237,12 +1307,13 @@ directories. Harness-specific installation is covered in RFC-0006.
 |---|---|---|
 | Skill, version, or group not found | `RESOURCE_DOES_NOT_EXIST` | 404 |
 | Duplicate skill name, version, or group | `RESOURCE_ALREADY_EXISTS` | 409 |
-| Invalid publish state transition | `INVALID_PARAMETER_VALUE` | 400 |
+| Invalid status transition | `INVALID_PARAMETER_VALUE` | 400 |
 | Unknown source type | `INVALID_PARAMETER_VALUE` | 400 |
 | Alias references non-existent version | `RESOURCE_DOES_NOT_EXIST` | 404 |
-| Group version member references non-existent skill version | `RESOURCE_DOES_NOT_EXIST` | 404 |
+| Group version member references non-existent version (skill or MCP) | `RESOURCE_DOES_NOT_EXIST` | 404 |
 | Delete skill version referenced by a group version | `INVALID_PARAMETER_VALUE` | 400 |
 | Delete skill with versions referenced by a group | `INVALID_PARAMETER_VALUE` | 400 |
+| Delete MCP server version referenced by a group version | `INVALID_PARAMETER_VALUE` | 400 |
 | Delete skill or group with no group references | Cascading delete (succeeds) | 200 |
 
 ### Workspace scoping
@@ -1278,8 +1349,8 @@ The detail view for a skill shows metadata, version list, aliases, tags
 (including security scan results), and group memberships.
 
 The detail view for a skill group shows its description, status, version
-list, aliases, and tags. Each group version shows its publish state and
-the pinned skill versions it contains.
+list, aliases, and tags. Each group version shows its status and the
+pinned member versions it contains.
 
 ### Security scan tracking
 
@@ -1299,10 +1370,11 @@ Recommended tag conventions:
 These are conventions, not enforced schema. Organizations can define
 additional scan tag prefixes for their own scanning tools and criteria.
 
-The publish state lifecycle supports scan-gated promotion workflows:
-a skill version stays in `draft` until scans pass, then is moved to
-`published`. The registry does not enforce this workflow, but the
-combination of publish state and scan tags makes it easy to implement.
+The status lifecycle supports scan-gated deprecation workflows:
+organizations can deprecate versions that fail scans and use scan
+result tags to filter for safe versions. The registry does not enforce
+this workflow, but the combination of status and scan tags makes it
+easy to implement.
 
 ## Drawbacks
 
@@ -1334,7 +1406,7 @@ management.
 
 This is sufficient for individual developers and small teams. This RFC
 proposes a governance layer on top of Git for enterprises that need
-publish-state lifecycle, security scan tracking, and federated discovery.
+status lifecycle, security scan tracking, and federated discovery.
 The two approaches are complementary.
 
 # Adoption strategy
@@ -1345,8 +1417,8 @@ This is a new feature, not a breaking change. Adoption is incremental:
 - Entities, database schema, store implementation, REST API, Python SDK,
   CLI, and basic UI.
 - Users can register capabilities of any kind (skill, agent, mcp-server,
-  hook), manage publish state, record scan results as tags, organize
-  capabilities into skill groups, and discover published capabilities.
+  hook), manage status lifecycle, record scan results as tags, organize
+  capabilities into skill groups, and discover active capabilities.
 - `mlflow skills pull` fetches content from registered sources.
 - Existing MLflow functionality is unaffected.
 
