@@ -547,8 +547,13 @@ class SkillVersion:
 
 **Source type extensibility.** The `source_type` enum is intentionally
 small for the initial implementation. New source types (e.g., `s3`,
-`azure-blob`) can be added without schema changes since the column
-stores a string value.
+`azure-blob`, `mlflow`) can be added without schema changes since the
+column stores a string value. In particular, an `mlflow` source type
+would allow the registry to store skill content directly in MLflow's
+artifact storage, providing a natural UI upload flow and keeping the
+door open for MLflow-native packaging. This is deferred from the
+initial implementation to keep the registry metadata-first, but can be
+added as a follow-up without breaking changes.
 
 **Version uniqueness.** The combination of `(name, version)` is unique
 within a workspace. A skill version represents a single logical
@@ -1432,4 +1437,7 @@ This is a new feature, not a breaking change. Adoption is incremental:
 - Agent trace integration: traces automatically record which registered
   capability version was used, linking back to the registry.
 - Usage analytics dashboard based on trace metadata.
-- Additional source types and capability kinds as demand emerges.
+- Additional source types as demand emerges, including an `mlflow`
+  source type for storing skill content directly in MLflow artifact
+  storage (see "Source type extensibility" in the data model section).
+- Additional capability kinds as demand emerges.
