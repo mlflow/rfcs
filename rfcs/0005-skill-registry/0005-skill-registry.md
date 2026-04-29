@@ -39,7 +39,7 @@ RFC (RFC-0006).
 
 # Basic example
 
-## Register a skill and publish it
+## Register a skill
 
 ```python
 import mlflow
