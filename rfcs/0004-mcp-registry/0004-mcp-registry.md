@@ -1071,3 +1071,7 @@ This is a new feature, not a breaking change. Adoption is incremental:
 Phase 3 is where deploy-to-gateway UX/API, centralized MLflow-authenticated access, gateway URL behavior for version vs. alias resolution, and runtime deprecation signaling would be defined.
 
 Each phase is independently useful. Phase 1 delivers a complete, self-contained registry.
+
+# Open questions
+
+1. Should we add a `draft` status for versions that are registered but not yet ready for consumption? This would let teams stage MCP server versions before making them discoverable. The tradeoff is that the upstream MCP registry spec only defines `active`, `deprecated`, and `deleted` — adding `draft` would be an MLflow extension that the compatibility layer would need to hide from upstream clients.
