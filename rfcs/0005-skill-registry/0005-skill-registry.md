@@ -392,10 +392,10 @@ across the organization's registered capabilities.
 
 ### Out of scope
 
-- **Artifact storage.** The registry stores metadata and source
-  pointers. Content remains in Git, OCI, or other distribution systems.
-  `pull` fetches from the source; the registry itself does not store
-  artifacts.
+- **Artifact storage as the only path.** The registry supports both
+  external source pointers (Git, OCI, ZIP) and direct artifact storage
+  (`source_type="mlflow"`). However, it is not an artifact-only store;
+  the metadata-first, source-pointer model remains the primary design.
 - **Authoring or development tools.** The registry manages published
   capabilities, not the process of writing them.
 - **Format specification.** The registry is format-agnostic. It does
@@ -422,10 +422,12 @@ erDiagram
 Skill ||--o{ SkillVersion : "has versions"
 Skill ||--o{ SkillTag : "has tags"
 Skill ||--o{ SkillAlias : "has aliases"
+SkillAlias ||--o{ SkillAliasHistory : "has history"
 SkillVersion ||--o{ SkillVersionTag : "has tags"
 SkillGroup ||--o{ SkillGroupVersion : "has versions"
 SkillGroup ||--o{ SkillGroupTag : "has tags"
 SkillGroup ||--o{ SkillGroupAlias : "has aliases"
+SkillGroupAlias ||--o{ SkillGroupAliasHistory : "has history"
 SkillGroupVersion ||--o{ SkillGroupVersionMembership : "contains members"
 SkillGroupVersion ||--o{ SkillGroupVersionTag : "has tags"
 SkillGroupVersionMembership }o--o| SkillVersion : "references (registry=skill)"
@@ -542,13 +544,37 @@ class SkillVersion:
 
 **Source type extensibility.** The `source_type` enum is intentionally
 small for the initial implementation. New source types (e.g., `s3`,
-`azure-blob`, `mlflow`) can be added without schema changes since the
-column stores a string value. In particular, an `mlflow` source type
-would allow the registry to store skill content directly in MLflow's
-artifact storage, providing a natural UI upload flow and keeping the
-door open for MLflow-native packaging. This is deferred from the
-initial implementation to keep the registry metadata-first, but can be
-added as a follow-up without breaking changes.
+`azure-blob`) can be added without schema changes since the column
+stores a string value.
+
+**MLflow artifact storage (`source_type="mlflow"`).** In addition to
+external source pointers, the registry supports storing skill content
+directly in MLflow's artifact storage. This serves users who do not
+have external Git/OCI infrastructure, who want agent capabilities
+stored alongside their models, or who operate in airgapped
+environments where external sources are not reachable.
+
+Content is stored as a directory tree of individual files under an
+artifact path, consistent with how MLflow stores model artifacts. For
+example, a skill with a SKILL.md, scripts, and reference material is
+stored as separate artifacts under a version-specific prefix:
+
+```
+skills/code-review/1.0.0/
+  SKILL.md
+  scripts/analyze.sh
+  scripts/lint-config.json
+  reference/style-guide.md
+```
+
+The `source` field contains the MLflow artifact URI (e.g.,
+`mlflow-artifacts:/skills/code-review/1.0.0/`). Pull downloads the
+directory tree from the artifact store. The MLflow UI can browse
+individual files within a stored skill version.
+
+The upload API accepts a local directory path and stores each file as
+a separate artifact. The `content_digest` is computed over the full
+directory contents at upload time.
 
 **Version uniqueness.** The combination of `(name, version)` is unique
 within a workspace. A skill version represents a single logical
@@ -744,6 +770,32 @@ Tags use the same structure for skill-level, version-level, and
 group-level tags. The distinction is maintained at the storage and API
 layer (separate tables, separate endpoints).
 
+#### Alias audit trail
+
+Alias changes are auditable. Every call to `set_skill_alias`,
+`delete_skill_alias`, `set_skill_group_alias`, or
+`delete_skill_group_alias` appends a record to an append-only history
+table. This supports governance questions like "who promoted this to
+production and when?" or "what was production pointing to before the
+incident?"
+
+```python
+@dataclass(frozen=True)
+class SkillAliasHistory:
+    name: str              # parent Skill name
+    alias: str             # e.g., "production"
+    old_version: str | None  # previous target (None if alias was created)
+    new_version: str | None  # new target (None if alias was deleted)
+    changed_by: str | None
+    timestamp: int | None    # millis since epoch
+```
+
+History is recorded automatically by the store on every alias
+mutation. The same structure applies to `SkillGroupAliasHistory`.
+
+History records are read-only and append-only. They cannot be modified
+or deleted through the API.
+
 ### Status and lifecycle
 
 This lifecycle aligns with the MCP Server Registry (RFC-0004).
@@ -857,6 +909,20 @@ FK: `(workspace, name)` references `skills`, CASCADE delete.
 | `alias` | `String(256)` | PK |
 | `version` | `String(256)` | target version string |
 
+#### `skill_alias_history`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `workspace` | `String(63)` | FK |
+| `name` | `String(256)` | FK |
+| `alias` | `String(256)` | |
+| `old_version` | `String(256)` | nullable; null on alias creation |
+| `new_version` | `String(256)` | nullable; null on alias deletion |
+| `changed_by` | `String(256)` | |
+| `timestamp` | `BigInteger` | millis since epoch; PK with workspace, name, alias |
+
+Append-only. No updates or deletes through the API.
+
 #### `skill_groups`
 
 | Column | Type | Notes |
@@ -938,6 +1004,20 @@ migrations and allows either registry to be deployed independently.
 | `name` | `String(256)` | PK, FK |
 | `alias` | `String(256)` | PK |
 | `version` | `String(256)` | target group version string |
+
+#### `skill_group_alias_history`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `workspace` | `String(63)` | FK |
+| `name` | `String(256)` | FK |
+| `alias` | `String(256)` | |
+| `old_version` | `String(256)` | nullable; null on alias creation |
+| `new_version` | `String(256)` | nullable; null on alias deletion |
+| `changed_by` | `String(256)` | |
+| `timestamp` | `BigInteger` | millis since epoch; PK with workspace, name, alias |
+
+Append-only. No updates or deletes through the API.
 
 **Workspace handling.** All tables use `(workspace, ...)` as the leading
 primary key components. Single-tenant deployments use `'default'`.
@@ -1067,6 +1147,15 @@ class SkillRegistryMixin:
     ) -> None:
         raise NotImplementedError
 
+    def get_skill_alias_history(
+        self,
+        name: str,
+        alias: str | None = None,
+        max_results: int = 100,
+        page_token: str | None = None,
+    ) -> PagedList[SkillAliasHistory]:
+        raise NotImplementedError
+
     # --- SkillGroup operations ---
 
     def create_skill_group(
@@ -1182,6 +1271,15 @@ class SkillRegistryMixin:
         self, name: str, alias: str,
     ) -> None:
         raise NotImplementedError
+
+    def get_skill_group_alias_history(
+        self,
+        name: str,
+        alias: str | None = None,
+        max_results: int = 100,
+        page_token: str | None = None,
+    ) -> PagedList[SkillGroupAliasHistory]:
+        raise NotImplementedError
 ```
 
 ### REST API
@@ -1212,6 +1310,8 @@ All paths relative to `/ajax-api/3.0/mlflow/skills`.
 | `POST` | `/{name}/aliases` | Set an alias |
 | `GET` | `/{name}/aliases/{alias}` | Resolve alias to `SkillVersion` |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
+| `GET` | `/{name}/aliases/history` | Get alias change history (all aliases) |
+| `GET` | `/{name}/aliases/{alias}/history` | Get alias change history (specific alias) |
 
 #### Skill group endpoints
 
@@ -1236,6 +1336,8 @@ All paths relative to `/ajax-api/3.0/mlflow/skill-groups`.
 | `POST` | `/{name}/aliases` | Set a group alias |
 | `GET` | `/{name}/aliases/{alias}` | Resolve group alias to version |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete a group alias |
+| `GET` | `/{name}/aliases/history` | Get alias change history (all aliases) |
+| `GET` | `/{name}/aliases/{alias}/history` | Get alias change history (specific alias) |
 
 #### Pagination and filtering
 
@@ -1452,16 +1554,16 @@ follow-up without breaking the tag-based approach.
 
 # Alternatives
 
-## Store skill artifacts directly in MLflow
+## Store skill artifacts only in MLflow (no source pointers)
 
-Store skill bundles (SKILL.md + scripts + assets) as MLflow artifacts
-alongside the metadata.
+Make MLflow artifact storage the sole storage mechanism, with no
+support for external source pointers.
 
-Rejected because skills are already versioned and stored in Git, OCI, or
-other systems. Source pointers federate across distribution mechanisms
-naturally; artifact storage forces centralization. Organizations that
-want artifact backup can use OCI registries, which already provide
-versioned, content-addressable storage.
+Rejected because most organizations already manage skills in Git or
+OCI. Source pointers federate across existing distribution mechanisms
+without requiring migration. The current design supports both:
+`source_type="mlflow"` for direct artifact storage alongside
+`source_type="git"`, `"oci"`, and `"zip"` for external sources.
 
 ## Use Git alone (no registry)
 
@@ -1483,6 +1585,8 @@ This is a new feature, not a breaking change. Adoption is incremental:
 - Users can register capabilities of any kind (skill, agent, mcp-server,
   hook), manage status lifecycle, record scan results as tags, organize
   capabilities into skill groups, and discover active capabilities.
+- Source types include `git`, `oci`, `zip`, and `mlflow` (direct
+  artifact storage).
 - `mlflow skills pull` fetches content from registered sources.
 - Existing MLflow functionality is unaffected.
 
@@ -1496,7 +1600,8 @@ This is a new feature, not a breaking change. Adoption is incremental:
 - Agent trace integration: traces automatically record which registered
   capability version was used, linking back to the registry.
 - Usage analytics dashboard based on trace metadata.
-- Additional source types as demand emerges, including an `mlflow`
-  source type for storing skill content directly in MLflow artifact
-  storage (see "Source type extensibility" in the data model section).
-- Additional capability kinds as demand emerges.
+- Additional source types and capability kinds as demand emerges.
+- Cross-workspace export/import for promoting assets between
+  workspaces or instances. This should follow whatever pattern the
+  other MLflow registries adopt rather than designing a serialization
+  format in isolation.

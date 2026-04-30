@@ -39,9 +39,9 @@ capabilities from their registered sources, and generates:
 .claude/plugins/pr-workflow/
   .claude-plugin/plugin.json      # Generated manifest
   skills/
-    code-review/SKILL.md          # Pulled from Git source
+    code-review/SKILL.md          # Pulled from registered source
   agents/
-    security-auditor.md           # Pulled from Git source
+    security-auditor.md           # Pulled from registered source
   .mcp.json                       # Generated from mcp-server members
 ```
 
