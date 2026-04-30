@@ -40,6 +40,8 @@
 
 Add an MCP Registry to MLflow — a governed, versioned registry for [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server definitions. The registry stores metadata-first records aligned with the [upstream MCP registry specification](https://registry.modelcontextprotocol.io/docs), but differs from an MCP gateway: it is the system of record for canonical server definitions, version history, aliases, governance, and approved hosted bindings, rather than the live traffic layer that mediates MCP requests. The design is intended to integrate cleanly with a future MCP gateway in MLflow AI Gateway, while remaining useful on its own as a governed registry. This is intended to complement, not replace, the public GitHub-hosted MCP registry.
 
+MLflow MCP should feel like one product. The registry is the governed source of truth, and a future MLflow MCP Gateway should build on the same server identities, versions, aliases, and hosted bindings rather than introducing a separate MCP catalog.
+
 MLflow stores the publisher-declared `server_json["version"]` as the canonical version of a server definition. It does not introduce a second MLflow-specific version. Hosted connectivity, when present, is represented by separate `MCPHostedBinding` records rather than mutable runtime metadata on the version itself.
 
 # Basic example
@@ -134,7 +136,7 @@ As MCP adoption grows, organizations accumulate MCP server definitions across te
 - Record which MCP servers exist and what state they are in
 - Version MCP server definitions as they evolve
 - Control which MCP servers are available to specific users, teams, or agents
-- Associate traces with governed MCP server versions when runtimes participate in MLflow-aware tracing
+- Associate traces with governed MCP server versions for rollback analysis, fixes, and lightweight auditing when runtimes participate in MLflow-aware tracing
 - Provide downstream systems (catalogs, gateways, agent frameworks) with a governed source of truth
 
 ### Registry vs. Gateway
@@ -142,9 +144,9 @@ As MCP adoption grows, organizations accumulate MCP server definitions across te
 The MCP Registry and an MCP Gateway are related but distinct capabilities:
 
 - **MCP Registry**: the control-plane system of record for governed MCP assets. It stores canonical `server_json`, version history, aliases, tags, lifecycle state, and hosted binding records that describe approved live connection paths.
-- **MCP Gateway**: a runtime data-plane service that receives live client traffic and mediates connectivity, authentication, routing, policy enforcement, and request-time observability.
+- **MCP Gateway**: a runtime data-plane service that receives live client traffic and mediates connectivity, authentication, routing, policy enforcement, and request-time observability. In MLflow, a future gateway should consume the runtime-relevant subset of registry data and add those runtime behaviors on top.
 
-This RFC proposes the former, not the latter. It does **not** design an MLflow MCP Gateway, extend the existing AI Gateway into an MCP Gateway, or define MCP proxy semantics. Instead, it ensures the registry can support that future integration cleanly by storing governed MCP server identities, aliases, and hosted bindings that a future gateway could resolve to concrete `{name, version}` records for connectivity and trace association.
+This RFC defines the registry layer first. It does **not** yet design the MLflow MCP Gateway runtime, extend the existing AI Gateway into an MCP Gateway, or define MCP proxy semantics. Instead, it establishes the governed MCP server identities, aliases, and hosted bindings that a future gateway would build on, so gateway configuration is derived from the registry rather than becoming a second source of truth.
 
 ### Use cases
 
@@ -155,11 +157,13 @@ This RFC proposes the former, not the latter. It does **not** design an MLflow M
 5. **Version history**: Multiple versions of an MCP server coexist with independent lifecycle states, supporting deprecation without erasing history
 6. **After-the-fact governance**: MCP servers already running in a hosted environment can have registry records and bindings created after the fact, associating existing deployments with governed assets without requiring redeployment
 
+These use cases support two complementary consumption modes. In the first, teams use MLflow as the governed MCP registry and connect directly to canonical `server_json` definitions or approved `remote` bindings. In the second, a future MLflow MCP Gateway would expose those same governed servers through a centralized MLflow entrypoint. A typical journey is to register an MCP server definition in MLflow, manage versions and aliases there, use direct connectivity in Phase 1, and later add gateway-backed deployment and access without introducing a separate catalog.
+
 ### Out of scope
 
 - **Runtime execution and orchestration** — The registry may store hosted binding records, but it does not provision, host, scale, or manage MCP runtimes
-- **End-user connectivity, proxying, or usage control enforcement** — Consumers can still connect directly to an MCP endpoint unless a future MLflow gateway or proxy mediates access
-- **MCP Gateway design** — This RFC does not define MLflow MCP Gateway request routing, protocol mediation, authentication behavior, usage control, or runtime APIs
+- **End-user connectivity, proxying, or usage control enforcement** — Consumers can still connect directly to an MCP endpoint unless a future MLflow gateway or proxy mediates access; centralized MLflow-credential-based access through a gateway is future work
+- **MCP Gateway runtime and deployment UX** — This RFC does not define the MLflow MCP Gateway runtime, including request routing, protocol mediation, authentication behavior, usage control, runtime APIs, or deploy UX
 - **Upstream MCP registry API compatibility layer** — A separate router implementing the upstream `GET /v0.1/servers` API shape is deferred to [Phase 2](#adoption-strategy); this RFC defines MLflow-native APIs
 
 ## MCP registry spec alignment
@@ -391,6 +395,8 @@ class MCPServerTag:
 ```
 
 Aliases provide stable version pointers. For example, setting alias `"production"` to version `"1.2.0"` allows consumers to resolve `get_mcp_server_version_by_alias("my-server", "production")` without tracking specific version strings. `MCPServer` exposes the full alias → version map, and version entities expose the subset of alias names that currently target that version.
+
+Aliases are most useful when more than one version may intentionally be live at once. Common patterns include `dev` / `staging` / `production` promotion, parallel deployment of old and new versions during a breaking change, and local workflows where users intentionally choose among multiple versions. Because hosted bindings can target aliases, operators can move a stable environment pointer without changing the governed server identity or forcing every client to track a raw version string.
 
 #### Future entity: MCPObservedTool (deferred)
 
@@ -984,9 +990,13 @@ The list view uses a card-based layout consistent with other MLflow pages, showi
 
 The detail view shows the server's metadata, versions list, aliases, hosted bindings, and tags. Individual version pages display the `server_json` payload, aliases, status, and any active hosted bindings targeting that version or one of its aliases. Hosted binding detail views show the connection type (`remote` or future `mlflow_gateway`), target (`version` or `alias`), endpoint information, and tags.
 
+As a possible future UI integration, the registry detail view could expose a `Deploy` action that publishes a governed MCP server to MLflow MCP Gateway by creating or updating a hosted binding against the same underlying version and alias model, so users experience registry and gateway as one workflow rather than two separate products.
+
 ### Trace linking
 
 Each MCP server version may be associated with traces that used it. The source of truth is a trace-to-MCP-version association created when a runtime or server knows which registered `{name, version}` handled a request. This supports both trace-to-MCP and MCP-to-traces lookup.
+
+Users can trace MCP usage without the registry as long as the client or runtime emits traces, but those traces may only capture raw endpoint details or ad hoc server names. The registry adds a governed canonical `{name, version}` identity so traces continue to roll up correctly when endpoints move or aliases change. That linkage also improves quality assessment workflows such as rollback and fix analysis, and supports lightweight auditing of which MCP definitions were in use.
 
 If tracing context is propagated to the runtime (for example, over HTTP with `traceparent`), caller-side and runtime-side traces can be correlated. Otherwise, the runtime can still record its own trace and associate it with the MCP server version it used. Looking up an MCP server in the registry does not by itself create a trace association.
 
@@ -1043,6 +1053,7 @@ This is a new feature, not a breaking change. Adoption is incremental:
 - Hosted bindings for approved hosted connection paths (`remote` today, `mlflow_gateway` reserved for future use)
 - Trace linking: trace-to-MCP-version associations and `link_mcp_server_versions_to_trace()` API
 - Users can register and version MCP server definitions
+- Direct resolution via canonical `server_json` payloads or approved `remote` bindings
 - Existing MLflow functionality is unaffected
 
 **Phase 2: Upstream spec compatibility and tool observation**
@@ -1053,12 +1064,10 @@ This is a new feature, not a breaking change. Adoption is incremental:
 **Phase 3: Integration and ecosystem**
 
 - Catalog integration (read active MCPs for discovery surfacing)
-- Gateway integration (read active MCP metadata and hosted bindings for runtime mediation)
+- Gateway integration (read active MCP metadata and hosted bindings for runtime mediation; build on the registry data model rather than a separate catalog)
 - Gateway trace provenance (future MCP Gateway resolves hosted bindings to governed server versions during request handling)
 - Shared base extraction if additional AI asset registries are introduced
 
+Phase 3 is where deploy-to-gateway UX/API, centralized MLflow-authenticated access, gateway URL behavior for version vs. alias resolution, and runtime deprecation signaling would be defined.
+
 Each phase is independently useful. Phase 1 delivers a complete, self-contained registry.
-
-# Open questions
-
-1. Should we add a `draft` status for versions that are registered but not yet ready for consumption? This would let teams stage MCP server versions before making them discoverable. The tradeoff is that the upstream MCP registry spec only defines `active`, `deprecated`, and `deleted` — adding `draft` would be an MLflow extension that the compatibility layer would need to hide from upstream clients.
