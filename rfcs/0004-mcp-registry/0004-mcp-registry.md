@@ -81,9 +81,16 @@ version = mlflow.genai.register_mcp_server(
         ],
     },
 )
-# version.status == "active"
+# version.status == "draft" (default — not yet visible to downstream consumers)
 # version.version == "1.0.0" (extracted from server_json)
 # version.name == "io.github.anthropic/brave-search" (extracted from server_json)
+
+# Publish the version to make it discoverable
+mlflow.genai.update_mcp_server_version(
+    name="io.github.anthropic/brave-search",
+    version="1.0.0",
+    status="active",
+)
 
 # Set an alias for stable resolution
 mlflow.genai.set_mcp_server_alias(
@@ -152,7 +159,7 @@ This RFC defines the registry layer first. It does **not** yet design the MLflow
 ### Use cases
 
 1. **Governed registration**: Platform administrators register MCP server definitions (both internally developed packages and hosted remote endpoints) as governed, versioned assets with stable identity
-2. **Lifecycle management**: MCP server versions move through statuses (active → deprecated → deleted) to control downstream surfacing
+2. **Lifecycle management**: MCP server versions move through statuses (draft → active → deprecated → deleted) to control downstream surfacing
 3. **Discovery and resolution**: MLflow-aware clients and runtimes discover active MCP servers and resolve them by name + version or alias
 4. **Direct connectivity association**: Operators can record approved direct connection paths as first-class binding records, bridging the gap between "what is governed" and "what is live"
 5. **Version history**: Multiple versions of an MCP server coexist with independent lifecycle states, supporting deprecation without erasing history
@@ -226,7 +233,7 @@ This design aligns with the [upstream MCP registry specification](https://regist
 
 - **Endpoint mapping**: all 8 upstream endpoints map closely to the MLflow-native API shape. The main nuance is upstream version update: the upstream spec includes an optional in-place version update endpoint, but the official MCP registry does not implement it. In MLflow, canonical publisher-managed `server_json` changes are represented by registering a new version, while mutable MLflow-specific fields remain editable through MLflow-native update APIs.
 - **Response translation**: wrap MLflow entities in the upstream `{servers: [{server, _meta}]}` envelope, with MLflow-specific metadata (tags, aliases, workspace) in a custom `_meta` namespace (e.g., `org.mlflow`)
-- **Status mapping**: MLflow uses upstream status values (`active`/`deprecated`/`deleted`) directly. MLflow's `deleted` is a soft delete — records are preserved for history
+- **Status mapping**: MLflow extends the upstream status values (`active`/`deprecated`/`deleted`) with an additional `draft` state for staging versions before publication. The upstream spec does not define a draft state, so the Phase 2 compatibility router will need to decide how to handle it — for example, filtering `draft` versions from read responses and auto-publishing versions created through the upstream write API, or exposing `draft` as a non-standard extension. The exact mapping is deferred to Phase 2 design. MLflow's `deleted` is a soft delete — records are preserved for history
 - **Pagination**: cursor ↔ page_token translation
 - **Workspace**: MLflow's existing middleware already extracts `X-MLFLOW-WORKSPACE` from incoming request headers, so external clients pass the workspace header alongside standard Bearer auth — no protocol changes needed
 
@@ -288,6 +295,7 @@ A versioned record containing an immutable MCP payload and mutable MLflow-manage
 
 ```python
 class MCPStatus(StrEnum):
+    DRAFT = "draft"  # registered but not yet ready for downstream consumption
     ACTIVE = "active"
     DEPRECATED = "deprecated"
     DELETED = "deleted"  # soft delete — retained internally for history, excluded from normal get/search/list APIs
@@ -299,7 +307,7 @@ class MCPServerVersion:
     version: str  # extracted from server_json["version"]; semver recommended
     server_json: dict  # immutable upstream MCP ServerJSON payload
     display_name: str | None = None  # mutable human-readable label
-    status: MCPStatus = MCPStatus.ACTIVE
+    status: MCPStatus = MCPStatus.DRAFT
     aliases: list[str] = field(default_factory=list)  # read-only; alias names from parent mcp_server_aliases rows currently pointing at this version
     tags: dict[str, str] = field(default_factory=dict)
     source: str | None = None  # provenance URI (e.g., git repository URL)
@@ -448,7 +456,10 @@ Each `MCPServerVersion` has an independent status controlling downstream surfaci
 
 ```mermaid
 stateDiagram-v2
-    [*] --> active
+    [*] --> draft
+    draft --> active : publish
+    draft --> deleted : discard
+    active --> draft : unpublish
     active --> deprecated
     deprecated --> active : re-activate
     deprecated --> deleted
@@ -456,6 +467,7 @@ stateDiagram-v2
 
 | State | Meaning | Downstream surfacing |
 |---|---|---|
+| `draft` | Registered but not yet ready for downstream consumption | Not surfaced — invisible to catalogs, gateways, consumers |
 | `active` | Ready for downstream use | Surfaced to catalogs, gateways, consumers |
 | `deprecated` | Still functional but no longer recommended | Surfaced with deprecation signal |
 | `deleted` | Soft-deleted — record preserved for history, no longer active | Not surfaced |
@@ -464,10 +476,13 @@ stateDiagram-v2
 
 | From | To |
 |---|---|
-| `active` | `deprecated` |
+| `draft` | `active`, `deleted` |
+| `active` | `draft`, `deprecated` |
 | `deprecated` | `active`, `deleted` |
 
-`deprecated` can return to `active` (re-activate) to handle cases where a deprecation was premature or a planned replacement is not yet ready.
+`draft` lets teams stage MCP server versions — validating metadata, setting aliases, and configuring access bindings — before making them discoverable. Transitioning from `draft` to `active` is an explicit publish action. A draft can also be discarded directly (`draft` → `deleted`) without ever being published. `active` can return to `draft` (unpublish) when a version was published prematurely or needs rework.
+
+`deprecated` can return to `active` (re-activate) to handle cases where a deprecation was premature or a planned replacement is not yet ready. `deleted` is terminal.
 
 #### Server-level status (derived)
 
@@ -501,7 +516,7 @@ Six tables, created via a single Alembic migration. All tables are workspace-sco
 | `version` | `String(256)` | PK, publisher-supplied |
 | `server_json` | `JSON` | immutable canonical MCP payload |
 | `display_name` | `String(256)` | mutable human-readable label |
-| `status` | `String(20)` | default `'active'` |
+| `status` | `String(20)` | default `'draft'` |
 | `source` | `String(512)` | provenance URI |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
@@ -630,7 +645,7 @@ class MCPServerRegistryMixin:
         server_json: dict,
         display_name: str | None = None,
         source: str | None = None,
-        status: MCPStatus | None = None,  # defaults to ACTIVE
+        status: MCPStatus | None = None,  # defaults to DRAFT
     ) -> MCPServerVersion:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -727,9 +742,9 @@ class MCPServerRegistryMixin:
 
 **User-facing vs. store layer**: Following the general shape of MLflow model registry, the Python SDK exposes explicit create/get/search/update/delete operations for the core entities. On top of that, it also provides `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as convenience helpers for the common "ingest a canonical `server.json` and create or update the parent server as needed" workflow. Internally, these helpers call the same underlying `create_mcp_server()` / `create_mcp_server_version()` flow. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
 
-**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, creation fails with a validation error. New versions default to `active` status.
+**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, creation fails with a validation error. New versions default to `draft` status.
 
-**Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (active→deprecated, deprecated→active, deprecated→deleted). New versions default to `active`; any later status change is an explicit admin action rather than automatic MLflow behavior.
+**Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
 **Latest version**: `get_latest_mcp_server_version` checks `MCPServer.latest_version_alias` first — if set, it resolves that alias to a version. If unset, it falls back to the version with the most recent `creation_timestamp`. This lets users explicitly control what "latest" means (e.g., pointing it at the latest *active* version) while preserving a sensible default.
 
@@ -793,7 +808,7 @@ class UpdateMCPServerRequest(BaseModel):
 class CreateMCPServerVersionRequest(BaseModel):
     server_json: ServerJSONPayload
     display_name: str | None = None
-    status: str = "active"
+    status: str = "draft"
     source: str | None = None
 
 
@@ -847,7 +862,7 @@ class MCPServerVersionResponse(BaseModel):
     version: str
     server_json: dict
     display_name: str | None = None
-    status: str = "active"
+    status: str = "draft"
     aliases: list[str] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     source: str | None = None
@@ -923,7 +938,7 @@ def register_mcp_server(
     server_json: dict,
     display_name: str | None = None,
     source: str | None = None,
-    status: str = "active",
+    status: str = "draft",
     create_access_bindings_from_remotes: bool = False,
 ) -> MCPServerVersion: ...
 
@@ -932,7 +947,7 @@ def register_mcp_server_from_url(
     url: str,
     display_name: str | None = None,
     source: str | None = None,
-    status: str = "active",
+    status: str = "draft",
     create_access_bindings_from_remotes: bool = False,
 ) -> MCPServerVersion: ...
 
@@ -1169,4 +1184,4 @@ Each phase is independently useful. Phase 1 delivers a complete, self-contained 
 
 # Open questions
 
-1. Should we add a `draft` status for versions that are registered but not yet ready for consumption? This would let teams stage MCP server versions before making them discoverable. The tradeoff is that the upstream MCP registry spec only defines `active`, `deprecated`, and `deleted` — adding `draft` would be an MLflow extension that the compatibility layer would need to hide from upstream clients.
+1. How should the Phase 2 upstream compatibility router handle MLflow's `draft` status? The upstream MCP registry spec only defines `active`, `deprecated`, and `deleted`. Options include filtering `draft` versions from read responses and auto-publishing versions created through the upstream write API, or exposing `draft` as a non-standard extension. Deferred to Phase 2 design.
