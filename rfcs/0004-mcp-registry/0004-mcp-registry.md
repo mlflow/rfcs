@@ -130,9 +130,11 @@ binding = mlflow.genai.create_mcp_access_binding(
     name="io.github.anthropic/brave-search",
     alias="production",
     endpoint_url="https://mcp.acme.internal/brave-search",
+    transport_type="streamable-http",
 )
 
 # binding.endpoint_url == "https://mcp.acme.internal/brave-search"
+# binding.transport_type == "streamable-http"
 ```
 
 ## Motivation
@@ -340,11 +342,18 @@ Retaining older versions enables:
 A direct access binding is the separate record that says a governed MCP server version or alias can be reached through an approved non-gateway endpoint. An `MCPServerVersion` is the governed metadata record for a server definition; by itself, it does not mean there is an approved direct endpoint available in the workspace. `MCPAccessBinding` is what makes that governed server show up in direct-access discovery. The registry is intentionally runtime-agnostic: MLflow-aware clients or runtimes may resolve a registered MCP server through MLflow and then either use the canonical `server_json` payload directly (for example, for local `packages[]` consumption) or follow an approved direct access binding. When the canonical server definition changes, publishers register a new version. When only direct connectivity changes, operators create or update access bindings without creating a new version.
 
 ```python
+class MCPTransportType(StrEnum):
+    STREAMABLE_HTTP = "streamable-http"
+    SSE = "sse"
+    STDIO = "stdio"  # included for completeness; access bindings typically use streamable-http or sse
+
+
 @dataclass
 class MCPAccessBinding:
     binding_id: int  # stable MLflow-managed binding identifier
     name: str  # parent MCPServer name
     endpoint_url: str  # required approved direct endpoint
+    transport_type: MCPTransportType = MCPTransportType.STREAMABLE_HTTP
     version: str | None = None  # exactly one of version / alias must be set
     alias: str | None = None
     workspace: str | None = None
@@ -363,6 +372,8 @@ class MCPGatewayBinding(MCPAccessBinding):
 ```
 
 **Binding target**: An access binding points to either a concrete `version` or an `alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string.
+
+**Connection details**: `endpoint_url` and `transport_type` together describe how a client connects to the approved endpoint. These are properties of the binding itself, not of the governed server version it points to — an enterprise may deploy the same governed server behind a different transport than the publisher declared in `server_json.remotes[]`. For example, a publisher may declare SSE endpoints in their upstream metadata while the enterprise deploys the same server internally behind a streamable-http reverse proxy.
 
 **Why a separate entity**: Direct connectivity changes independently from the canonical MCP definition. Modeling approved direct access as a separate binding avoids mutating version records when an endpoint moves, when an alias changes, or when multiple approved direct entrypoints exist for the same governed server. It is valid for multiple versions of the same `MCPServer` to be available at once, for example to support both `v1` and `v2` clients during a migration, and the model does not prevent multiple approved direct endpoints from targeting the same governed version when needed.
 
@@ -403,7 +414,7 @@ Below is a subset of the fields that the upstream spec defines:
 
 MLflow preserves the full `server_json` payload as provided by the publisher, and MLflow-aware clients can read and parse that full payload directly. Publisher-declared `remotes[]` remain part of the preserved upstream metadata, but they are not the MLflow source of truth for approved direct enterprise connectivity.
 
-**Source of truth for direct access**: `MCPAccessBinding` is the MLflow-governed source of truth for approved direct endpoints that MLflow should surface to users. For convenience, registration helpers may optionally create bindings from declared `remotes[]`, but once created the binding is the governed record MLflow uses for approved direct connectivity. When `create_access_bindings_from_remotes=True`, the helper creates one direct-access binding per declared `remotes[]` entry, targets the newly created version, and uses the literal `url` value from the upstream payload.
+**Source of truth for direct access**: `MCPAccessBinding` is the MLflow-governed source of truth for approved direct endpoints that MLflow should surface to users. For convenience, registration helpers may optionally create bindings from declared `remotes[]`, but once created the binding is the governed record MLflow uses for approved direct connectivity. When `create_access_bindings_from_remotes=True`, the helper creates one direct-access binding per declared `remotes[]` entry, targets the newly created version, uses the literal `url` value from the upstream payload, and carries over the `transport_type` from the upstream entry.
 
 MLflow-managed fields such as `status` are stored as first-class MLflow fields on `MCPServerVersion`, **not** inside `server_json`. Direct access bindings are stored in `MCPAccessBinding`, not embedded into `server_json`. In API responses, version-level MLflow-managed fields are projected into a namespaced `_meta` block for interoperability:
 
@@ -567,6 +578,7 @@ This matches MLflow's registered model alias pattern: aliases are stored in a pa
 | `version` | `String(256)` | nullable; exactly one of `version` / `alias` must be set |
 | `alias` | `String(256)` | nullable |
 | `endpoint_url` | `String(2048)` | direct endpoint URL |
+| `transport_type` | `String(32)` | default `'streamable-http'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -686,6 +698,7 @@ class MCPServerRegistryMixin:
         self,
         name: str,
         endpoint_url: str,
+        transport_type: MCPTransportType = MCPTransportType.STREAMABLE_HTTP,
         version: str | None = None,
         alias: str | None = None,
     ) -> MCPAccessBinding:
@@ -711,6 +724,7 @@ class MCPServerRegistryMixin:
         version: str | None = None,
         alias: str | None = None,
         endpoint_url: str | None = None,
+        transport_type: MCPTransportType | None = None,
     ) -> MCPAccessBinding:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -821,12 +835,14 @@ class CreateMCPAccessBindingRequest(BaseModel):
     version: str | None = None
     alias: str | None = None
     endpoint_url: str
+    transport_type: str = "streamable-http"
 
 
 class UpdateMCPAccessBindingRequest(BaseModel):
     version: str | None = None
     alias: str | None = None
     endpoint_url: str | None = None
+    transport_type: str | None = None
 
 
 class AliasResponse(BaseModel):
@@ -837,6 +853,7 @@ class AliasResponse(BaseModel):
 class MCPAccessBindingSummaryResponse(BaseModel):
     binding_id: int
     endpoint_url: str
+    transport_type: str = "streamable-http"
     version: str | None = None
     alias: str | None = None
 
@@ -875,6 +892,7 @@ class MCPAccessBindingResponse(BaseModel):
     binding_id: int
     name: str
     endpoint_url: str
+    transport_type: str = "streamable-http"
     version: str | None = None
     alias: str | None = None
     created_by: str | None = None
@@ -1014,6 +1032,7 @@ def create_mcp_access_binding(
     *,
     name: str,
     endpoint_url: str,
+    transport_type: str = "streamable-http",
     version: str | None = None,
     alias: str | None = None,
 ) -> MCPAccessBinding: ...
@@ -1034,6 +1053,7 @@ def update_mcp_access_binding(
     name: str,
     binding_id: int,
     endpoint_url: str | None = None,
+    transport_type: str | None = None,
     version: str | None = None,
     alias: str | None = None,
 ) -> MCPAccessBinding: ...
