@@ -7,7 +7,7 @@
 
 | Author(s)              | [Jon Burdo](https://github.com/jonburdo), [Dan Kuc](https://github.com/dkuc), [Matthew Prahl](https://github.com/mprahl) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-05-01 |
+| **Date Last Modified** | 2026-05-04 |
 | **AI Assistant(s)**    | Claude Code, GPT 5.4 |
 
 **Table of contents**
@@ -103,7 +103,7 @@ mlflow.genai.set_mcp_server_alias(
 ## Discover and consume MCP servers
 
 ```python
-# Search for active MCP servers (status is derived from latest version)
+# Search for active MCP servers (status is derived from the resolved latest version)
 servers = mlflow.genai.search_mcp_servers(
     filter_string="status = 'active'",
 )
@@ -273,12 +273,11 @@ class MCPServer:
     display_name: str | None = None  # mutable human-readable label; falls back to server_json["title"], then name
     description: str | None = None
     workspace: str | None = None  # resolved via resolve_entity_workspace_name()
-    status: MCPStatus | None = None  # read-only; derived from latest version's status
+    status: MCPStatus | None = None  # read-only; derived from the resolved latest version's status
     tags: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)  # read-only; populated from mcp_server_aliases table, e.g. {"production": "1.2.0"}
     access_bindings: list["MCPAccessBinding"] = field(default_factory=list)  # read-only
-    latest_version_alias: str | None = None  # optional; alias name to resolve as "latest" (e.g., "production")
-    last_registered_version: str | None = None  # read-only; most recently created version string (fallback when latest_version_alias is unset)
+    latest_version: str | None = None  # optional explicit version string to resolve as "latest"
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
@@ -288,6 +287,8 @@ class MCPServer:
 **Name identity**: `name` is extracted from `server_json["name"]` and follows the upstream spec's reverse-DNS format (e.g., `io.github.user/brave-search`). This format prevents name collisions by construction — the namespace portion identifies the publisher. The `name` is immutable and serves as the primary key within a workspace. For display purposes, `display_name` is a mutable user-supplied label on `MCPServer`. UIs resolve display names as: `display_name` (if set) → `server_json["title"]` (if present) → `name`.
 
 **Audit field population**: `created_by` and `last_updated_by` are populated from the authenticated MLflow user when authentication is enabled. In unauthenticated installs, these fields remain empty.
+
+**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. Unlike Model Registry, which uses MLflow-controlled increasing version numbers, MCP server versions are publisher-supplied strings from `server_json["version"]`, so MLflow cannot rely on version identity alone to define a universal `latest`. `MCPServer.latest_version` can explicitly pin which version resolves as `@latest`. If it is unset, MLflow falls back to the most recently created non-`draft` version. Draft versions are ignored when calculating `latest`, so staging a draft does not change downstream `@latest` resolution or the derived server status. If no non-`draft` version exists yet, the server has no resolved latest version.
 
 #### MCPServerVersion
 
@@ -330,7 +331,7 @@ Retaining older versions enables:
 
 **Version string conventions**: The version string is extracted from `server_json["version"]`. Semantic versioning is recommended but not enforced — any non-empty string is accepted.
 
-**Alias storage model**: Following MLflow's existing registered model design, alias rows are stored parent-scoped on `MCPServer` as alias → version mappings, while version entities also expose `MCPServerVersion.aliases` for the alias names currently targeting that version. This means users can inspect aliases directly on a version even though aliases are stored in a top-level table.
+**Alias storage model**: Following MLflow's existing registered model design, alias rows are stored parent-scoped on `MCPServer` as alias → version mappings, while version entities also expose `MCPServerVersion.aliases` for the alias names currently targeting that version. This means users can inspect aliases directly on a version even though aliases are stored in a top-level table. The alias name `latest` is reserved and not stored in `mcp_server_aliases`.
 
 **Typed payload**: The `server_json` field uses `dict` in the entity and store layers for simplicity. At the API layer, the `CreateMCPServerVersionRequest` uses a `ServerJSONPayload` Pydantic model (with `extra="allow"`) that validates the payload on ingestion and extracts typed fields. See [server_json validation](#server_json-validation).
 
@@ -480,13 +481,13 @@ stateDiagram-v2
 | `active` | `draft`, `deprecated` |
 | `deprecated` | `active`, `deleted` |
 
-`draft` lets teams stage MCP server versions — validating metadata, setting aliases, and configuring access bindings — before making them discoverable. Transitioning from `draft` to `active` is an explicit publish action. A draft can also be discarded directly (`draft` → `deleted`) without ever being published. `active` can return to `draft` (unpublish) when a version was published prematurely or needs rework.
+`draft` lets teams stage MCP server versions — validating metadata, setting aliases, and configuring access bindings — before making them discoverable. Transitioning from `draft` to `active` is an explicit publish action. A draft can also be discarded directly (`draft` → `deleted`) without ever being published. `active` can return to `draft` (unpublish) when a version was published prematurely or needs rework. Draft versions do not affect latest resolution or derived server status.
 
 `deprecated` can return to `active` (re-activate) to handle cases where a deprecation was premature or a planned replacement is not yet ready. `deleted` is terminal.
 
 #### Server-level status (derived)
 
-`MCPServer.status` is read-only, derived from the latest version's `status`. This avoids maintaining two independent lifecycles and aligns with upstream, which only has version-level status. The server's status gives a quick summary for UI filtering without requiring clients to inspect individual versions.
+`MCPServer.status` is read-only, derived from the resolved latest version's `status`. This avoids maintaining two independent lifecycles and aligns with upstream, which only has version-level status. The server's status gives a quick summary for UI filtering without requiring clients to inspect individual versions.
 
 ### Database schema
 
@@ -500,8 +501,7 @@ Six tables, created via a single Alembic migration. All tables are workspace-sco
 | `name` | `String(256)` | PK |
 | `display_name` | `String(256)` | mutable human-readable label |
 | `description` | `String(5000)` | |
-| `latest_version_alias` | `String(256)` | optional alias name to resolve as "latest" |
-| `last_registered_version` | `String(256)` | most recently created version string |
+| `latest_version` | `String(256)` | optional explicit version string to resolve as `latest` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -631,7 +631,7 @@ class MCPServerRegistryMixin:
         name: str,
         description: str | None = None,
         display_name: str | None = None,
-        latest_version_alias: str | None = None,
+        latest_version: str | None = None,
     ) -> MCPServer:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -746,7 +746,7 @@ class MCPServerRegistryMixin:
 
 **Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
-**Latest version**: `get_latest_mcp_server_version` checks `MCPServer.latest_version_alias` first — if set, it resolves that alias to a version. If unset, it falls back to the version with the most recent `creation_timestamp`. This lets users explicitly control what "latest" means (e.g., pointing it at the latest *active* version) while preserving a sensible default.
+**Latest version**: `get_latest_mcp_server_version` first checks `MCPServer.latest_version`. If that field is set, it resolves directly to that version. Otherwise, it returns the most recently created non-`draft` version. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`.
 
 ### REST API
 
@@ -779,7 +779,7 @@ All paths below are relative to the router prefix `/ajax-api/3.0/mlflow/mcp-serv
 | `POST` | `/{name}/versions/{version}/tags` | Set a version-level tag |
 | `DELETE` | `/{name}/versions/{version}/tags/{key}` | Delete a version-level tag |
 | `POST` | `/{name}/aliases` | Set an alias |
-| `GET` | `/{name}/aliases/{alias}` | Resolve alias to version |
+| `GET` | `/{name}/aliases/{alias}` | Resolve alias to version; reserved `latest` resolves through latest-version logic |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
 
 Resource identifiers (`name`, `version`, `alias`, `binding_id`, `key`) are path parameters, not query parameters. This makes URLs self-describing and enables standard HTTP caching.
@@ -802,7 +802,7 @@ class CreateMCPServerRequest(BaseModel):
 class UpdateMCPServerRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
-    latest_version_alias: str | None = None
+    latest_version: str | None = None
 
 
 class CreateMCPServerVersionRequest(BaseModel):
@@ -845,10 +845,9 @@ class MCPServerResponse(BaseModel):
     name: str
     display_name: str | None = None
     description: str | None = None
-    status: str | None = None  # derived from latest version's status
+    status: str | None = None  # derived from the resolved latest version's status
     access_bindings: list[MCPAccessBindingSummaryResponse] = Field(default_factory=list)
-    latest_version_alias: str | None = None
-    last_registered_version: str | None = None
+    latest_version: str | None = None
     aliases: list[AliasResponse] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
@@ -972,7 +971,7 @@ def update_mcp_server(
     name: str,
     display_name: str | None = None,
     description: str | None = None,
-    latest_version_alias: str | None = None,
+    latest_version: str | None = None,
 ) -> MCPServer: ...
 
 def delete_mcp_server(*, name: str) -> None: ...
