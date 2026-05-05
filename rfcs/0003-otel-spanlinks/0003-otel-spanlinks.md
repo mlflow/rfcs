@@ -3,18 +3,6 @@ mlflow_issue:  [21025](https://github.com/mlflow/mlflow/issues/21025)
 rfc_pr:        # leave this empty
 author(s): Khaled Sulayman (ksulayma@redhat.com)
 
-# Amendments
-
-The following amendments reflect design pivots adopted during implementation (PR [#22797](https://github.com/mlflow/mlflow/pull/22797)).
-
-## 1. No dedicated `links` DB column
-
-The RFC proposed a nullable `links` JSON column on the `spans` table with an Alembic migration. Since links are already persisted in the `content` JSON blob via `Span.to_dict()` and there is no current need for efficient links querying, the dedicated column was dropped — no migration needed. A dedicated column can be added later when a concrete query consumer exists (e.g. reverse-link lookups).
-
-## 2. Link entity simplified
-
-The RFC showed `Link` with a `_context: SpanContext` field cached in `__post_init__`. This was removed — `Link` is now a plain dataclass (`trace_id`, `span_id`, `attributes`) with no OTel dependency. OTel context is constructed on-the-fly at call sites (e.g. `add_link()`, provider layer) rather than cached on the entity.
-
 # Summary
 
 [Span Links](https://opentelemetry.io/docs/specs/otel/trace/api/#link) are an official OpenTelemetry API primitive that allow for linking spans together that may not have a direct parent-child relationship and come from separate traces.
@@ -83,7 +71,7 @@ In addition to the gaps described above, the motivation follows by way of Links 
 
 ### Requirements
 - Span Links are preserved during OTLP ingestion
-- New 'Links' column in Span table
+- Span Links persisted via the existing `content` JSON blob in the spans table
 - Span Links can be created via MLFlow Python API
 - Span Links added to Span serialization format without breaking backward compatibility
 - Span Links displayed among span metadata MLFlow's UI
@@ -128,24 +116,8 @@ class Link:
     span_id: str
     attributes: Optional[dict[str, Any]] = None
 
-    # Internal: cached OTel SpanContext (built in __post_init__)
-    _context: SpanContext = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        """Build and cache the OTel SpanContext once at creation time."""
-        ...
-        # Build context once and cache it
-        self._context = build_otel_context(
-            otel_trace_id,
-            otel_span_id,
-        )
-
-    def to_otel_link(self):
-        """Convert to OpenTelemetry Link object using cached context."""
-        ...
-
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dictionary (for database storage)."""
+        """Serialize to dictionary."""
         return {
             "trace_id": self.trace_id,
             "span_id": self.span_id,
@@ -154,7 +126,7 @@ class Link:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Link":
-        """Deserialize from dictionary (rebuilds _context in __post_init__)."""
+        """Deserialize from dictionary."""
         return cls(
             trace_id=data["trace_id"],
             span_id=data["span_id"],
@@ -162,7 +134,7 @@ class Link:
         )
 ```
 
-This allows for correlating trace and span IDs to correctly identify spans (and construct them internally to the class with SpanContexts) without bubbling up OTel logic to the user or requiring them to import OTel types.
+`Link` is a plain dataclass with no OTel dependency. OTel context is constructed on-the-fly at call sites (e.g. `add_link()`, provider layer) rather than cached on the entity. This keeps the entity simple while still allowing correlation of trace and span IDs without bubbling up OTel logic to the user.
 
 The User-facing API should allow for the adding of links during span instantiation:
 
@@ -205,18 +177,14 @@ for link in span_a_links:
 
 Additionally would need changes to `from_otel_proto` and `to_otel_proto` to ensure links *aren't* silently dropped and *are* properly exported, respectively, when interfacing with OTLP.
 
-### Database Schema & Migration
+### Storage
 
-A nullable `links` column of type `JSON` will be added to the `spans` table. Going off of the intersection between the OTel standard and what is currently implemented in MLFlow, each link object will be comprised of:
-- `trace_id` - an entity of `SpanContext`
-- `span_id` - an entity of `SpanContext`
-- `attributes`
+Links are persisted in the existing `content` JSON blob via `Span.to_dict()` / `Span.from_dict()` — no dedicated column or Alembic migration is needed. Each link object in the serialized `"links"` array contains:
+- `trace_id` — the MLflow trace ID of the linked span
+- `span_id` — the span ID within that trace
+- `attributes` — optional key-value pairs describing the link relationship
 
-Each of these will be serialized and deserialized according to the conventions currently existing in `Span.to/from_dict()`
-
-For migration, an Alembic migration script will be contributed to add the column to the DB.
-
-Backwards compatibility is achieved by virtue of the fact that the column is nullable.
+Backwards compatibility is achieved because `from_dict()` defaults to an empty list when the `"links"` key is absent. A dedicated column can be added later if a concrete query consumer exists (e.g. reverse-link lookups).
 
 ### UI Additions
 
@@ -239,10 +207,9 @@ Additionally, add a component to `ModelTraceExplorerDefaultSpanView.tsx` that di
 
 ## Drawbacks
 
-- Database migration required, which must then be tested across all DB providers
 - Added serialization complexity
 - Added UI complexity
-- Increased testing surface area (serialization/deserialization, database persistence, OTLP compatibility, UI rendering, backward compatibility scenarios)
+- Increased testing surface area (serialization/deserialization, OTLP compatibility, UI rendering, backward compatibility scenarios)
 
 # Alternatives
 
@@ -252,7 +219,7 @@ Given that this feature implements an existing OTel primitive, it naturally foll
 
 This is an additive change and usage is purely opt-in (user explicitly specifies links during span instantiation or calls `span.add_link()`), so a successful implementation will be non-breaking. However, due to the size of this change, it may be worth considering splitting up work across sequential PRs. Tentatively, I would suggest:
 
-1. Python API, database migration, and storage layer and relevant testing
+1. Python API and storage layer and relevant testing
     - Can also be broken down to first introduce "preferred" entrypoints and follow with support for the rest
 2. UI components and TypeScript types
 3. Documentation and examples
