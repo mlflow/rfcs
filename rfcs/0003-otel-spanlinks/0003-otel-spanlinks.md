@@ -71,7 +71,7 @@ In addition to the gaps described above, the motivation follows by way of Links 
 
 ### Requirements
 - Span Links are preserved during OTLP ingestion
-- New 'Links' column in Span table
+- Span Links persisted via the existing `content` JSON blob in the spans table
 - Span Links can be created via MLFlow Python API
 - Span Links added to Span serialization format without breaking backward compatibility
 - Span Links displayed among span metadata MLFlow's UI
@@ -116,24 +116,8 @@ class Link:
     span_id: str
     attributes: Optional[dict[str, Any]] = None
 
-    # Internal: cached OTel SpanContext (built in __post_init__)
-    _context: SpanContext = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        """Build and cache the OTel SpanContext once at creation time."""
-        ...
-        # Build context once and cache it
-        self._context = build_otel_context(
-            otel_trace_id,
-            otel_span_id,
-        )
-
-    def to_otel_link(self):
-        """Convert to OpenTelemetry Link object using cached context."""
-        ...
-
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dictionary (for database storage)."""
+        """Serialize to dictionary."""
         return {
             "trace_id": self.trace_id,
             "span_id": self.span_id,
@@ -142,7 +126,7 @@ class Link:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Link":
-        """Deserialize from dictionary (rebuilds _context in __post_init__)."""
+        """Deserialize from dictionary."""
         return cls(
             trace_id=data["trace_id"],
             span_id=data["span_id"],
@@ -150,7 +134,7 @@ class Link:
         )
 ```
 
-This allows for correlating trace and span IDs to correctly identify spans (and construct them internally to the class with SpanContexts) without bubbling up OTel logic to the user or requiring them to import OTel types.
+`Link` is a plain dataclass with no OTel dependency. OTel context is constructed on-the-fly at call sites (e.g. `add_link()`, provider layer) rather than cached on the entity. This keeps the entity simple while still allowing correlation of trace and span IDs without bubbling up OTel logic to the user.
 
 The User-facing API should allow for the adding of links during span instantiation:
 
@@ -193,18 +177,14 @@ for link in span_a_links:
 
 Additionally would need changes to `from_otel_proto` and `to_otel_proto` to ensure links *aren't* silently dropped and *are* properly exported, respectively, when interfacing with OTLP.
 
-### Database Schema & Migration
+### Storage
 
-A nullable `links` column of type `JSON` will be added to the `spans` table. Going off of the intersection between the OTel standard and what is currently implemented in MLFlow, each link object will be comprised of:
-- `trace_id` - an entity of `SpanContext`
-- `span_id` - an entity of `SpanContext`
-- `attributes`
+Links are persisted in the existing `content` JSON blob via `Span.to_dict()` / `Span.from_dict()` — no dedicated column or Alembic migration is needed. Each link object in the serialized `"links"` array contains:
+- `trace_id` — the MLflow trace ID of the linked span
+- `span_id` — the span ID within that trace
+- `attributes` — optional key-value pairs describing the link relationship
 
-Each of these will be serialized and deserialized according to the conventions currently existing in `Span.to/from_dict()`
-
-For migration, an Alembic migration script will be contributed to add the column to the DB.
-
-Backwards compatibility is achieved by virtue of the fact that the column is nullable.
+Backwards compatibility is achieved because `from_dict()` defaults to an empty list when the `"links"` key is absent. A dedicated column can be added later if a concrete query consumer exists (e.g. reverse-link lookups).
 
 ### UI Additions
 
@@ -227,10 +207,9 @@ Additionally, add a component to `ModelTraceExplorerDefaultSpanView.tsx` that di
 
 ## Drawbacks
 
-- Database migration required, which must then be tested across all DB providers
 - Added serialization complexity
 - Added UI complexity
-- Increased testing surface area (serialization/deserialization, database persistence, OTLP compatibility, UI rendering, backward compatibility scenarios)
+- Increased testing surface area (serialization/deserialization, OTLP compatibility, UI rendering, backward compatibility scenarios)
 
 # Alternatives
 
@@ -240,7 +219,7 @@ Given that this feature implements an existing OTel primitive, it naturally foll
 
 This is an additive change and usage is purely opt-in (user explicitly specifies links during span instantiation or calls `span.add_link()`), so a successful implementation will be non-breaking. However, due to the size of this change, it may be worth considering splitting up work across sequential PRs. Tentatively, I would suggest:
 
-1. Python API, database migration, and storage layer and relevant testing
+1. Python API and storage layer and relevant testing
     - Can also be broken down to first introduce "preferred" entrypoints and follow with support for the rest
 2. UI components and TypeScript types
 3. Documentation and examples
@@ -248,6 +227,7 @@ This is an additive change and usage is purely opt-in (user explicitly specifies
 # Open questions
 
 1. Q: If Span A links to Span B via some expected span_id, should we validate whether Span B exists at the time of linking? For example, it might be the case that an application expects a Span to link to some other Span that is still yet to be initiated. Additionally, users might want to link Spans across experiments (it is also an open question as to whether we want to allow this behavior)
+    - A: No existence validation. Links are stored as-is — cross-experiment, circular, and self-links are all allowed.
 
 2. Q: Should SpanLinks be bidirectional? E.g., if Span A links to Span B, should Span B be made to link to Span A? In Otel, these are unidirectional, but there might be a discussion to be had around at least enabling bidirectional span linking based on the type of workflows we expect to find this useful. If yes, it would necessitate validating that spans exist at link-time as discussed in item 1.
     - A: Proceed with unidirectional for now, as per OTel spec.
