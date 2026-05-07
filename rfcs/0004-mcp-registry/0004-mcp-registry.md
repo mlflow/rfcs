@@ -177,10 +177,9 @@ Journey 1 and the additional Phase 1 flows below are fully in scope for Phase 1.
 2. A new MCP server entry appears in the registry listing with its version history and metadata, even before it has any approved access path.
 3. The admin optionally sets aliases such as `dev`, `staging`, and `production`, and records approved direct-access bindings for any remote endpoints that users are allowed to call directly.
 4. The workspace can also show a separate access-binding listing that surfaces the approved direct endpoints currently available in that workspace.
-5. The admin grants appropriate permissions through MLflow's permission model.
-6. End users can browse either the registry listing to see all governed MCP servers, or the access-binding listing to see the approved direct endpoints currently surfaced in the workspace. From the registry listing, they can inspect the canonical `server_json` definition for local/package-based consumption. From the access-binding listing, they can select a direct endpoint and follow it back to the governed server, version, or alias it resolves to.
-7. When a new version is available, the admin registers the new `server.json`, optionally updates aliases or direct access bindings to point at it, and can optionally deprecate the older version without deleting history.
-8. When MLflow-aware tracing is enabled and the MCP server or runtime participates in that tracing flow, traces can be associated with the governed MCP server version for debugging, rollback and fix analysis, and lightweight auditing.
+5. End users can browse either the registry listing to see all governed MCP servers, or the access-binding listing to see the approved direct endpoints currently surfaced in the workspace. From the registry listing, they can inspect the canonical `server_json` definition for local/package-based consumption. From the access-binding listing, they can select a direct endpoint and follow it back to the governed server, version, or alias it resolves to.
+6. When a new version is available, the admin registers the new `server.json`, optionally updates aliases or direct access bindings to point at it, and can optionally deprecate the older version without deleting history.
+7. When MLflow-aware tracing is enabled and the MCP server or runtime participates in that tracing flow, traces can be associated with the governed MCP server version for debugging, rollback and fix analysis, and lightweight auditing.
 
 #### Additional Phase 1 flows
 
@@ -202,10 +201,9 @@ Journey 1 and the additional Phase 1 flows below are fully in scope for Phase 1.
 2. As a future integration, the admin uses a `Deploy` action or API to publish that governed server through MLflow MCP Gateway.
 3. That deploy flow creates or updates a gateway-owned runtime record (for example, an `MCPGatewayBinding`) that targets the chosen governed version or alias, while keeping the registry as the system of record for identity and lifecycle.
 4. Once gateway access is active, the same governed MCP server can be surfaced through availability-oriented discovery without introducing a separate gateway catalog. The gateway contributes another access path, but discovery still points back to the same governed server identity in the registry.
-5. The admin grants appropriate permissions through MLflow's permission model.
-6. End users discover the server through the same registry listing and any derived availability filtering, then connect through MLflow MCP Gateway using MLflow-managed access. The gateway resolves the request to the governed MCP server version or alias recorded in the registry.
-7. For version updates, if the gateway-owned deployment record targets an alias, the admin can move that alias so gateway traffic follows the governed pointer without updating the gateway record or forcing every client to adopt a new raw version string.
-8. Older versions can be deprecated in the registry by the admin, and future gateway/runtime behavior can surface that deprecation signal to users consistently.
+5. End users discover the server through the same registry listing and any derived availability filtering, then connect through MLflow MCP Gateway using MLflow-managed access. The gateway resolves the request to the governed MCP server version or alias recorded in the registry.
+6. For version updates, if the gateway-owned deployment record targets an alias, the admin can move that alias so gateway traffic follows the governed pointer without updating the gateway record or forcing every client to adopt a new raw version string.
+7. Older versions can be deprecated in the registry by the admin, and future gateway/runtime behavior can surface that deprecation signal to users consistently.
 
 ### Out of scope
 
@@ -358,10 +356,9 @@ Retaining older versions enables:
 A direct access binding is the separate record that says a governed MCP server version or alias can be reached through an approved non-gateway endpoint. An `MCPServerVersion` is the governed metadata record for a server definition; by itself, it does not mean there is an approved direct endpoint available in the workspace. `MCPAccessBinding` is what makes that governed server show up in direct-access discovery. The registry is intentionally runtime-agnostic: MLflow-aware clients or runtimes may resolve a registered MCP server through MLflow and then either use the canonical `server_json` payload directly (for example, for local `packages[]` consumption) or follow an approved direct access binding. When the canonical server definition changes, publishers register a new version. When only direct connectivity changes, operators create or update access bindings without creating a new version.
 
 ```python
-class MCPTransportType(StrEnum):
+class MCPRemoteTransportType(StrEnum):
     STREAMABLE_HTTP = "streamable-http"
     SSE = "sse"
-    STDIO = "stdio"  # included for completeness; access bindings typically use streamable-http or sse
 
 
 @dataclass
@@ -369,7 +366,7 @@ class MCPAccessBinding:
     binding_id: int  # stable MLflow-managed binding identifier
     name: str  # parent MCPServer name
     endpoint_url: str  # required approved direct endpoint
-    transport_type: MCPTransportType = MCPTransportType.STREAMABLE_HTTP
+    transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP
     version: str | None = None  # exactly one of version / alias must be set
     alias: str | None = None
     workspace: str | None = None
@@ -377,14 +374,6 @@ class MCPAccessBinding:
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
     last_updated_timestamp: int | None = None
-```
-
-```python
-# Future example, intentionally out of scope for this RFC:
-@dataclass
-class MCPGatewayBinding(MCPAccessBinding):
-    # gateway-specific fields intentionally omitted
-    pass
 ```
 
 **Binding target**: An access binding points to either a concrete `version` or an `alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string.
@@ -395,24 +384,23 @@ class MCPGatewayBinding(MCPAccessBinding):
 
 **Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted.
 
-**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed deployment entity (for example, `MCPGatewayBinding`) that resolves against the same governed `name` + `version` or alias model in the registry. The conceptual subclass example above is illustrative only: it shows that the gateway would reuse the same parent/target resolution pattern while adding gateway-specific fields and lifecycle that remain intentionally out of scope for this RFC. This RFC only defines direct access bindings.
+**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed `name` + `version` or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
 
 #### Future gateway path (informative)
 
 The intended future evolution path is:
 
 1. The registry remains the source of truth for governed server identity and resolution through `MCPServer`, `MCPServerVersion`, and `MCPServerAlias`. In Phase 1, it also owns the direct-access `MCPAccessBinding` records.
-2. A future MLflow MCP Gateway introduces a gateway-owned deployment entity such as `MCPGatewayBinding` that points to the same governed server and resolves through either a concrete `version` or an `alias`.
+2. A future MLflow MCP Gateway introduces a gateway-owned entity that points to the same governed server and resolves through either a concrete `version` or an `alias`.
 3. Discovery remains unified: the registry listing continues to show governed MCP servers, while availability-oriented discovery can surface either direct-access bindings or future gateway-managed access paths without creating a second MCP catalog.
 4. Version rollouts continue to use governed aliases. If a gateway-owned deployment record targets an alias, moving that alias updates the resolved governed version without requiring the gateway deployment record itself to change.
-5. Trace linking continues to resolve through governed identity: gateway request -> gateway-managed binding -> governed alias or version -> `{workspace, name, version}`.
+5. Trace linking continues to resolve through governed identity: gateway request -> gateway-managed entity -> governed alias or version -> `{workspace, name, version}`.
 
 ```mermaid
 erDiagram
     MCPServer ||--o{ MCPServerVersion : "has versions"
     MCPServer ||--o{ MCPServerAlias : "has aliases"
     MCPServer ||--o{ MCPAccessBinding : "direct access"
-    MCPServer ||--o{ MCPGatewayBinding : "future gateway access"
 ```
 
 #### server_json and the upstream MCP specification
@@ -741,7 +729,7 @@ class MCPServerRegistryMixin:
         self,
         name: str,
         endpoint_url: str,
-        transport_type: MCPTransportType = MCPTransportType.STREAMABLE_HTTP,
+        transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP,
         version: str | None = None,
         alias: str | None = None,
     ) -> MCPAccessBinding:
@@ -767,7 +755,7 @@ class MCPServerRegistryMixin:
         version: str | None = None,
         alias: str | None = None,
         endpoint_url: str | None = None,
-        transport_type: MCPTransportType | None = None,
+        transport_type: MCPRemoteTransportType | None = None,
     ) -> MCPAccessBinding:
         raise NotImplementedError(self.__class__.__name__)
 
