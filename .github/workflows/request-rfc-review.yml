@@ -1,0 +1,88 @@
+name: Request RFC review
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+    paths:
+      - "rfcs/**"
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  request-review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect new RFC and request reviews
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const author = context.payload.pull_request.user.login.toLowerCase();
+
+            const maintainers = [
+              "dbczumar",
+              "daniellok-db",
+              "harupy",
+              "kriscon-db",
+              "mprahl",
+              "PattaraS",
+              "serena-ruan",
+              "TomeHirata",
+              "B-Step62",
+            ];
+
+            // List files in the PR (paginate to be safe).
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            // A new RFC adds a markdown file under a new rfcs/<slug>/ directory,
+            // e.g. rfcs/0004-skill-registry/0004-skill-registry.md.
+            const rfcRegex = /^rfcs\/[^/]+\/[^/]+\.md$/;
+            const newRfcFiles = files.filter(
+              (f) => f.status === "added" && rfcRegex.test(f.filename)
+            );
+            if (newRfcFiles.length === 0) {
+              core.info("No new RFC markdown file added; skipping review request.");
+              return;
+            }
+
+            // Avoid posting twice if the workflow re-runs (e.g. opened -> ready_for_review).
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const marker = "<!-- rfc-review-request -->";
+            if (comments.some((c) => c.body && c.body.includes(marker))) {
+              core.info("RFC review-request comment already posted; skipping.");
+              return;
+            }
+
+            const reviewers = maintainers.filter(
+              (m) => m.toLowerCase() !== author
+            );
+            const mentionList = reviewers.map((m) => `@${m}`).join(" ");
+
+            const body = [
+              marker,
+              `Thanks for opening a new RFC! ${mentionList} — please take a look when you have a chance and leave your feedback.`,
+              "",
+              "Reviewers: see the [RFC process](../blob/main/README.md) for guidance on what to look for.",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body,
+            });
+            core.info(`Requested review from ${reviewers.length} maintainer(s).`);
