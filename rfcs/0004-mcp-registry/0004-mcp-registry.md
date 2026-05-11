@@ -127,8 +127,8 @@ version = mlflow.genai.get_mcp_server_version_by_alias(
 ```python
 # Record an approved direct access path for the production alias.
 binding = mlflow.genai.create_mcp_access_binding(
-    name="io.github.anthropic/brave-search",
-    alias="production",
+    server_name="io.github.anthropic/brave-search",
+    server_alias="production",
     endpoint_url="https://mcp.acme.internal/brave-search",
     transport_type="streamable-http",
 )
@@ -364,11 +364,11 @@ class MCPRemoteTransportType(StrEnum):
 @dataclass
 class MCPAccessBinding:
     binding_id: int  # stable MLflow-managed binding identifier
-    name: str  # parent MCPServer name
+    server_name: str  # MCPServer name
     endpoint_url: str  # required approved direct endpoint
     transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP
-    version: str | None = None  # exactly one of version / alias must be set
-    alias: str | None = None
+    server_version: str | None = None  # exactly one of server_version / server_alias must be set
+    server_alias: str | None = None
     workspace: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -376,7 +376,7 @@ class MCPAccessBinding:
     last_updated_timestamp: int | None = None
 ```
 
-**Binding target**: An access binding points to either a concrete `version` or an `alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string.
+**Binding target**: An access binding points to either a concrete `server_version` or a `server_alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string.
 
 **Connection details**: `endpoint_url` and `transport_type` together describe how a client connects to the approved endpoint. These are properties of the binding itself, not of the governed server version it points to — an enterprise may deploy the same governed server behind a different transport than the publisher declared in `server_json.remotes[]`. For example, a publisher may declare SSE endpoints in their upstream metadata while the enterprise deploys the same server internally behind a streamable-http reverse proxy.
 
@@ -384,7 +384,7 @@ class MCPAccessBinding:
 
 **Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted.
 
-**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed `name` + `version` or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
+**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed server name + version or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
 
 #### Future gateway path (informative)
 
@@ -602,9 +602,9 @@ This matches MLflow's registered model alias pattern: aliases are stored in a pa
 |--------|------|-------|
 | `workspace` | `String(63)` | PK component |
 | `binding_id` | `BigInteger` | PK, auto-incrementing binding ID |
-| `name` | `String(256)` | FK → mcp_servers |
-| `version` | `String(256)` | nullable; exactly one of `version` / `alias` must be set |
-| `alias` | `String(256)` | nullable |
+| `server_name` | `String(256)` | FK → mcp_servers |
+| `server_version` | `String(256)` | nullable; exactly one of `server_version` / `server_alias` must be set |
+| `server_alias` | `String(256)` | nullable |
 | `endpoint_url` | `String(2048)` | direct endpoint URL |
 | `transport_type` | `String(32)` | default `'streamable-http'` |
 | `created_by` | `String(256)` | |
@@ -612,21 +612,21 @@ This matches MLflow's registered model alias pattern: aliases are stored in a pa
 | `creation_timestamp` | `BigInteger` | millis since epoch |
 | `last_updated_timestamp` | `BigInteger` | millis since epoch |
 
-FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
+FK: `(workspace, server_name)` → `mcp_servers`, CASCADE delete.
 
-**Validation**: Application-level validation enforces that exactly one of `version` / `alias` is set. For `version` bindings, the version must exist on the parent server. For `alias` bindings, the alias must exist on the parent server. `endpoint_url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side binding/deployment entity against the same governed server identities.
+**Validation**: Application-level validation enforces that exactly one of `server_version` / `server_alias` is set. For version bindings, the version must exist on the parent server. For alias bindings, the alias must exist on the parent server. `endpoint_url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side binding/deployment entity against the same governed server identities.
 
 **Indexes**:
 
-- `ix_mcp_access_bindings_name` on `(workspace, name)`
-- `ix_mcp_access_bindings_version` on `(workspace, name, version)`
-- `ix_mcp_access_bindings_alias` on `(workspace, name, alias)`
+- `ix_mcp_access_bindings_server_name` on `(workspace, server_name)`
+- `ix_mcp_access_bindings_version` on `(workspace, server_name, server_version)`
+- `ix_mcp_access_bindings_alias` on `(workspace, server_name, server_alias)`
 
 **JSON columns**: `server_json` uses SQLAlchemy's `JSON` type (with `mssql.JSON` for SQL Server), following the pattern established by MLflow's evaluation dataset records and span dimension attributes. This maps to native `JSON` on PostgreSQL and MySQL (with database-level validation on write), and to `NVARCHAR(MAX)` / `TEXT` on MSSQL and SQLite.
 
 **Workspace handling**: All tables are workspace-scoped. Server-scoped tables use `(workspace, name)` as their leading identity components, while access binding tables use `(workspace, binding_id)`. Single-tenant deployments use the `'default'` workspace.
 
-**Binding IDs**: `binding_id` is an integer-style MLflow-managed identifier, similar in spirit to experiment IDs. It gives access bindings a stable, concise resource key without overloading mutable fields such as `version`, `alias`, or `endpoint_url` as part of the binding's identity. The nested API paths retain `name` for parent-resource scoping, authorization, and URL consistency even though `binding_id` is the stable binding identifier. Because binding IDs are scoped to a workspace rather than allocated globally across all workspaces, `(workspace, binding_id)` remains the natural primary and foreign-key identity.
+**Binding IDs**: `binding_id` is an integer-style MLflow-managed identifier, similar in spirit to experiment IDs. It gives access bindings a stable, concise resource key without overloading mutable fields such as `server_version`, `server_alias`, or `endpoint_url` as part of the binding's identity. The nested API paths retain `{name}` for parent-resource scoping, authorization, and URL consistency even though `binding_id` is the stable binding identifier. Because binding IDs are scoped to a workspace rather than allocated globally across all workspaces, `(workspace, binding_id)` remains the natural primary and foreign-key identity.
 
 **Timestamps**: Set at the application layer via `get_current_time_millis()`, not via DDL defaults.
 
@@ -727,20 +727,20 @@ class MCPServerRegistryMixin:
 
     def create_mcp_access_binding(
         self,
-        name: str,
+        server_name: str,
         endpoint_url: str,
         transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP,
-        version: str | None = None,
-        alias: str | None = None,
+        server_version: str | None = None,
+        server_alias: str | None = None,
     ) -> MCPAccessBinding:
         raise NotImplementedError(self.__class__.__name__)
 
-    def get_mcp_access_binding(self, name: str, binding_id: int) -> MCPAccessBinding:
+    def get_mcp_access_binding(self, server_name: str, binding_id: int) -> MCPAccessBinding:
         raise NotImplementedError(self.__class__.__name__)
 
     def search_mcp_access_bindings(
         self,
-        name: str | None = None,
+        server_name: str | None = None,
         filter_string: str | None = None,
         max_results: int = 100,
         order_by: list[str] | None = None,
@@ -750,16 +750,16 @@ class MCPServerRegistryMixin:
 
     def update_mcp_access_binding(
         self,
-        name: str,
+        server_name: str,
         binding_id: int,
-        version: str | None = None,
-        alias: str | None = None,
+        server_version: str | None = None,
+        server_alias: str | None = None,
         endpoint_url: str | None = None,
         transport_type: MCPRemoteTransportType | None = None,
     ) -> MCPAccessBinding:
         raise NotImplementedError(self.__class__.__name__)
 
-    def delete_mcp_access_binding(self, name: str, binding_id: int) -> None:
+    def delete_mcp_access_binding(self, server_name: str, binding_id: int) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
     # --- Tag operations (key/value style, not tag-object style) ---
@@ -878,15 +878,15 @@ class UpdateMCPServerVersionRequest(BaseModel):
 
 
 class CreateMCPAccessBindingRequest(BaseModel):
-    version: str | None = None
-    alias: str | None = None
+    server_version: str | None = None
+    server_alias: str | None = None
     endpoint_url: str
     transport_type: str = "streamable-http"
 
 
 class UpdateMCPAccessBindingRequest(BaseModel):
-    version: str | None = None
-    alias: str | None = None
+    server_version: str | None = None
+    server_alias: str | None = None
     endpoint_url: str | None = None
     transport_type: str | None = None
 
@@ -900,8 +900,8 @@ class MCPAccessBindingSummaryResponse(BaseModel):
     binding_id: int
     endpoint_url: str
     transport_type: str = "streamable-http"
-    version: str | None = None
-    alias: str | None = None
+    server_version: str | None = None
+    server_alias: str | None = None
 
 
 class MCPServerResponse(BaseModel):
@@ -938,12 +938,12 @@ class MCPServerVersionResponse(BaseModel):
 
 class MCPAccessBindingResponse(BaseModel):
     binding_id: int
-    name: str
+    server_name: str
     endpoint_url: str
     transport_type: str = "streamable-http"
     tools: list[MCPToolPayload] | None = None  # read-only; projected from resolved version
-    version: str | None = None
-    alias: str | None = None
+    server_version: str | None = None
+    server_alias: str | None = None
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
@@ -991,7 +991,7 @@ The `filter_string` parameter supports expressions following existing MLflow fil
 - `tools.name = 'web_search'` (version-level; return versions that declare a tool with the given name)
 - `tags.team = 'platform'`
 
-`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(name=...)` narrows that same API to a specific governed server. The `has_access_bindings = true` filter is available for callers that only want directly usable MCP servers.
+`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = true` filter is available for callers that only want directly usable MCP servers.
 
 ### Python SDK
 
@@ -1086,18 +1086,18 @@ def delete_mcp_server_version(*, name: str, version: str) -> None: ...
 
 def create_mcp_access_binding(
     *,
-    name: str,
+    server_name: str,
     endpoint_url: str,
     transport_type: str = "streamable-http",
-    version: str | None = None,
-    alias: str | None = None,
+    server_version: str | None = None,
+    server_alias: str | None = None,
 ) -> MCPAccessBinding: ...
 
-def get_mcp_access_binding(*, name: str, binding_id: int) -> MCPAccessBinding: ...
+def get_mcp_access_binding(*, server_name: str, binding_id: int) -> MCPAccessBinding: ...
 
 def search_mcp_access_bindings(
     *,
-    name: str | None = None,
+    server_name: str | None = None,
     filter_string: str | None = None,
     max_results: int = 100,
     order_by: list[str] | None = None,
@@ -1106,15 +1106,15 @@ def search_mcp_access_bindings(
 
 def update_mcp_access_binding(
     *,
-    name: str,
+    server_name: str,
     binding_id: int,
     endpoint_url: str | None = None,
     transport_type: str | None = None,
-    version: str | None = None,
-    alias: str | None = None,
+    server_version: str | None = None,
+    server_alias: str | None = None,
 ) -> MCPAccessBinding: ...
 
-def delete_mcp_access_binding(*, name: str, binding_id: int) -> None: ...
+def delete_mcp_access_binding(*, server_name: str, binding_id: int) -> None: ...
 
 def set_mcp_server_tag(*, name: str, key: str, value: str) -> None: ...
 
