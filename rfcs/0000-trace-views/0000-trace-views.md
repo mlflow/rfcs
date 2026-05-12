@@ -15,10 +15,10 @@ MLflow traces capture everything an agent did: LLM calls, tool invocations, retr
 
 Today, teams work around this with bespoke pipelines:
 
-- **Exporting traces to spreadsheets.** BioNTech exports to Excel for clinicians who "aren't comfortable in the Databricks UI"; T-Mobile chose Google Sheets over all Databricks annotation tooling.
-- **Building custom annotation UIs.** Zillow built Streamlit tools because the MLflow UI was "insufficient for their product managers and designers." Ecolab is building their own annotation app.
-- **Picking up competing tools.** Grammarly's evals team chose Braintrust because "Braintrust makes it easier for nontechnical folks to provide feedback." Skyscanner was flagged a churn risk for "evaluating an alternative solution that has better UI support."
-- **Giving SMEs raw traces and hoping.** At Rockwell, trace parsing displayed wrong Q&A pairs and "confused every participant." At easyJet, SME fatigue caused participants to drop off before completing annotation.
+- **Exporting traces to spreadsheets.** Teams export to Excel for clinicians who aren't comfortable in the MLflow UI.
+- **Building custom annotation UIs.** Teams build Streamlit tools because they deem the MLflow UI insufficient for their product managers and designers. Some build their own annotation app.
+- **Picking up competing tools.** Anecdotally tools like Braintrust make it easier for nontechnical folks to provide feedback.
+- **Giving SMEs raw traces and hoping.** Raw traces can cause more annotator fatigue.
 
 Every workaround is bespoke, breaks when the agent changes, and ships nothing reusable. Trace views give the trace UI a first-class way to focus on what matters for a given task — annotation, debugging, judging — without altering the trace itself, and a way to share that focus with others.
 
@@ -41,21 +41,21 @@ Four journeys ground the design. Each describes a user, the pain they hit today,
 
 ![View active with range summary](images/03-view-active-range-summary.png)
 
-She reads top to bottom and labels each range. Clicking a range card opens a **range detail** view that shows the full inputs and outputs of the matched span(s), in case she needs more context.
-
-![Range detail](images/edit-mode-detail.png)
-
-If the view ever feels too aggressive, "Raw trace" is one click away in the selector. The full trace data is never hidden, only filtered through the view.
+She reads top to bottom and labels each range. Clicking a range card opens a **range detail** view that shows the full inputs and outputs of the matched span(s), in case she needs more context. The summary can link to both the labeled version of the trace detail, as well as to specific spans as "deeplinks. 
 
 This is the highest-stakes user surface. Every customer pain quoted in *Motivation* maps to this CUJ: nontechnical users opening complex traces, getting overwhelmed, and producing bad labels (or leaving the platform).
 
-## CUJ 2: Developer preparing traces for an SME labeling session
+![Range detail](images/edit-mode-detail.png)
+
+## CUJ 2: Developer preparing traces for SME review
 
 **Who:** A developer setting up a labeling session for a batch of traces from a new agent build.
 
-**Today:** She runs the session with raw traces. SMEs ask her in Slack what to focus on. She writes a doc; SMEs ignore it. She gives up and labels them herself, or the session ships poor labels and eval datasets degrade. (First American's JBW workshop was delayed for exactly this reason — 8 agents, 50+ tools, traces too dense for SMEs to navigate.)
+**Today:** She runs the session with raw traces. SMEs ask her in Slack what to focus on. She writes a doc; SMEs ignore it. She gives up and labels them herself, or the session ships poor labels and eval datasets degrade.
 
-**With trace views:** She runs the built-in trace-view skill — `trace.summarize()` followed by `summary.create_view()` — over the batch. An LLM analyzes each trace, identifies the agent's milestones (e.g., "Plan → Search → Synthesize"), and persists a `TraceView` with one `SpanRange` per milestone. She opens one of the traces in the UI to review the AI's output. It's close, but she wants to rename "Step 2: Search" to "Knowledge lookup," add a second span the AI missed to the planning range, and pick a different JSONPath for the synthesis output.
+**With trace views:** She runs the built-in trace-view skill — `trace.summarize()` followed by `summary.create_view()` — over the batch. An LLM analyzes each trace, identifies the agent's milestones (e.g., "Plan → Search → Synthesize"), and persists a `TraceView` with one `SpanRange` per milestone. An alternative approach would be to expose skills only and let users drive them with their own agent or the assistant. MLflow doesn't have an OOB agent harness yet so this is likely to be less complex than exposing a summarize method on the trace itself. In testing I found that a single prompt could produce decent milestones for traces from various agents.
+
+She opens one of the traces in the UI to review the AI's output. It's close, but she wants to rename "Step 2: Search" to "Knowledge lookup," add a second span the AI missed to the planning range, and pick a different JSONPath for the synthesis output.
 
 ![Edit mode with drag-to-select](images/06-drag-to-select.gif)
 
@@ -65,9 +65,9 @@ She clicks **Edit**, drag-selects the missing span to add it to the planning ran
 
 ![Output path selection](images/07-output-path-selection.gif)
 
-If the structure generalizes across the batch, she promotes the view to an **experiment-scoped template**. Every trace in the experiment now renders this view automatically, with no per-trace setup. SMEs see consistent range cards instead of raw spans.
+It's possible that the traces will have a consistent structure which generalizes across all traces in the experiment. In which case it should be easy to apply to all traces.
 
-This is the developer-as-curator CUJ. It anchors the **"AI creates, developer edits"** creation model: AI does the first pass, the developer corrects rather than authoring from blank. The customer evidence here is First American (workshop blocked by trace complexity) and Grammarly (80-100 turn chats "extremely hard to evaluate").
+This is the developer-as-curator CUJ. It anchors the **"AI creates, developer edits"** creation model: AI does the first pass, the developer corrects rather than authoring from blank.
 
 ## CUJ 3: Developer debugging an agent failure
 
@@ -83,20 +83,17 @@ This is the **direct-UI-creation** CUJ. No AI, no Python, no JSON editing. Drag,
 
 ## CUJ 4: Judge author scoring against a view
 
-**Who:** An evals author building a judge that should only score one phase of agent behavior — for example, "did the planning step decompose the task correctly?"
+**Who:** An evals author building a judge that should only score one phase of agent behavior — for example, "did the planning step decompose the task correctly?" Alternatively when writing an evaluation of the agent's trajectory an example grading criteria would be: "did the trajectory follow or deviate from the initial plan?". 
 
 **Today:** She copies trace JSON into the judge prompt template. The prompt blows past the context budget, or it includes irrelevant tool-call noise that confuses the judge. Either way the judge is brittle: when the agent's span structure changes, the manual extraction breaks.
 
 **With trace views:** She defines an experiment-scoped template that selects only the planning spans, with a JSONPath that extracts the relevant fields. Her judge references the view in the `{{trajectory}}` placeholder. At judge time, MLflow renders the view's extracted ranges instead of the raw trace — scoped automatically and consistently across traces.
 
 ```python
-@judge(name="planning_quality")
-def planning_quality(trace):
-    view = next(v for v in trace.views if v.name == "planning-phase")
-    return llm_score(
-        prompt="Did the agent decompose the task correctly?",
-        context=view.render(),
-    )
+make_judge("""
+   evaluate the provided trajectory to see if the agent verifies it's work:
+   {{ trajectory }}
+""")
 ```
 
 This CUJ is API-shaped — no dedicated UI surface — but it justifies the view abstraction as a primitive beyond the trace explorer. The same view that helps an SME label also helps a judge score.
