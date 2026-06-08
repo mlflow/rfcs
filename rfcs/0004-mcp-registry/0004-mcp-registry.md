@@ -831,8 +831,8 @@ class MCPServerRegistryMixin:
         raise NotImplementedError(self.__class__.__name__)
 ```
 
-For nullable update fields, omitting a parameter leaves the stored value unchanged, while
-passing `None` explicitly sets the field to `null`.
+For update fields, omitting a parameter leaves the stored value unchanged, while passing
+`None` to a nullable field explicitly sets the field to `null`.
 
 **User-facing vs. store layer**: Following the general shape of MLflow model registry, the Python SDK exposes explicit create/get/search/update/delete operations for the core entities. On top of that, it also provides `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as convenience helpers for the common "ingest a canonical `server.json` and create or update the parent server as needed" workflow. Internally, these helpers call the same underlying `create_mcp_server()` / `create_mcp_server_version()` flow. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
 
@@ -890,6 +890,13 @@ Request models contain only the mutable fields — resource identifiers come fro
 from pydantic import BaseModel, Field
 
 
+class MCPIconPayload(BaseModel):
+    src: str
+    sizes: list[str] | None = None
+    mimeType: str | None = None
+    theme: str | None = None
+
+
 class MCPToolPayload(BaseModel):
     name: str
     title: str | None = None
@@ -897,20 +904,20 @@ class MCPToolPayload(BaseModel):
     inputSchema: dict | None = None
     outputSchema: dict | None = None
     annotations: dict | None = None
-    icons: list[dict] | None = None
+    icons: list[MCPIconPayload] | None = None
     execution: dict | None = None
 
 
 class CreateMCPServerRequest(BaseModel):
     name: str
     description: str | None = None
-    icons: list[dict] | None = None
+    icons: list[MCPIconPayload] | None = None
 
 
 class UpdateMCPServerRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
-    icons: list[dict] | None = None
+    icons: list[MCPIconPayload] | None = None
 
 
 class CreateMCPServerVersionRequest(BaseModel):
@@ -960,7 +967,7 @@ class MCPServerResponse(BaseModel):
     name: str
     display_name: str | None = None
     description: str | None = None
-    icons: list[dict] | None = None
+    icons: list[MCPIconPayload] | None = None
     status: str | None = None  # derived from the parent-resolved version's status
     access_bindings: list[MCPAccessBindingSummaryResponse] = Field(default_factory=list)
     latest_version: str | None = None  # read-only; highest semantic version among active versions
@@ -1081,7 +1088,7 @@ def create_mcp_server(
     *,
     name: str,
     description: str | None = None,
-    icons: list[dict] | None = None,
+    icons: list[MCPIcon] | None = None,
 ) -> MCPServer: ...
 
 def get_mcp_server(*, name: str) -> MCPServer: ...
@@ -1099,7 +1106,7 @@ def update_mcp_server(
     name: str,
     display_name: str | None = None,
     description: str | None = None,
-    icons: list[dict] | None = None,
+    icons: list[MCPIcon] | None = None,
 ) -> MCPServer: ...
 
 def delete_mcp_server(*, name: str) -> None: ...
@@ -1208,7 +1215,9 @@ The `server_json` field in `CreateMCPServerVersionRequest` uses a typed Pydantic
 - `title`, `description` (string)
 - `packages[]` — entries typed with required fields (`registryType`, `identifier`, `transport`)
 - `remotes[]` — entries typed with required fields (`type`, `url`)
-- `repository`, `websiteUrl` (string)
+- `repository` — typed object with required `url` and `source`, plus optional `id` and
+  `subfolder`
+- `websiteUrl` (string)
 - `_meta` (dict)
 
 **Forward compatibility:** Unknown fields at any level are accepted and preserved (`extra="allow"`). The registry does not reject payloads containing fields not yet defined in the upstream spec.
