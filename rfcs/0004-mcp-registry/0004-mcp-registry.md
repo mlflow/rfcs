@@ -266,7 +266,18 @@ The logical governed asset, scoped to a workspace.
 ```python
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypedDict
+
+from typing_extensions import NotRequired
+
+
+class MCPIcon(TypedDict):
+    """Icon following the upstream MCP server.json icon schema."""
+
+    src: str
+    sizes: NotRequired[list[str]]
+    mimeType: NotRequired[str]
+    theme: NotRequired[str]
 
 
 @dataclass
@@ -274,7 +285,7 @@ class MCPServer:
     name: str  # extracted from server_json; reverse-DNS format (e.g., "io.github.user/server"); PK within workspace
     display_name: str | None = None  # mutable human-readable label; falls back to server_json["title"], then name
     description: str | None = None  # mutable; API falls back to server_json["description"] from the parent-resolved version
-    icons: list[dict[str, Any]] | None = None  # mutable; sized icon variants following the upstream server.json icon schema (src, sizes, mimeType, theme)
+    icons: list[MCPIcon] | None = None  # mutable; sized icon variants following the upstream server.json icon schema
     workspace: str | None = None  # resolved via resolve_entity_workspace_name()
     status: MCPStatus | None = None  # read-only; derived from the parent-resolved version's status
     tags: dict[str, str] = field(default_factory=dict)
@@ -308,7 +319,7 @@ class MCPTool:
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
     annotations: dict[str, Any] | None = None
-    icons: list[dict[str, Any]] | None = None
+    icons: list[MCPIcon] | None = None
     execution: dict[str, Any] | None = None
 
 
