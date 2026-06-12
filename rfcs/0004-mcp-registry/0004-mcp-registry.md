@@ -306,7 +306,7 @@ class MCPServer:
 
 **Audit field population**: `created_by` and `last_updated_by` are populated from the authenticated MLflow user when authentication is enabled. In unauthenticated installs, these fields remain empty.
 
-**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. MLflow then uses one shared latest-resolution rule across `MCPServer.latest_version`, the reserved `latest` alias, `server_alias="latest"` binding resolution, and server-level derived metadata. Resolution prefers the highest semantic version among `active` versions if one exists; otherwise it falls back to the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in semantic-version ordering, while build metadata does not affect precedence. If no non-`deleted` version exists, the server has no resolved latest version.
+**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. MLflow then uses one shared latest-resolution rule across `MCPServer.latest_version`, the reserved `latest` alias, `server_alias="latest"` binding resolution, and server-level derived metadata. Resolution prefers the highest semantic version among `active` versions if one exists; otherwise it falls back to the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in semantic-version ordering. If no non-`deleted` version exists, the server has no resolved latest version.
 
 #### MCPServerVersion
 
@@ -572,6 +572,7 @@ Six tables, created via a single Alembic migration. All tables are workspace-sco
 | `version_major` | `Integer` | extracted from validated semantic version |
 | `version_minor` | `Integer` | extracted from validated semantic version |
 | `version_patch` | `Integer` | extracted from validated semantic version |
+| `version_prerelease_sort_key` | `String(512)` | encoded prerelease sort key derived from the validated semantic version |
 | `server_json` | `JSON` | immutable canonical MCP payload |
 | `display_name` | `String(256)` | mutable human-readable label |
 | `status` | `String(20)` | default `'draft'` |
@@ -584,9 +585,9 @@ Six tables, created via a single Alembic migration. All tables are workspace-sco
 
 FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
 
-**Semantic version ordering**: `version_major`, `version_minor`, and `version_patch` are materialized from the validated semantic version string at write time. `get_latest_mcp_server_version` filters to `active` rows, orders them by these numeric fields in descending order, and then applies full semantic-version precedence in application code when multiple candidates share the same `major.minor.patch` and differ by prerelease identifiers. Build metadata remains part of the stored canonical version string but is ignored for precedence.
+**Semantic version ordering**: `version_major`, `version_minor`, `version_patch`, and `version_prerelease_sort_key` are materialized from the validated semantic version string at write time. `version_prerelease_sort_key` encodes SemVer prerelease precedence into a lexicographically sortable value so the database can order prerelease versions correctly. Latest resolution then orders by `(version_major, version_minor, version_patch, version_prerelease_sort_key)` descending and uses the stored canonical `version` string as a final deterministic tie-break when semantic precedence is otherwise equal.
 
-**Index**: `ix_mcp_server_versions_latest_lookup` on `(workspace, name, status, version_major, version_minor, version_patch)` supports latest-resolution lookups.
+**Index**: `idx_mcp_server_versions_latest` on `(workspace, name, status, version_major, version_minor, version_patch, version_prerelease_sort_key, version)` supports latest-resolution lookups.
 
 #### `mcp_server_tags` — server-level key-value metadata
 
@@ -849,11 +850,11 @@ For update fields, omitting a parameter leaves the stored value unchanged, while
 
 **User-facing vs. store layer**: Following the general shape of MLflow model registry, the Python SDK exposes explicit create/get/search/update/delete operations for the core entities. On top of that, it also provides `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as convenience helpers for the common "ingest a canonical `server.json` and create or update the parent server as needed" workflow. Internally, these helpers call the same underlying `create_mcp_server()` / `create_mcp_server_version()` flow. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
 
-**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, or if `version` is not a valid semantic version, creation fails with a validation error. On success, the store also materializes `version_major`, `version_minor`, and `version_patch` from the parsed version. New versions default to `draft` status.
+**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, or if `version` is not a valid semantic version, creation fails with a validation error. On success, the store also materializes `version_major`, `version_minor`, `version_patch`, and `version_prerelease_sort_key` from the parsed version. New versions default to `draft` status.
 
 **Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
-**Latest version**: `get_latest_mcp_server_version` returns the same shared latest pointer described above: the highest semantic version among `active` versions if one exists, otherwise the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in precedence and build metadata do not affect precedence. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same rule is reused when an `MCPAccessBinding` targets `server_alias="latest"`.
+**Latest version**: `get_latest_mcp_server_version` returns the same shared latest pointer described above: the highest semantic version among `active` versions if one exists, otherwise the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in semantic precedence, and the stored canonical `version` string is used only as a final deterministic tie-break when semantic precedence is otherwise equal. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same rule is reused when an `MCPAccessBinding` targets `server_alias="latest"`.
 
 **Parent-derived status resolution**: `MCPServer.status` follows the parent-resolution rule defined above: prefer the highest semantic-version `active` version if one exists; otherwise fall back to the highest semantic-version non-`deleted` non-`active` version.
 
@@ -1243,7 +1244,7 @@ The `server_json` field in `CreateMCPServerVersionRequest` uses a typed Pydantic
 
 **Forward compatibility:** Unknown fields at any level are accepted and preserved (`extra="allow"`). The registry does not reject payloads containing fields not yet defined in the upstream spec.
 
-**Semantic-version policy:** The upstream schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow adopts the same field but enforces that guidance as a validation rule. Semantic-version precedence drives `latest` resolution for `active` versions: prerelease identifiers affect ordering, while build metadata does not.
+**Semantic-version policy:** The upstream schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow adopts the same field but enforces that guidance as a validation rule. Semantic-version precedence drives latest resolution, including prerelease ordering. MLflow persists an encoded prerelease sort key so that ordering can happen directly in SQL, and then uses the full stored `version` string as a final deterministic tie-break when semantic precedence is otherwise equal.
 
 **Tools validation:** The `tools` field on `MCPServerVersion` uses a typed `MCPTool` frozen dataclass at the entity and store layers, and a corresponding `MCPToolPayload` Pydantic model at the API layer. Both types model the fields defined in the [MCP Tool schema](https://modelcontextprotocol.io/specification/2025-11-25/server/tools). Only known fields are accepted. The DB stores tools as a JSON column.
 
