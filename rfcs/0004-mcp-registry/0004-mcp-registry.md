@@ -394,13 +394,13 @@ class MCPAccessBinding:
     last_updated_timestamp: int | None = None
 ```
 
-**Binding target**: An access binding points to either a concrete `server_version` or a `server_alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string.
+**Binding target**: An access binding points to either a concrete `server_version` or a `server_alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string. In addition to user-defined aliases, bindings may also target the reserved system alias `latest`. Unlike stored aliases, `latest` is not persisted in `mcp_server_aliases`; it is resolved dynamically using the same latest-version rule as `get_mcp_server_version_by_alias(..., alias="latest")`.
 
 **Connection details**: `endpoint_url` and `transport_type` together describe how a client connects to the approved endpoint. These are properties of the binding itself, not of the governed server version it points to — an enterprise may deploy the same governed server behind a different transport than the publisher declared in `server_json.remotes[]`. For example, a publisher may declare SSE endpoints in their upstream metadata while the enterprise deploys the same server internally behind a streamable-http reverse proxy.
 
 **Why a separate entity**: Direct connectivity changes independently from the canonical MCP definition. Modeling approved direct access as a separate binding avoids mutating version records when an endpoint moves, when an alias changes, or when multiple approved direct entrypoints exist for the same governed server. It is valid for multiple versions of the same `MCPServer` to be available at once, for example to support both `v1` and `v2` clients during a migration, and the model does not prevent multiple approved direct endpoints from targeting the same governed version when needed. Binding detail and binding summary responses include a `resolved_version` field for convenience; when the binding target can be resolved, it contains the fully resolved governed version, and otherwise it is `null`.
 
-**Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted.
+**Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted. Bindings that follow the reserved `latest` pointer are also only valid while `latest` resolves. If a server no longer has any `active` version, `latest`-targeted bindings become stale and should not be surfaced; store implementations may proactively clean them up when the last active candidate leaves latest resolution.
 
 **Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed server name + version or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
 
@@ -853,7 +853,7 @@ For update fields, omitting a parameter leaves the stored value unchanged, while
 
 **Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
-**Latest version**: `get_latest_mcp_server_version` returns the highest semantic version among `active` versions for the named server. Store implementations use the persisted `version_major`, `version_minor`, and `version_patch` fields to order candidate rows, then apply full semantic-version precedence in application code when prerelease identifiers must be compared. If no `active` version exists, the server has no resolved latest version. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`.
+**Latest version**: `get_latest_mcp_server_version` returns the highest semantic version among `active` versions for the named server. Store implementations use the persisted `version_major`, `version_minor`, and `version_patch` fields to order candidate rows, then apply full semantic-version precedence in application code when prerelease identifiers must be compared. If no `active` version exists, the server has no resolved latest version. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same latest-resolution rule is also reused when an `MCPAccessBinding` targets `server_alias="latest"`.
 
 **Parent-derived status resolution**: Parent-level `status` uses a separate resolution rule from `latest_version`. `MCPServer.status` resolves from the highest semantic version among `active` versions if one exists; otherwise it resolves from the highest semantic version among non-`deleted` non-`active` versions. UI-only fallback for `display_name`, `description`, and `icons` may use that same parent-resolved version, but the API still returns the stored nullable `MCPServer` fields as-is.
 
@@ -894,6 +894,8 @@ All paths below are relative to the router prefix `/ajax-api/3.0/mlflow/mcp-serv
 Resource identifiers (`name`, `version`, `alias`, `binding_id`, `key`) are path parameters, not query parameters. This makes URLs self-describing and enables standard HTTP caching.
 
 Because the router exposes both a static workspace-level `GET /bindings` route and a parameterized `GET /{name}/...` namespace, the static `/bindings` route must be registered before the `/{name}` routes so the literal string `bindings` is not interpreted as a server name.
+
+Latest resolution is expressed through the alias route, not through a special `/versions/latest` endpoint. Callers that want the system-defined latest pointer should use `GET /{name}/aliases/latest` or create/update bindings with `server_alias="latest"`.
 
 #### Request and response models
 
@@ -1041,6 +1043,8 @@ Binding detail and binding summary responses may include `resolved_version`
 for convenience so callers do not need a second lookup to understand
 alias-backed bindings.
 
+For bindings that target `server_alias="latest"`, `resolved_version` reflects the currently resolved latest active version rather than a stored alias row.
+
 #### Pagination
 
 Search endpoints use page-token-based pagination following existing MLflow conventions:
@@ -1070,7 +1074,7 @@ The `filter_string` parameter supports expressions following existing MLflow fil
 - `transport_type = 'streamable-http'` (binding-level; filter access bindings by transport type)
 - `tags.team = 'platform'`
 
-`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = 'true'` filter is available for callers that only want directly usable MCP servers.
+`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = 'true'` filter is available for callers that only want directly usable MCP servers. Search and get APIs only surface bindings whose targets can currently be resolved, so stale `latest` bindings do not continue to appear as usable direct endpoints after latest resolution disappears.
 
 ### Python SDK
 
