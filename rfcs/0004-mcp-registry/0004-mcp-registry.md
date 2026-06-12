@@ -7,7 +7,7 @@
 
 | Author(s)              | [Jon Burdo](https://github.com/jonburdo), [Dan Kuc](https://github.com/dkuc), [Matthew Prahl](https://github.com/mprahl) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-06-04 |
+| **Date Last Modified** | 2026-06-12 |
 | **AI Assistant(s)**    | Claude Code, GPT 5.4 |
 
 **Table of contents**
@@ -283,9 +283,9 @@ class MCPIcon(TypedDict):
 @dataclass
 class MCPServer:
     name: str  # extracted from server_json; reverse-DNS format (e.g., "io.github.user/server"); PK within workspace
-    display_name: str | None = None  # mutable human-readable label; falls back to server_json["title"], then name
-    description: str | None = None  # mutable; API falls back to server_json["description"] from the parent-resolved version
-    icons: list[MCPIcon] | None = None  # mutable; sized icon variants following the upstream server.json icon schema
+    display_name: str | None = None  # mutable user-defined label; API returns null when unset
+    description: str | None = None  # mutable user-defined description; API returns null when unset
+    icons: list[MCPIcon] | None = None  # mutable user-defined icons; API returns null when unset
     workspace: str | None = None  # resolved via resolve_entity_workspace_name()
     status: MCPStatus | None = None  # read-only; derived from the parent-resolved version's status
     tags: dict[str, str] = field(default_factory=dict)
@@ -298,13 +298,15 @@ class MCPServer:
     last_updated_timestamp: int | None = None
 ```
 
-**Name identity**: `name` is extracted from `server_json["name"]` and follows the upstream spec's reverse-DNS format (e.g., `io.github.user/brave-search`). This format prevents name collisions by construction — the namespace portion identifies the publisher. The `name` is immutable and serves as the primary key within a workspace. For display purposes, `display_name` is a mutable user-supplied label on `MCPServer`. The API resolves display names as: `display_name` (if set) → `server_json["title"]` (if present) → `name`.
+**Name identity**: `name` is extracted from `server_json["name"]` and follows the upstream spec's reverse-DNS format (e.g., `io.github.user/brave-search`). This format prevents name collisions by construction — the namespace portion identifies the publisher. The `name` is immutable and serves as the primary key within a workspace.
 
-**Description resolution**: `MCPServer.description` is a mutable MLflow-managed field. The API resolves descriptions as: `MCPServer.description` (if set) → `server_json["description"]` from the parent-resolved version (if present) → empty. The parent-resolved version is the highest semantic version among `active` versions if one exists; otherwise it is the highest semantic version among non-`deleted` non-`active` versions. `MCPServer.status` is derived from that same parent-resolved version, while `latest_version` remains `active`-only.
+**User-defined presentation metadata**: `display_name`, `description`, and `icons` are mutable MLflow-managed fields stored directly on `MCPServer`. The API returns these fields exactly as stored; if the user has not set them, the response value is `null`.
+
+**UI fallback behavior**: The UI may apply presentation-only fallback when those fields are unset. For `display_name`, the UI may fall back to `server_json["title"]` from the parent-resolved version, then to `name`. For `description` and `icons`, the UI may fall back to the corresponding fields from the parent-resolved version's `server_json`. The parent-resolved version is the highest semantic version among `active` versions if one exists; otherwise it is the highest semantic version among non-`deleted` non-`active` versions. This fallback is a UI concern only and is not applied in the API or store layer.
 
 **Audit field population**: `created_by` and `last_updated_by` are populated from the authenticated MLflow user when authentication is enabled. In unauthenticated installs, these fields remain empty.
 
-**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. `latest` then resolves to the highest semantic version among `active` versions for that server. Prerelease identifiers participate in semantic-version ordering, while build metadata does not affect `latest` resolution. If no `active` version exists, the server has no resolved latest version. Parent-derived metadata uses a separate fallback rule: `status` and fallback `description` resolve from the highest semantic version among `active` versions if present, otherwise from the highest semantic version among non-`deleted` non-`active` versions.
+**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. `latest` then resolves to the highest semantic version among `active` versions for that server. Prerelease identifiers participate in semantic-version ordering, while build metadata does not affect `latest` resolution. If no `active` version exists, the server has no resolved latest version.
 
 #### MCPServerVersion
 
@@ -853,7 +855,7 @@ For update fields, omitting a parameter leaves the stored value unchanged, while
 
 **Latest version**: `get_latest_mcp_server_version` returns the highest semantic version among `active` versions for the named server. Store implementations use the persisted `version_major`, `version_minor`, and `version_patch` fields to order candidate rows, then apply full semantic-version precedence in application code when prerelease identifiers must be compared. If no `active` version exists, the server has no resolved latest version. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`.
 
-**Parent-derived metadata resolution**: Parent-level derived fields use a separate resolution rule from `latest_version`. `MCPServer.status` and fallback `MCPServer.description` resolve from the highest semantic version among `active` versions if one exists; otherwise they resolve from the highest semantic version among non-`deleted` non-`active` versions.
+**Parent-derived status resolution**: Parent-level `status` uses a separate resolution rule from `latest_version`. `MCPServer.status` resolves from the highest semantic version among `active` versions if one exists; otherwise it resolves from the highest semantic version among non-`deleted` non-`active` versions. UI-only fallback for `display_name`, `description`, and `icons` may use that same parent-resolved version, but the API still returns the stored nullable `MCPServer` fields as-is.
 
 ### REST API
 
@@ -1032,6 +1034,8 @@ class SetTagRequest(BaseModel):
 ```
 
 `MCPServer.aliases` is modeled as a `dict[str, str]` in the entity layer for convenience, while REST responses expose aliases as `list[AliasResponse]` to keep the payload shape explicit and consistent with other response models.
+
+`MCPServerResponse.display_name`, `description`, and `icons` are returned exactly as stored on `MCPServer`. If the user has not set them, the API returns `null`. Any fallback to fields in `server_json` is presentation-only behavior applied by the UI, not by the API.
 
 Binding detail and binding summary responses may include `resolved_version`
 for convenience so callers do not need a second lookup to understand
@@ -1247,7 +1251,7 @@ The MCP Servers page lives under the GenAI workflow in the MLflow sidebar, along
 
 ![MCP Servers list view](mcp-servers-list-view.png)
 
-The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest active version (if any), derived status, source, and tags. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access bindings.
+The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest active version (if any), derived status, source, and tags. When `display_name`, `description`, or `icons` are unset on `MCPServer`, the UI may fall back to the corresponding `server_json` fields from the parent-resolved version for presentation. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access bindings.
 
 The access-binding listing lives in the same page and presents one row or card per approved direct endpoint. Each entry shows the endpoint URL, the governed MCP server it belongs to, and the target version or alias it resolves through. From this listing, users can navigate back to the governed server detail page to inspect the full `server_json`, tags, aliases, and version history behind that endpoint. This view is intended to answer "what direct MCP endpoints are available in this workspace right now?" without creating a second catalog separate from the governed registry.
 
@@ -1255,7 +1259,7 @@ A "Create MCP Server" button initiates registration. A grid/list toggle allows s
 
 ![MCP Servers detail view](mcp-servers-details-view.png)
 
-The detail view shows the server's metadata, versions list, aliases, direct access bindings, and tags. Individual version pages display the `server_json` payload, aliases, status, and any access bindings targeting that version or one of its aliases. Access binding detail views show the target (`version` or `alias`) and approved endpoint information, and the access-binding listing links back to the governed server records they expose.
+The detail view shows the server's metadata, versions list, aliases, direct access bindings, and tags. When `display_name`, `description`, or `icons` are unset on `MCPServer`, the UI may fall back to the corresponding fields from the parent-resolved version's `server_json`; for `display_name`, the UI may then fall back again to `name`. Individual version pages display the `server_json` payload, aliases, status, and any access bindings targeting that version or one of its aliases. Access binding detail views show the target (`version` or `alias`) and approved endpoint information, and the access-binding listing links back to the governed server records they expose.
 
 **Tools display**: The version detail page displays the declared tools for that version — tool name, description, and input schema. This helps platform engineers and end users understand what capabilities a governed server version provides.
 
