@@ -222,7 +222,7 @@ This design aligns with the [upstream MCP registry specification](https://regist
 - The concept of server versions with status lifecycle
 
 **What we adapt to MLflow conventions:**
-- **API prefix**: MLflow-native REST API (`/ajax-api/3.0/mlflow/mcp-servers`) rather than the upstream `/v0.1/servers` prefix, because MLflow APIs integrate with MLflow's authentication, workspace, and permission infrastructure
+- **API prefix**: MLflow-native REST API prefixes rather than the upstream `/v0.1/servers` prefix. See [REST API](#rest-api) for the supported `/api`, `/ajax-api`, and static-prefix variants
 - **URL structure**: RESTful nested paths (matching both upstream MCP and newer MLflow AI asset registry APIs) rather than the older flat action-suffix paths used in the model registry
 - **Latest resolution**: upstream reserves `GET /servers/{name}/versions/latest` as a special selector. The MLflow-native API instead resolves latest via `GET /{name}/aliases/latest` so `GET /{name}/versions/{version}` remains a literal version lookup, including the edge case of a publisher-supplied version string `"latest"`
 - **Pagination**: Page-token-based (MLflow convention) rather than cursor-based (upstream convention)
@@ -853,17 +853,17 @@ For update fields, omitting a parameter leaves the stored value unchanged, while
 
 **Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
-**Latest version**: `get_latest_mcp_server_version` returns the highest semantic version among `active` versions for the named server. Store implementations use the persisted `version_major`, `version_minor`, and `version_patch` fields to order candidate rows, then apply full semantic-version precedence in application code when prerelease identifiers must be compared. If no `active` version exists, the server has no resolved latest version. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same latest-resolution rule is also reused when an `MCPAccessBinding` targets `server_alias="latest"`.
+**Latest version**: `get_latest_mcp_server_version` returns the same semantic-version latest pointer described above: the highest semantic version among `active` versions, with prerelease identifiers participating in precedence and build metadata ignored. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same rule is reused when an `MCPAccessBinding` targets `server_alias="latest"`.
 
-**Parent-derived status resolution**: Parent-level `status` uses a separate resolution rule from `latest_version`. `MCPServer.status` resolves from the highest semantic version among `active` versions if one exists; otherwise it resolves from the highest semantic version among non-`deleted` non-`active` versions. UI-only fallback for `display_name`, `description`, and `icons` may use that same parent-resolved version, but the API still returns the stored nullable `MCPServer` fields as-is.
+**Parent-derived status resolution**: `MCPServer.status` follows the parent-resolution rule defined above: prefer the highest semantic-version `active` version if one exists; otherwise fall back to the highest semantic-version non-`deleted` non-`active` version.
 
 ### REST API
 
-The REST API is implemented as a FastAPI router mounted at `/ajax-api/3.0/mlflow/mcp-servers`, using RESTful nested resource paths. This follows the same approach used in newer MLflow AI asset registry APIs rather than the older flat action-suffix style used in the model registry. The collection root is intentionally slashless: `GET /ajax-api/3.0/mlflow/mcp-servers` and `POST /ajax-api/3.0/mlflow/mcp-servers`.
+The REST API is implemented as a FastAPI router using RESTful nested resource paths. It is exposed under both `/api/3.0/mlflow/mcp-servers` and `/ajax-api/3.0/mlflow/mcp-servers`, plus the corresponding static-prefix variants used by MLflow deployments (for example `/mlflow/api/...`). The collection root is intentionally slashless in all variants.
 
 #### Endpoints
 
-All paths below are relative to the router prefix `/ajax-api/3.0/mlflow/mcp-servers`.
+All paths below are relative to the logical MCP router prefix.
 
 | Method | Path | Description |
 |---|---|---|
@@ -1050,7 +1050,7 @@ For bindings that target `server_alias="latest"`, `resolved_version` reflects th
 Search endpoints use page-token-based pagination following existing MLflow conventions:
 
 ```
-GET /ajax-api/3.0/mlflow/mcp-servers?filter_string=status%20%3D%20%27active%27&max_results=10
+GET /mcp-servers?filter_string=status%20%3D%20%27active%27&max_results=10
 ```
 
 Response:
@@ -1255,7 +1255,7 @@ The MCP Servers page lives under the GenAI workflow in the MLflow sidebar, along
 
 ![MCP Servers list view](mcp-servers-list-view.png)
 
-The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest active version (if any), derived status, source, and tags. When `display_name`, `description`, or `icons` are unset on `MCPServer`, the UI may fall back to the corresponding `server_json` fields from the parent-resolved version for presentation. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access bindings.
+The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest active version (if any), derived status, source, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the presentation-only fallback described above. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access bindings.
 
 The access-binding listing lives in the same page and presents one row or card per approved direct endpoint. Each entry shows the endpoint URL, the governed MCP server it belongs to, and the target version or alias it resolves through. From this listing, users can navigate back to the governed server detail page to inspect the full `server_json`, tags, aliases, and version history behind that endpoint. This view is intended to answer "what direct MCP endpoints are available in this workspace right now?" without creating a second catalog separate from the governed registry.
 
@@ -1263,7 +1263,7 @@ A "Create MCP Server" button initiates registration. A grid/list toggle allows s
 
 ![MCP Servers detail view](mcp-servers-details-view.png)
 
-The detail view shows the server's metadata, versions list, aliases, direct access bindings, and tags. When `display_name`, `description`, or `icons` are unset on `MCPServer`, the UI may fall back to the corresponding fields from the parent-resolved version's `server_json`; for `display_name`, the UI may then fall back again to `name`. Individual version pages display the `server_json` payload, aliases, status, and any access bindings targeting that version or one of its aliases. Access binding detail views show the target (`version` or `alias`) and approved endpoint information, and the access-binding listing links back to the governed server records they expose.
+The detail view shows the server's metadata, versions list, aliases, direct access bindings, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the same presentation-only fallback described above. Individual version pages display the `server_json` payload, aliases, status, and any access bindings targeting that version or one of its aliases. Access binding detail views show the target (`version` or `alias`) and approved endpoint information, and the access-binding listing links back to the governed server records they expose.
 
 **Tools display**: The version detail page displays the declared tools for that version — tool name, description, and input schema. This helps platform engineers and end users understand what capabilities a governed server version provides.
 
