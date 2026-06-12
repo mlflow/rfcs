@@ -53,6 +53,8 @@ MLflow stores the publisher-declared semantic version from `server_json["version
 ```python
 import mlflow
 
+NOT_SET = object()
+
 # Register an MCP server from a server.json payload.
 # name and version are extracted from server_json.
 # The parent MCPServer is auto-created if it doesn't exist.
@@ -400,7 +402,7 @@ class MCPAccessBinding:
 
 **Why a separate entity**: Direct connectivity changes independently from the canonical MCP definition. Modeling approved direct access as a separate binding avoids mutating version records when an endpoint moves, when an alias changes, or when multiple approved direct entrypoints exist for the same governed server. It is valid for multiple versions of the same `MCPServer` to be available at once, for example to support both `v1` and `v2` clients during a migration, and the model does not prevent multiple approved direct endpoints from targeting the same governed version when needed. Binding detail and binding summary responses include a `resolved_version` field for convenience; when the binding target can be resolved, it contains the fully resolved governed version, and otherwise it is `null`.
 
-**Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted. Bindings that follow the reserved `latest` pointer are also only valid while `latest` resolves. If a server no longer has any `active` version, `latest`-targeted bindings become stale and should not be surfaced; store implementations may proactively clean them up when the last active candidate leaves latest resolution.
+**Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted. Bindings that follow the reserved `latest` pointer are also only valid while `latest` resolves. If a server no longer has any `active` version, `latest`-targeted bindings become invalid and should be eagerly deleted rather than left behind as hidden unresolved rows. This keeps get/search behavior simple: normal APIs only return resolvable bindings.
 
 **Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed server name + version or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
 
@@ -638,7 +640,7 @@ This matches MLflow's registered model alias pattern: aliases are stored in a pa
 
 FK: `(workspace, server_name)` → `mcp_servers`, CASCADE delete.
 
-**Validation**: Application-level validation enforces that exactly one of `server_version` / `server_alias` is set. For version bindings, the version must exist on the parent server. For alias bindings, the alias must exist on the parent server. `endpoint_url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side binding/deployment entity against the same governed server identities.
+**Validation**: Application-level validation enforces that exactly one of `server_version` / `server_alias` is set. For version bindings, the version must exist on the parent server. For alias bindings, `server_alias` must either be a stored alias on the parent server or the reserved system alias `latest`. Creating or updating a binding with `server_alias="latest"` is only valid when `latest` currently resolves to an `active` version; otherwise the request fails. `endpoint_url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side binding/deployment entity against the same governed server identities.
 
 **Indexes**:
 
@@ -1074,7 +1076,7 @@ The `filter_string` parameter supports expressions following existing MLflow fil
 - `transport_type = 'streamable-http'` (binding-level; filter access bindings by transport type)
 - `tags.team = 'platform'`
 
-`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = 'true'` filter is available for callers that only want directly usable MCP servers. Search and get APIs only surface bindings whose targets can currently be resolved, so stale `latest` bindings do not continue to appear as usable direct endpoints after latest resolution disappears.
+`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = 'true'` filter is available for callers that only want directly usable MCP servers. Search and get APIs only surface bindings whose targets can currently be resolved. In particular, bindings that previously targeted `server_alias="latest"` should have been deleted once latest stopped resolving rather than remaining retrievable in an unresolved state.
 
 ### Python SDK
 
@@ -1123,9 +1125,9 @@ def search_mcp_servers(
 def update_mcp_server(
     *,
     name: str,
-    display_name: str | None = None,
-    description: str | None = None,
-    icons: list[MCPIcon] | None = None,
+    display_name: str | None = NOT_SET,
+    description: str | None = NOT_SET,
+    icons: list[MCPIcon] | None = NOT_SET,
 ) -> MCPServer: ...
 
 def delete_mcp_server(*, name: str) -> None: ...
@@ -1159,9 +1161,9 @@ def update_mcp_server_version(
     *,
     name: str,
     version: str,
-    display_name: str | None = None,
-    status: str | None = None,
-    tools: list[MCPTool] | None = None,
+    display_name: str | None = NOT_SET,
+    status: str | None = NOT_SET,
+    tools: list[MCPTool] | None = NOT_SET,
 ) -> MCPServerVersion: ...
 
 def delete_mcp_server_version(*, name: str, version: str) -> None: ...
@@ -1192,10 +1194,10 @@ def update_mcp_access_binding(
     *,
     server_name: str,
     binding_id: int,
-    endpoint_url: str | None = None,
-    transport_type: str | None = None,
-    server_version: str | None = None,
-    server_alias: str | None = None,
+    endpoint_url: str | None = NOT_SET,
+    transport_type: str | None = NOT_SET,
+    server_version: str | None = NOT_SET,
+    server_alias: str | None = NOT_SET,
 ) -> MCPAccessBinding: ...
 
 def delete_mcp_access_binding(*, server_name: str, binding_id: int) -> None: ...
@@ -1221,6 +1223,8 @@ version = mlflow.genai.register_mcp_server_from_url(
 servers = mlflow.genai.search_mcp_servers(filter_string="has_access_bindings = 'true'")
 bindings = mlflow.genai.search_mcp_access_bindings()
 ```
+
+For SDK update methods, `NOT_SET` means "leave unchanged" while `None` means "clear this nullable field". This mirrors the store-layer update contract so callers can distinguish partial updates from explicit nulling.
 
 ### server_json validation
 
