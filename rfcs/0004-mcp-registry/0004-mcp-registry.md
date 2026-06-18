@@ -847,7 +847,7 @@ class MCPServerRegistryMixin:
 For update fields, omitting a parameter leaves the stored value unchanged, while passing
 `None` to a nullable field explicitly sets the field to `null`.
 
-**User-facing vs. store layer**: Following the general shape of MLflow model registry, the Python SDK exposes explicit create/get/search/update/delete operations for the core entities. On top of that, it also provides `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as convenience helpers for the common "ingest a canonical `server.json` and create or update the parent server as needed" workflow. Internally, these helpers call the same underlying `create_mcp_server()` / `create_mcp_server_version()` flow. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
+**User-facing vs. store layer**: The Python SDK exposes `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as the canonical entry points for registering MCP servers. These handle the common workflow of ingesting a canonical `server.json`, auto-creating the parent `MCPServer` if needed, and optionally creating access bindings from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations remain available on `MlflowClient` for programmatic use cases, but are not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
 
 **Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, or if `version` is not a valid semantic version, creation fails with a validation error. On success, the store also materializes `version_major`, `version_minor`, and `version_patch` from the parsed version. New versions default to `draft` status.
 
@@ -1078,7 +1078,7 @@ The `filter_string` parameter supports expressions following existing MLflow fil
 
 ### Python SDK
 
-The Python SDK exposes a user-facing `mlflow.genai` API that keeps the registry flows concise while still surfacing the main operations explicitly. Similar CLI commands will be added for the same operations, but this RFC does not spell out a separate CLI surface in detail.
+The Python SDK exposes a user-facing `mlflow.genai` API that keeps the registry flows concise while still surfacing the main operations explicitly. `register_mcp_server` is the canonical entry point for creating MCP servers and versions — it auto-creates the parent `MCPServer` if needed and optionally creates access bindings from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations are available on `MlflowClient` for programmatic use, but are intentionally not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. Similar CLI commands will be added for the same operations, but this RFC does not spell out a separate CLI surface in detail.
 
 ```python
 import mlflow
@@ -1103,13 +1103,6 @@ def register_mcp_server_from_url(
     create_access_bindings_from_remotes: bool = False,
 ) -> MCPServerVersion: ...
 
-def create_mcp_server(
-    *,
-    name: str,
-    description: str | None = None,
-    icons: list[MCPIcon] | None = None,
-) -> MCPServer: ...
-
 def get_mcp_server(*, name: str) -> MCPServer: ...
 
 def search_mcp_servers(
@@ -1129,16 +1122,6 @@ def update_mcp_server(
 ) -> MCPServer: ...
 
 def delete_mcp_server(*, name: str) -> None: ...
-
-def create_mcp_server_version(
-    *,
-    server_json: dict,
-    display_name: str | None = None,
-    source: str | None = None,
-    status: str = "draft",
-    tools: list[MCPTool] | None = None,
-    create_access_bindings_from_remotes: bool = False,
-) -> MCPServerVersion: ...
 
 def get_mcp_server_version(*, name: str, version: str) -> MCPServerVersion: ...
 
