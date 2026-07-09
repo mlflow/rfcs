@@ -13,11 +13,27 @@ Optimize PostgreSQL trace analytics for MLflow's Usage page and Traces page by:
 - denormalizing hot analytics fields onto `trace_info`, `spans`, and `assessments`
 - rewriting hot queries to read those columns directly
 - adding targeted indexes for assessment and span-cost workloads
+- adding opt-in daily rollup tables, filled by a periodic job, for stable trace analytics ranges
 - cleaning up duplicated EAV rows once the denormalized columns become authoritative
 
 On a load test with 10M traces, 30M spans, and 30M assessments in one experiment, the current Usage
 page takes about 3 minutes to load and several Traces page metrics time out. This RFC aims to reduce
 those query paths from minutes to seconds while keeping PostgreSQL as the analytics backend.
+
+A prototype on the same 10M-trace dataset showed the following 32-day UI replay results. This is a
+comparison between the optimized prototype with SQL rollups disabled and the same prototype with SQL
+rollups enabled; it is not a benchmark of the original pre-optimization implementation. The replay
+runs requests serially, so the total is cumulative request time rather than browser page-load wall
+time with parallel requests. With the rollups, this takes the experiment overview page about 4
+seconds to load on a hot query.
+
+| Request / metric path              | Prototype without rollups | Prototype with rollups | Speedup |
+| ---------------------------------- | ------------------------- | ---------------------- | ------- |
+| Full UI replay, 20 serial requests | 119.4s                    | 27.5s                  | 4.3x    |
+| Cost over time by model            | 21.3s                     | 59ms                   | 361x    |
+| Cost breakdown by model            | 14.4s                     | 52ms                   | 276x    |
+| Token/latency daily time series    | 5.4-9.8s                  | 56-63ms                | 89-167x |
+| Time-range trace count             | 558ms                     | 53ms                   | 10x     |
 
 ## Motivation
 
@@ -47,20 +63,18 @@ Trace analytics currently combine trace rows with EAV-style metric tables.
 
 At a high level:
 
-- `trace_info` stores one row per trace, including experiment, request id
-  (trace id in API terms), timestamp, status, and execution duration.
-- `trace_metrics` stores trace-level metric key/value pairs keyed by
-  `(request_id, key)`. Token usage metrics are stored here today.
+- `trace_info` stores one row per trace, including experiment, request id (trace id in API terms),
+  timestamp, status, and execution duration.
+- `trace_metrics` stores trace-level metric key/value pairs keyed by `(request_id, key)`. Token
+  usage metrics are stored here today.
 - `spans` stores one row per span.
-- `span_metrics` stores span-level metric key/value pairs keyed by
-  `(trace_id, span_id, key)`. Cost metrics are stored here today.
-- `assessments` stores one row per assessment and points back to a trace via
-  `trace_id`.
+- `span_metrics` stores span-level metric key/value pairs keyed by `(trace_id, span_id, key)`. Cost
+  metrics are stored here today.
+- `assessments` stores one row per assessment and points back to a trace via `trace_id`.
 
-This layout is flexible, but common dashboard queries must join through these
-tables before aggregating. For example, a token time-series query currently has
-to filter traces by experiment and time range, join to `trace_metrics`, filter
-by metric key, and then group by time bucket:
+This layout is flexible, but common dashboard queries must join through these tables before
+aggregating. For example, a token time-series query currently has to filter traces by experiment and
+time range, join to `trace_metrics`, filter by metric key, and then group by time bucket:
 
 ```sql
 SELECT floor(ti.timestamp_ms / :bucket_ms) * :bucket_ms AS time_bucket,
@@ -75,9 +89,9 @@ GROUP BY floor(ti.timestamp_ms / :bucket_ms) * :bucket_ms
 ORDER BY time_bucket;
 ```
 
-The proposed design moves the hottest analytics fields onto the rows already
-filtered by experiment and time, so these paths become direct column
-aggregations instead of EAV joins plus runtime value extraction.
+The proposed design moves the hottest analytics fields onto the rows already filtered by experiment
+and time, so these paths become direct column aggregations instead of EAV joins plus runtime value
+extraction.
 
 ## Detailed design
 
@@ -226,7 +240,79 @@ For Postgres span analytics, use a trace-first query shape:
 This keeps PostgreSQL on the measured trace-first plan instead of inlining back to a slower
 span-first scan. This was discovered from a proof of concept implementation.
 
-### 5. Targeted indexes
+### 5. Opt-in SQL daily rollups
+
+Denormalization removes the EAV joins from hot paths, but large dashboard windows still repeatedly
+aggregate over millions of rows. This RFC proposes an opt-in SQL rollup layer for PostgreSQL-backed
+trace analytics. The rollups are disabled by default and enabled with a server-side configuration
+flag, so deployments can choose the extra storage and maintenance work only when they need it.
+
+Add three daily rollup tables:
+
+| Table                            | Grain                                                                                      | Dimension columns                                                   | Measure columns                                                                              |
+| -------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `sql_trace_metric_daily_rollups` | `(workspace, experiment_id, rollup_day, metric_name, trace_status?, trace_name?)`          | `trace_status`, `trace_name`                                        | `sample_count`, `sum_value`, `min_value`, `max_value`, `p50_value`, `p90_value`, `p99_value` |
+| `sql_span_cost_daily_rollups`    | `(workspace, experiment_id, rollup_day, metric_name, model_name?, model_provider?)`        | `model_name`, `model_provider`                                      | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
+| `sql_assessment_daily_rollups`   | `(workspace, experiment_id, rollup_day, metric_name, assessment_name?, assessment_value?)` | `assessment_name`, `assessment_value_json`, `assessment_value_text` | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
+
+Each row should also have a deterministic `rollup_key` primary key derived from the grain. Lookup
+indexes should start with `(workspace, experiment_id, rollup_day, metric_name)`, with secondary
+dimension indexes for the common dimension filters.
+
+The trace metric table stores one row per
+`(workspace, experiment_id, rollup_day, metric_name, dimension grain)`. For trace metrics it stores
+`sample_count`, `sum_value`, `min_value`, `max_value`, and daily `p50_value`, `p90_value`, and
+`p99_value`. Daily percentiles are not composable into coarser buckets, so readers should use these
+percentile columns only for daily bucketed `P50`, `P90`, and `P99` requests. Non-daily or unbucketed
+percentile requests should stay on the raw exact path.
+
+The span-cost rollup table stores daily `input_cost`, `output_cost`, and `total_cost` aggregates by
+model and provider grains. The assessment rollup table stores daily assessment count and numeric
+assessment-value aggregates by assessment name and value grains. The rollup reader should use these
+tables for exact daily `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` queries and for supported daily trace
+metric percentiles. Requests with arbitrary filters, unsupported dimensions, unsupported percentile
+values, or bucket widths other than one day should fall back to the raw query path.
+
+A periodic server job fills the tables. Each pass should:
+
+1. compute eligible `(workspace, experiment_id, rollup_day)` partitions from raw traces
+2. exclude days newer than a freshness threshold, defaulting to 24 hours
+3. rebuild deleted/stale rollup partitions before processing newly eligible trace days
+4. skip partitions that already have a `trace_count` rollup marker row
+5. rebuild a bounded number of missing partitions per pass
+6. upsert rollup rows by deterministic rollup key
+
+The freshness threshold keeps the job away from traces that are still being actively written.
+
+To keep rollups stable, MLflow should reject late mutations that change rollup facts once a trace is
+older than the freshness window. Specifically, the MLflow API should not allow adding spans, adding
+trace metrics, or updating trace-info fields such as timestamp, duration, status, token usage, span
+cost, or other analytic facts for traces older than 24 hours. Tags, comments, display metadata, and
+similar non-analytic annotations can remain mutable. Adding assessments to older traces should also
+remain allowed, since human review and evaluator backfills often happen after the trace is closed.
+
+Assessment writes or trace deletes against already-rolled-up traces should delete stale rollup rows
+for the affected `(workspace, experiment_id, rollup_day)`. Until the next scheduled rollup job
+rebuilds that day, readers should compute the missing day from raw rows and use rollups for the
+remaining covered days. The job should prioritize rebuilding deleted rollup days before processing
+newly eligible trace days, and bulk deletes should group affected traces by partition so each day is
+deleted and rebuilt once.
+
+The rollup tables need targeted indexes for lookup and dimension filtering. Span-cost rollup builds
+also need a raw-table covering index that matches their day-range access pattern:
+
+```sql
+CREATE INDEX idx_spans_cost_exp_time_cover
+  ON spans (experiment_id, start_time_unix_nano)
+  INCLUDE (input_cost, output_cost, total_cost, dimension_attributes)
+  WHERE input_cost IS NOT NULL
+     OR output_cost IS NOT NULL
+     OR total_cost IS NOT NULL;
+```
+
+This index avoids repeatedly scanning all spans when building or repairing daily span-cost rollups.
+
+### 6. Targeted indexes
 
 This RFC keeps the existing `(experiment_id, timestamp_ms)` access path on `trace_info` and does not
 propose an additional broad covering index on `trace_info`.
@@ -240,19 +326,34 @@ That is intentional:
 This RFC does propose the following targeted indexes:
 
 ```sql
+-- Drives assessment time-series queries by experiment and trace timestamp without joining
+-- through trace_info.
 CREATE INDEX idx_assessments_exp_trace_ts
     ON assessments (experiment_id, trace_timestamp_ms);
 
+-- Covers assessment time-series queries grouped or filtered by assessment name.
 CREATE INDEX idx_assessments_exp_trace_ts_name
     ON assessments (experiment_id, trace_timestamp_ms, name);
 
+-- Supports assessment distribution and name-filtered queries that aggregate valid rows.
 CREATE INDEX idx_assessments_exp_name_valid
     ON assessments (experiment_id, name, valid);
 
+-- Supports trace-first raw span-cost fallbacks: first select trace ids from trace_info,
+-- then index into cost-bearing spans by trace id and span start time.
 CREATE INDEX idx_spans_cost_trace_time_cover
     ON spans (trace_id, start_time_unix_nano)
     INCLUDE (total_cost, dimension_attributes)
     WHERE total_cost IS NOT NULL;
+
+-- Supports daily span-cost rollup build and repair jobs, which scan cost-bearing spans by
+-- experiment and day rather than by trace id.
+CREATE INDEX idx_spans_cost_exp_time_cover
+  ON spans (experiment_id, start_time_unix_nano)
+  INCLUDE (input_cost, output_cost, total_cost, dimension_attributes)
+  WHERE input_cost IS NOT NULL
+     OR output_cost IS NOT NULL
+     OR total_cost IS NOT NULL;
 ```
 
 ## Implementation details
@@ -262,9 +363,10 @@ CREATE INDEX idx_spans_cost_trace_time_cover
   2. backfill `trace_info`
   3. backfill `spans`
   4. backfill `assessments`
-  5. retarget reads and writes
-  6. batch-delete duplicated EAV rows
-  7. create indexes
+  5. create opt-in rollup tables and targeted indexes
+  6. retarget reads and writes
+  7. batch-delete duplicated EAV rows
+  8. optionally enable the periodic SQL rollup job
 - Batched deletes from `trace_metrics`, `span_metrics`, and trace metadata will create dead tuples.
   Rollout guidance should mention normal autovacuum follow-up or `VACUUM (ANALYZE)` after large
   cleanup operations.
@@ -279,25 +381,36 @@ CREATE INDEX idx_spans_cost_trace_time_cover
 
 ## Expected impact
 
-Representative target improvements on the benchmark dataset:
+Representative measured improvements on the 10M trace / 30M span / 30M assessment benchmark dataset:
 
-| Query                          | Current | Target  |
-| ------------------------------ | ------- | ------- |
-| Usage page total               | ~3 min  | <10s    |
-| `input_tokens` daily sum       | 114.8s  | ~2-3s   |
-| `assessment_value` AVG/P90/P99 | 105.8s  | ~8-10s  |
+| Query / replay request                       | Prototype without rollups | Prototype with rollups | Speedup |
+| -------------------------------------------- | ------------------------- | ---------------------- | ------- |
+| Full 32-day UI replay, 20 requests           | 119.4s                    | 27.5s                  | 4.3x    |
+| `cost_over_time_by_model`                    | 21.3s                     | 59ms                   | 361x    |
+| `cost_breakdown_by_model`                    | 14.4s                     | 52ms                   | 276x    |
+| `total_tokens` daily P50/P90/P99 time series | 9.8s                      | 63ms                   | 155x    |
+| `latency` daily P50/P90/P99 time series      | 9.8s                      | 59ms                   | 167x    |
+| `trace_count_by_status` daily count          | 6.6s                      | 58ms                   | 114x    |
+| `cache_read_input_tokens` daily sum          | 5.5s                      | 58ms                   | 94x     |
+| `time_range_trace_count`                     | 558ms                     | 53ms                   | 10x     |
 
-These numbers are benchmark-based targets, not guarantees. Exact percentile queries may still
-retain significant sort cost even after the denormalization work, and are expected to remain the
-main residual cost on the slowest paths.
+These numbers are benchmark results from a prototype implementation using daily buckets for a 32-day
+window. They compare the prototype with SQL rollups disabled to the same prototype with SQL rollups
+enabled; they are not a measurement of the original pre-optimization implementation and are not
+guarantees for every deployment. Queries outside the rollup-supported shape, especially arbitrary
+filtered requests and non-daily exact percentile queries, still fall back to the raw path and remain
+the main residual cost.
 
 ## Drawbacks
 
 - Additional columns and targeted indexes still increase storage, even after cleanup removes the
   duplicated hot EAV rows and session metadata.
+- Opt-in rollup tables add more storage and operational state. Deployments that enable them need a
+  periodic job, freshness policy, and dirty-partition repair path for deletes.
 - Retargeting reads and writes, cleaning up duplicated rows, and supporting downgrade reconstruction
   increase implementation and migration complexity.
-- Assessment trace-time columns must stay consistent if later write paths update trace timing.
+- Assessment trace-time columns and rollup dimensions must stay consistent if later write paths
+  update trace timing or analytic fields.
 
 ## Alternatives considered
 
@@ -325,6 +438,10 @@ benchmarks justify it.
 - Ship through a standard Alembic migration.
 - Require a maintenance window for the backfill, write-path cutover, and EAV cleanup in the database
   migration.
+- Keep SQL daily rollups disabled by default. Operators can enable them after the denormalized
+  fields are backfilled and the scheduler is running.
+- Enforce a 24-hour immutability window for analytic trace facts so periodic rollup jobs only need
+  to process closed days and delete-triggered dirty partitions.
 - Downgrade should reconstruct the removed EAV rows before dropping the denormalized columns.
 
 ## Open question
