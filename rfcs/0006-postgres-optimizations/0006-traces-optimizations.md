@@ -20,20 +20,18 @@ On a load test with 10M traces, 30M spans, and 30M assessments in one experiment
 page takes about 3 minutes to load and several Traces page metrics time out. This RFC aims to reduce
 those query paths from minutes to seconds while keeping PostgreSQL as the analytics backend.
 
-A prototype on the same 10M-trace dataset showed the following 32-day UI replay results. This is a
-comparison between the optimized prototype with SQL rollups disabled and the same prototype with SQL
-rollups enabled; it is not a benchmark of the original pre-optimization implementation. The replay
-runs requests serially, so the total is cumulative request time rather than browser page-load wall
-time with parallel requests. With the rollups, this takes the experiment overview page about 4
+A prototype on the same 10M-trace dataset showed the following 32-day UI replay results. The
+replay runs requests serially, so the total is cumulative request time rather than browser page-load
+wall time with parallel requests. With the rollups, this takes the experiment overview page about 4
 seconds to load on a hot query.
 
-| Request / metric path              | Prototype without rollups | Prototype with rollups | Speedup |
-| ---------------------------------- | ------------------------- | ---------------------- | ------- |
-| Full UI replay, 20 serial requests | 119.4s                    | 27.5s                  | 4.3x    |
-| Cost over time by model            | 21.3s                     | 59ms                   | 361x    |
-| Cost breakdown by model            | 14.4s                     | 52ms                   | 276x    |
-| Token/latency daily time series    | 5.4-9.8s                  | 56-63ms                | 89-167x |
-| Time-range trace count             | 558ms                     | 53ms                   | 10x     |
+| Request / metric path              | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master |
+| ---------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ |
+| Full UI replay, 20 serial requests | 1,891.9s        | 119.4s                    | 27.5s                  | 68.8x                    |
+| Cost over time by model            | 110.3s          | 21.3s                     | 59ms                   | 1,870x                   |
+| Cost breakdown by model            | 24.2s           | 14.4s                     | 52ms                   | 464x                     |
+| Token/latency daily time series    | 9.4-459.0s      | 5.4-9.8s                  | 56-63ms                | 159-7,908x               |
+| Time-range trace count             | 315ms           | 558ms                     | 53ms                   | 5.9x                     |
 
 ## Motivation
 
@@ -383,23 +381,28 @@ CREATE INDEX idx_spans_cost_exp_time_cover
 
 Representative measured improvements on the 10M trace / 30M span / 30M assessment benchmark dataset:
 
-| Query / replay request                       | Prototype without rollups | Prototype with rollups | Speedup |
-| -------------------------------------------- | ------------------------- | ---------------------- | ------- |
-| Full 32-day UI replay, 20 requests           | 119.4s                    | 27.5s                  | 4.3x    |
-| `cost_over_time_by_model`                    | 21.3s                     | 59ms                   | 361x    |
-| `cost_breakdown_by_model`                    | 14.4s                     | 52ms                   | 276x    |
-| `total_tokens` daily P50/P90/P99 time series | 9.8s                      | 63ms                   | 155x    |
-| `latency` daily P50/P90/P99 time series      | 9.8s                      | 59ms                   | 167x    |
-| `trace_count_by_status` daily count          | 6.6s                      | 58ms                   | 114x    |
-| `cache_read_input_tokens` daily sum          | 5.5s                      | 58ms                   | 94x     |
-| `time_range_trace_count`                     | 558ms                     | 53ms                   | 10x     |
+| Query / replay request                            | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master | Rollup speedup vs no rollups |
+| ------------------------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ | ---------------------------- |
+| Full 32-day UI replay, 20 requests                | 1,891.9s        | 119.4s                    | 27.5s                  | 68.8x                    | 4.3x                         |
+| `cost_over_time_by_model`                         | 110.3s          | 21.3s                     | 59ms                   | 1,870x                   | 361x                         |
+| `cost_breakdown_by_model`                         | 24.2s           | 14.4s                     | 52ms                   | 464x                     | 276x                         |
+| `input_tokens` daily sum                          | 298.9s          | 5.5s                      | 61ms                   | 4,904x                   | 90x                          |
+| `output_tokens` daily sum                         | 360.9s          | 5.4s                      | 56ms                   | 6,467x                   | 97x                          |
+| `cache_read_input_tokens` daily sum               | 459.0s          | 5.5s                      | 58ms                   | 7,908x                   | 94x                          |
+| `cache_creation_input_tokens` daily sum           | 434.4s          | 5.4s                      | 60ms                   | 7,258x                   | 90x                          |
+| `total_tokens` daily P50/P90/P99 time series      | 56.2s           | 9.8s                      | 63ms                   | 893x                     | 155x                         |
+| `latency` daily P50/P90/P99 time series           | 9.4s            | 9.8s                      | 59ms                   | 159x                     | 167x                         |
+| `trace_count_by_status` daily count               | 6.1s            | 6.6s                      | 58ms                   | 105x                     | 114x                         |
+| `assessment_value` daily time series              | 105.8s          | 10.2s                     | 9.3s                   | 11x                      | 1.1x                         |
+| `assessment_distribution` on the Traces tab        | 10.0s           | 8.6s                      | 61ms                   | 165x                     | 141x                         |
+| `time_range_trace_count`                          | 315ms           | 558ms                     | 53ms                   | 5.9x                     | 10x                          |
 
-These numbers are benchmark results from a prototype implementation using daily buckets for a 32-day
-window. They compare the prototype with SQL rollups disabled to the same prototype with SQL rollups
-enabled; they are not a measurement of the original pre-optimization implementation and are not
-guarantees for every deployment. Queries outside the rollup-supported shape, especially arbitrary
-filtered requests and non-daily exact percentile queries, still fall back to the raw path and remain
-the main residual cost.
+These numbers are benchmark results from the same 10M-trace dataset using daily buckets for a
+32-day window. The upstream master column is a clean `upstream/master` checkout using the original
+EAV-backed schema. The two prototype columns use the optimized prototype with SQL rollups disabled
+and enabled, respectively. They are not guarantees for every deployment. Queries outside the
+rollup-supported shape, especially arbitrary filtered requests and non-daily exact percentile
+queries, still fall back to the raw path and remain the main residual cost.
 
 ## Drawbacks
 
