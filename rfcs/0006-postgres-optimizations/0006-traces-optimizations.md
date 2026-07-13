@@ -14,7 +14,8 @@ Optimize PostgreSQL trace analytics for MLflow's Usage page and Traces page by:
 - rewriting hot queries to read those columns directly
 - adding targeted indexes for assessment and span-cost workloads
 - adding opt-in daily rollup tables, filled by a periodic job, for stable trace analytics ranges
-- cleaning up duplicated EAV rows once the denormalized columns become authoritative
+- cleaning up duplicated metric, tag, and metadata rows once the denormalized columns become
+  authoritative
 
 On a load test with 10M traces, 30M spans, and 30M assessments in one experiment, the current Usage
 page takes about 3 minutes to load and several Traces page metrics time out. This RFC aims to reduce
@@ -121,6 +122,18 @@ should:
 
 Non-denormalized custom trace metrics remain in `trace_metrics`.
 
+`trace_name` should also become the authoritative storage and query field on `trace_info` for
+analytics and trace-name filtering. MLflow should:
+
+1. backfill `trace_info.trace_name` from trace tags
+2. retarget trace-name readers, including trace-name analytics filters and rollup builders, to
+   `trace_info.trace_name`
+3. synthesize the API-facing trace-name tag from `trace_info.trace_name` for compatibility
+4. stop writing the trace-name tag separately
+5. delete existing trace-name tag rows in batches
+6. reconstruct those tag rows from `trace_info.trace_name` on downgrade before dropping the
+   denormalized column
+
 `session_id` should become the authoritative storage and query field on `trace_info` for analytics
 and session-oriented queries. MLflow should:
 
@@ -158,9 +171,9 @@ that column.
 
 ### 3. Denormalize assessment analytics onto `assessments`
 
-Add the following columns to `assessments`:
+Keep `experiment_id` on `assessments`, but remove its foreign key constraint. Add the following
+columns:
 
-- `experiment_id`
 - `trace_timestamp_ms`
 - `aggregate_value`
 
@@ -177,20 +190,22 @@ repeatedly cast or reinterpret assessment values. The difference in query shape 
 Before:
 
 ```sql
-SELECT name,
+SELECT a.name,
        AVG(
            CASE
-               WHEN jsonb_typeof(value::jsonb) = 'number' THEN (value::jsonb)::text::double precision
-               WHEN jsonb_typeof(value::jsonb) = 'boolean' THEN
-                   CASE WHEN (value::jsonb)::boolean THEN 1.0 ELSE 0.0 END
+               WHEN jsonb_typeof(a.value::jsonb) = 'number' THEN (a.value::jsonb)::text::double precision
+               WHEN jsonb_typeof(a.value::jsonb) = 'boolean' THEN
+                   CASE WHEN (a.value::jsonb)::boolean THEN 1.0 ELSE 0.0 END
                ELSE NULL
            END
        )
-FROM assessments
-WHERE experiment_id = ?
-  AND trace_timestamp_ms BETWEEN ? AND ?
-  AND valid = true
-GROUP BY name;
+FROM assessments a
+JOIN trace_info ti
+  ON ti.request_id = a.trace_id
+WHERE ti.experiment_id = ?
+  AND ti.timestamp_ms BETWEEN ? AND ?
+  AND a.valid = true
+GROUP BY a.name;
 ```
 
 After:
@@ -215,6 +230,14 @@ analytics and leave it null otherwise.
 knows the experiment from the owning trace when it writes the assessment, so storing that value does
 not require an extra integrity lookup on every insert. Skipping the foreign key keeps this
 high-volume write path cheaper while preserving the same logical relationship.
+
+After migration, MLflow should:
+
+1. backfill `trace_timestamp_ms` from the owning trace rows
+2. backfill `aggregate_value` from existing assessment values using the same numeric coercion rules
+   that analytics readers use today
+3. retarget assessment analytics to `assessments.experiment_id`,
+   `assessments.trace_timestamp_ms`, and `assessments.aggregate_value`
 
 ### 4. Query execution changes
 
@@ -285,9 +308,10 @@ The freshness threshold keeps the job away from traces that are still being acti
 To keep rollups stable, MLflow should reject late mutations that change rollup facts once a trace is
 older than the freshness window. Specifically, the MLflow API should not allow adding spans, adding
 trace metrics, or updating trace-info fields such as timestamp, duration, status, token usage, span
-cost, or other analytic facts for traces older than 24 hours. Tags, comments, display metadata, and
-similar non-analytic annotations can remain mutable. Adding assessments to older traces should also
-remain allowed, since human review and evaluator backfills often happen after the trace is closed.
+cost, `trace_name`, `session_id`, or other analytic facts for traces older than 24 hours. Comments,
+display metadata, and similar non-analytic annotations can remain mutable. Adding assessments to
+older traces should also remain allowed, since human review and evaluator backfills often happen
+after the trace is closed.
 
 Assessment writes or trace deletes against already-rolled-up traces should delete stale rollup rows
 for the affected `(workspace, experiment_id, rollup_day)`. Until the next scheduled rollup job
@@ -369,8 +393,9 @@ CREATE INDEX idx_spans_cost_exp_time_cover
   Rollout guidance should mention normal autovacuum follow-up or `VACUUM (ANALYZE)` after large
   cleanup operations.
 - Downgrade should reconstruct token rows in `trace_metrics` from `trace_info`, cost rows in
-  `span_metrics` from `spans`, and `TRACE_SESSION` metadata rows from `trace_info.session_id` before
-  dropping the denormalized columns.
+  `span_metrics` from `spans`, trace-name tag rows from `trace_info.trace_name`, and
+  `TRACE_SESSION` metadata rows from `trace_info.session_id` before dropping the denormalized
+  columns.
 - Use `Float(53)` / `DOUBLE PRECISION` for denormalized token, span-cost, and aggregate numeric
   columns to match the existing analytics numeric path.
 - In the Alembic migration code, `batch_op` should be used only for SQLite compatibility paths.
@@ -394,7 +419,7 @@ Representative measured improvements on the 10M trace / 30M span / 30M assessmen
 | `latency` daily P50/P90/P99 time series           | 9.4s            | 9.8s                      | 59ms                   | 159x                     | 167x                         |
 | `trace_count_by_status` daily count               | 6.1s            | 6.6s                      | 58ms                   | 105x                     | 114x                         |
 | `assessment_value` daily time series              | 105.8s          | 10.2s                     | 9.3s                   | 11x                      | 1.1x                         |
-| `assessment_distribution` on the Traces tab        | 10.0s           | 8.6s                      | 61ms                   | 165x                     | 141x                         |
+| `assessment_distribution` on the Traces tab       | 10.0s           | 8.6s                      | 61ms                   | 165x                     | 141x                         |
 | `time_range_trace_count`                          | 315ms           | 558ms                     | 53ms                   | 5.9x                     | 10x                          |
 
 These numbers are benchmark results from the same 10M-trace dataset using daily buckets for a
@@ -445,7 +470,8 @@ benchmarks justify it.
   fields are backfilled and the scheduler is running.
 - Enforce a 24-hour immutability window for analytic trace facts so periodic rollup jobs only need
   to process closed days and delete-triggered dirty partitions.
-- Downgrade should reconstruct the removed EAV rows before dropping the denormalized columns.
+- Downgrade should reconstruct removed metric, tag, and metadata rows before dropping the
+  denormalized columns.
 
 ## Open question
 
