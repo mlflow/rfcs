@@ -389,9 +389,16 @@ CREATE INDEX idx_spans_cost_exp_time_cover
   6. retarget reads and writes
   7. batch-delete duplicated EAV rows
   8. optionally enable the periodic SQL rollup job
+- The rollout may be split into two phases. An optional online pre-migration phase can add nullable
+  columns, build compatible indexes, and run idempotent backfills while the pre-RFC MLflow version
+  is still serving traffic. The final cutover phase should then do the write/read retargeting,
+  catch-up backfill, legacy-row cleanup, and any destructive DDL. This is to reduce downtime from
+  long SQL operations on large databases.
 - Batched deletes from `trace_metrics`, `span_metrics`, and trace metadata will create dead tuples.
   Rollout guidance should mention normal autovacuum follow-up or `VACUUM (ANALYZE)` after large
   cleanup operations.
+- If such an online pre-migration phase is implemented, it should remain strictly additive and must
+  not advance Alembic schema version state until the final cutover migration runs.
 - Downgrade should reconstruct token rows in `trace_metrics` from `trace_info`, cost rows in
   `span_metrics` from `spans`, trace-name tag rows from `trace_info.trace_name`, and
   `TRACE_SESSION` metadata rows from `trace_info.session_id` before dropping the denormalized
@@ -464,8 +471,12 @@ benchmarks justify it.
 ## Adoption strategy
 
 - Ship through a standard Alembic migration.
-- Require a maintenance window for the backfill, write-path cutover, and EAV cleanup in the database
-  migration.
+- Optionally support a phased rollout where operators first run an additive pre-migration utility to
+  add the new columns, create compatible indexes, and backfill data idempotently before the main
+  migration window.
+- Reserve downtime for the final cutover steps: schema-version advancement, final catch-up backfill,
+  read/write retargeting, legacy-row cleanup, and any destructive DDL such as constraint or column
+  drops.
 - Keep SQL daily rollups disabled by default. Operators can enable them after the denormalized
   fields are backfilled and the scheduler is running.
 - Enforce a 24-hour immutability window for analytic trace facts so periodic rollup jobs only need
