@@ -21,18 +21,18 @@ On a load test with 10M traces, 30M spans, and 30M assessments in one experiment
 page takes about 3 minutes to load and several Traces page metrics time out. This RFC aims to reduce
 those query paths from minutes to seconds while keeping PostgreSQL as the analytics backend.
 
-A prototype on the same 10M-trace dataset showed the following 32-day UI replay results. The
-replay runs requests serially, so the total is cumulative request time rather than browser page-load
-wall time with parallel requests. With the rollups, this takes the experiment overview page about 4
-seconds to load on a hot query.
+A prototype on the same 10M-trace dataset showed the following 32-day UI replay results. The replay
+runs requests serially, so the total is cumulative request time rather than browser page-load wall
+time with parallel requests. The rollup results below exclude the unbounded exact assessment-value
+distribution grain; that query stays on the raw path.
 
 | Request / metric path              | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master |
 | ---------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ |
-| Full UI replay, 20 serial requests | 1,891.9s        | 119.4s                    | 27.5s                  | 68.8x                    |
-| Cost over time by model            | 110.3s          | 21.3s                     | 59ms                   | 1,870x                   |
-| Cost breakdown by model            | 24.2s           | 14.4s                     | 52ms                   | 464x                     |
-| Token/latency daily time series    | 9.4-459.0s      | 5.4-9.8s                  | 56-63ms                | 159-7,908x               |
-| Time-range trace count             | 315ms           | 558ms                     | 53ms                   | 5.9x                     |
+| Full UI replay, 20 serial requests | 1,891.9s        | 119.4s                    | 36.8s                  | 51.5x                    |
+| Cost over time by model            | 110.3s          | 21.3s                     | 56ms                   | 1,976x                   |
+| Cost breakdown by model            | 24.2s           | 14.4s                     | 66ms                   | 367x                     |
+| Token/latency daily time series    | 9.4-459.0s      | 5.4-9.8s                  | 64-74ms                | 135-6,788x               |
+| Time-range trace count             | 315ms           | 558ms                     | 67ms                   | 4.7x                     |
 
 ## Motivation
 
@@ -51,7 +51,7 @@ scale, the slowest trace analytics queries share four problems:
 ## Out of scope
 
 - Moving analytics to a different database engine.
-- UI pagination or client-side query shaping.
+- Changing UI pagination behavior beyond guarding expensive exact assessment-value distributions.
 - A full request-shape guardrail design for trace metrics queries.
 - A broad covering index on `trace_info` beyond the existing `(experiment_id, timestamp_ms)` access
   path.
@@ -112,8 +112,9 @@ These values are derived from the write paths that already produce them:
 - `session_id` from trace metadata
 - token values from `TOKEN_USAGE`
 
-After migration, these five token keys become single-source-of-truth fields on `trace_info`. MLflow
-should:
+After migration, the five token fields above (`input_tokens`, `output_tokens`, `total_tokens`,
+`cache_read_input_tokens`, and `cache_creation_input_tokens`) become the single-source-of-truth
+fields on `trace_info`. MLflow should:
 
 1. backfill the new columns from `trace_metrics`
 2. stop writing those token keys to `trace_metrics`
@@ -236,8 +237,8 @@ After migration, MLflow should:
 1. backfill `trace_timestamp_ms` from the owning trace rows
 2. backfill `aggregate_value` from existing assessment values using the same numeric coercion rules
    that analytics readers use today
-3. retarget assessment analytics to `assessments.experiment_id`,
-   `assessments.trace_timestamp_ms`, and `assessments.aggregate_value`
+3. retarget assessment analytics to `assessments.experiment_id`, `assessments.trace_timestamp_ms`,
+   and `assessments.aggregate_value`
 
 ### 4. Query execution changes
 
@@ -270,11 +271,11 @@ flag, so deployments can choose the extra storage and maintenance work only when
 
 Add three daily rollup tables:
 
-| Table                            | Grain                                                                                      | Dimension columns                                                   | Measure columns                                                                              |
-| -------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `sql_trace_metric_daily_rollups` | `(workspace, experiment_id, rollup_day, metric_name, trace_status?, trace_name?)`          | `trace_status`, `trace_name`                                        | `sample_count`, `sum_value`, `min_value`, `max_value`, `p50_value`, `p90_value`, `p99_value` |
-| `sql_span_cost_daily_rollups`    | `(workspace, experiment_id, rollup_day, metric_name, model_name?, model_provider?)`        | `model_name`, `model_provider`                                      | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
-| `sql_assessment_daily_rollups`   | `(workspace, experiment_id, rollup_day, metric_name, assessment_name?, assessment_value?)` | `assessment_name`, `assessment_value_json`, `assessment_value_text` | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
+| Table                            | Grain                                                                               | Dimension columns              | Measure columns                                                                              |
+| -------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------- |
+| `sql_trace_metric_daily_rollups` | `(workspace, experiment_id, rollup_day, metric_name, trace_status?, trace_name?)`   | `trace_status`, `trace_name`   | `sample_count`, `sum_value`, `min_value`, `max_value`, `p50_value`, `p90_value`, `p99_value` |
+| `sql_span_cost_daily_rollups`    | `(workspace, experiment_id, rollup_day, metric_name, model_name?, model_provider?)` | `model_name`, `model_provider` | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
+| `sql_assessment_daily_rollups`   | `(workspace, experiment_id, rollup_day, metric_name, assessment_name?)`             | `assessment_name`              | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
 
 Each row should also have a deterministic `rollup_key` primary key derived from the grain. Lookup
 indexes should start with `(workspace, experiment_id, rollup_day, metric_name)`, with secondary
@@ -288,30 +289,59 @@ percentile columns only for daily bucketed `P50`, `P90`, and `P99` requests. Non
 percentile requests should stay on the raw exact path.
 
 The span-cost rollup table stores daily `input_cost`, `output_cost`, and `total_cost` aggregates by
-model and provider grains. The assessment rollup table stores daily assessment count and numeric
-assessment-value aggregates by assessment name and value grains. The rollup reader should use these
-tables for exact daily `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` queries and for supported daily trace
-metric percentiles. Requests with arbitrary filters, unsupported dimensions, unsupported percentile
-values, or bucket widths other than one day should fall back to the raw query path.
+model and provider grains. The assessment rollup table stores daily assessment counts and numeric
+aggregates over `aggregate_value`, both globally and by assessment name. It intentionally does not
+group by exact `assessment_value`: user-defined numeric scores, free-form strings, and structured
+values can be effectively unbounded, causing the rollup to approach the raw assessment table's
+cardinality. Queries grouped by exact assessment value therefore stay on the raw path. This does not
+affect numeric `AVG`, `SUM`, `MIN`, or `MAX` rollups over `aggregate_value`, which remain grouped by
+assessment name.
+
+The rollup reader should use these tables for exact daily `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`
+queries and for supported daily trace metric percentiles. Rollup eligibility, fallback, and
+maintenance behavior should be centralized behind backend-specific planning code rather than
+scattered across individual query paths. Requests with arbitrary filters, exact assessment-value
+dimensions, unsupported dimensions, unsupported percentile values, or bucket widths other than one
+day should fall back to the raw query path.
+
+The Traces table currently requests exact assessment-value counts when infinite pagination is
+enabled, and infinite pagination is enabled by default. To keep that raw fallback bounded, add a
+server setting named `MLFLOW_TRACE_METRICS_MAX_ASSESSMENT_VALUE_DISTRIBUTION_ROWS`, defaulting to
+`1000000`. It limits the number of source assessment rows that an exact-value distribution may
+aggregate; it does not truncate returned groups or counts.
+
+Exact assessment-value distribution queries should be guarded by that setting so the raw fallback
+remains bounded. This guard applies whether or not SQL rollups are enabled. If the guard blocks the
+query, the UI should treat the global distribution as unavailable rather than presenting partial
+page-local counts as complete results.
 
 A periodic server job fills the tables. Each pass should:
 
-1. compute eligible `(workspace, experiment_id, rollup_day)` partitions from raw traces
-2. exclude days newer than a freshness threshold, defaulting to 24 hours
+1. compute eligible `(workspace, experiment_id, rollup_day)` partitions from raw trace, span, and
+   assessment rows
+2. exclude days newer than a configurable freshness threshold, controlled by
+   `MLFLOW_SQL_TRACE_ROLLUPS_FRESHNESS_SECONDS` and defaulting to 24 hours
 3. rebuild deleted/stale rollup partitions before processing newly eligible trace days
-4. skip partitions that already have a `trace_count` rollup marker row
+4. skip partitions that already have a coverage marker row
 5. rebuild a bounded number of missing partitions per pass
 6. upsert rollup rows by deterministic rollup key
 
 The freshness threshold keeps the job away from traces that are still being actively written.
+Because SQL rollups are disabled by default, this late-mutation restriction is also off by default.
+When operators enable rollups, this same server-side setting should define how old a trace can be
+before late analytic updates are rejected.
 
-To keep rollups stable, MLflow should reject late mutations that change rollup facts once a trace is
-older than the freshness window. Specifically, the MLflow API should not allow adding spans, adding
-trace metrics, or updating trace-info fields such as timestamp, duration, status, token usage, span
-cost, `trace_name`, `session_id`, or other analytic facts for traces older than 24 hours. Comments,
-display metadata, and similar non-analytic annotations can remain mutable. Adding assessments to
-older traces should also remain allowed, since human review and evaluator backfills often happen
-after the trace is closed.
+Rollup invalidation and rebuild for a given partition should be serialized, and a rebuilt partition
+should only become visible once its rows and coverage marker are published together. This prevents
+concurrent rebuilders or late writes from making a stale partition appear complete again.
+
+When SQL rollups are enabled, to keep rollups stable, MLflow should reject late mutations that
+change rollup facts once a trace is older than the freshness window. Specifically, the MLflow API
+should not allow adding spans, adding trace metrics, or updating trace-info fields such as
+timestamp, duration, status, token usage, span cost, `trace_name`, `session_id`, or other analytic
+facts for traces older than that window. Comments, display metadata, and similar non-analytic
+annotations can remain mutable. Adding assessments to older traces should also remain allowed, since
+human review and evaluator backfills often happen after the trace is closed.
 
 Assessment writes or trace deletes against already-rolled-up traces should delete stale rollup rows
 for the affected `(workspace, experiment_id, rollup_day)`. Until the next scheduled rollup job
@@ -400,9 +430,8 @@ CREATE INDEX idx_spans_cost_exp_time_cover
 - If such an online pre-migration phase is implemented, it should remain strictly additive and must
   not advance Alembic schema version state until the final cutover migration runs.
 - Downgrade should reconstruct token rows in `trace_metrics` from `trace_info`, cost rows in
-  `span_metrics` from `spans`, trace-name tag rows from `trace_info.trace_name`, and
-  `TRACE_SESSION` metadata rows from `trace_info.session_id` before dropping the denormalized
-  columns.
+  `span_metrics` from `spans`, trace-name tag rows from `trace_info.trace_name`, and `TRACE_SESSION`
+  metadata rows from `trace_info.session_id` before dropping the denormalized columns.
 - Use `Float(53)` / `DOUBLE PRECISION` for denormalized token, span-cost, and aggregate numeric
   columns to match the existing analytics numeric path.
 - In the Alembic migration code, `batch_op` should be used only for SQLite compatibility paths.
@@ -413,35 +442,47 @@ CREATE INDEX idx_spans_cost_exp_time_cover
 
 Representative measured improvements on the 10M trace / 30M span / 30M assessment benchmark dataset:
 
-| Query / replay request                            | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master | Rollup speedup vs no rollups |
-| ------------------------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ | ---------------------------- |
-| Full 32-day UI replay, 20 requests                | 1,891.9s        | 119.4s                    | 27.5s                  | 68.8x                    | 4.3x                         |
-| `cost_over_time_by_model`                         | 110.3s          | 21.3s                     | 59ms                   | 1,870x                   | 361x                         |
-| `cost_breakdown_by_model`                         | 24.2s           | 14.4s                     | 52ms                   | 464x                     | 276x                         |
-| `input_tokens` daily sum                          | 298.9s          | 5.5s                      | 61ms                   | 4,904x                   | 90x                          |
-| `output_tokens` daily sum                         | 360.9s          | 5.4s                      | 56ms                   | 6,467x                   | 97x                          |
-| `cache_read_input_tokens` daily sum               | 459.0s          | 5.5s                      | 58ms                   | 7,908x                   | 94x                          |
-| `cache_creation_input_tokens` daily sum           | 434.4s          | 5.4s                      | 60ms                   | 7,258x                   | 90x                          |
-| `total_tokens` daily P50/P90/P99 time series      | 56.2s           | 9.8s                      | 63ms                   | 893x                     | 155x                         |
-| `latency` daily P50/P90/P99 time series           | 9.4s            | 9.8s                      | 59ms                   | 159x                     | 167x                         |
-| `trace_count_by_status` daily count               | 6.1s            | 6.6s                      | 58ms                   | 105x                     | 114x                         |
-| `assessment_value` daily time series              | 105.8s          | 10.2s                     | 9.3s                   | 11x                      | 1.1x                         |
-| `assessment_distribution` on the Traces tab       | 10.0s           | 8.6s                      | 61ms                   | 165x                     | 141x                         |
-| `time_range_trace_count`                          | 315ms           | 558ms                     | 53ms                   | 5.9x                     | 10x                          |
+| Query / replay request                       | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master | Rollup speedup vs no rollups |
+| -------------------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ | ---------------------------- |
+| Full 32-day UI replay, 20 requests           | 1,891.9s        | 119.4s                    | 36.8s                  | 51.5x                    | 3.2x                         |
+| `cost_over_time_by_model`                    | 110.3s          | 21.3s                     | 56ms                   | 1,976x                   | 382x                         |
+| `cost_breakdown_by_model`                    | 24.2s           | 14.4s                     | 66ms                   | 367x                     | 218x                         |
+| `input_tokens` daily sum                     | 298.9s          | 5.5s                      | 74ms                   | 4,047x                   | 74x                          |
+| `output_tokens` daily sum                    | 360.9s          | 5.4s                      | 66ms                   | 5,468x                   | 82x                          |
+| `cache_read_input_tokens` daily sum          | 459.0s          | 5.5s                      | 68ms                   | 6,770x                   | 81x                          |
+| `cache_creation_input_tokens` daily sum      | 434.4s          | 5.4s                      | 64ms                   | 6,788x                   | 84x                          |
+| `total_tokens` daily P50/P90/P99 time series | 56.2s           | 9.8s                      | 66ms                   | 853x                     | 149x                         |
+| `latency` daily P50/P90/P99 time series      | 9.4s            | 9.8s                      | 70ms                   | 135x                     | 140x                         |
+| `trace_count_by_status` daily count          | 6.1s            | 6.6s                      | 199ms                  | 31x                      | 33x                          |
+| `assessment_value` daily time series         | 105.8s          | 10.2s                     | 9.4s                   | 11.3x                    | 1.1x                         |
+| `assessment_distribution` on the Traces tab  | 10.0s           | 8.6s                      | 7.9s                   | 1.3x                     | 1.1x                         |
+| `time_range_trace_count`                     | 315ms           | 558ms                     | 67ms                   | 4.7x                     | 8.4x                         |
 
-These numbers are benchmark results from the same 10M-trace dataset using daily buckets for a
-32-day window. The upstream master column is a clean `upstream/master` checkout using the original
-EAV-backed schema. The two prototype columns use the optimized prototype with SQL rollups disabled
-and enabled, respectively. They are not guarantees for every deployment. Queries outside the
-rollup-supported shape, especially arbitrary filtered requests and non-daily exact percentile
-queries, still fall back to the raw path and remain the main residual cost.
+These numbers are benchmark results from the same 10M-trace dataset using daily buckets for a fixed
+32-day range from 2026-06-07 20:42:04 UTC through 2026-07-09 20:42:03 UTC. That range contains all
+10M traces and avoids a moving `last 30 days` window. The upstream master column is a clean
+`upstream/master` checkout using the original EAV-backed schema. The two prototype columns use the
+optimized prototype with SQL rollups disabled and enabled, respectively. The with-rollups column is
+a direct replay after removing the exact assessment-value rollup; exact-value distributions
+therefore use the raw PostgreSQL path. Its timings are medians from three repeated replays, whose
+total request times were 46.1s, 36.8s, and 36.0s. The exact assessment distribution had a 7.9s
+median, compared with 61ms when the removed high-cardinality rollup served it. The other filtered
+assessment requests remained on the raw path in both implementations and had medians close to the
+previous raw measurements. Background periodic jobs were disabled during the replay to avoid
+maintenance contention. These results are not guarantees for every deployment. Queries outside the
+rollup-supported shape, especially arbitrary filtered requests, allowed exact assessment-value
+distributions, and non-daily exact percentile queries, still fall back to the raw path and remain
+the main residual cost.
 
-## Drawbacks
+## Trade-offs
 
 - Additional columns and targeted indexes still increase storage, even after cleanup removes the
   duplicated hot EAV rows and session metadata.
 - Opt-in rollup tables add more storage and operational state. Deployments that enable them need a
   periodic job, freshness policy, and dirty-partition repair path for deletes.
+- Exact assessment-value distributions are not accelerated because their user-defined grouping
+  dimension is not reliably bounded. The server rejects distributions above the configured source
+  assessment-row cap, so the UI may omit global distribution summaries for large ranges.
 - Retargeting reads and writes, cleaning up duplicated rows, and supporting downgrade reconstruction
   increase implementation and migration complexity.
 - Assessment trace-time columns and rollup dimensions must stay consistent if later write paths
@@ -479,8 +520,10 @@ benchmarks justify it.
   drops.
 - Keep SQL daily rollups disabled by default. Operators can enable them after the denormalized
   fields are backfilled and the scheduler is running.
-- Enforce a 24-hour immutability window for analytic trace facts so periodic rollup jobs only need
-  to process closed days and delete-triggered dirty partitions.
+- The late-mutation restriction stays off until SQL daily rollups are enabled. When operators enable
+  rollups, enforce a configurable immutability window for analytic trace facts, controlled by
+  `MLFLOW_SQL_TRACE_ROLLUPS_FRESHNESS_SECONDS` and defaulting to 24 hours, so periodic rollup jobs
+  only need to process closed days and delete-triggered dirty partitions.
 - Downgrade should reconstruct removed metric, tag, and metadata rows before dropping the
   denormalized columns.
 
