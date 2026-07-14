@@ -29,7 +29,7 @@ distribution grain; that query stays on the raw path.
 | Request / metric path              | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master |
 | ---------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ |
 | Full UI replay, 20 serial requests | 1,891.9s        | 119.4s                    | 36.8s                  | 51.5x                    |
-| Cost over time by model            | 110.3s          | 21.3s                     | 56ms                   | 1,976x                   |
+| Cost over time by model            | 110.3s          | 21.3s                     | 56ms                   | 1,972x                   |
 | Cost breakdown by model            | 24.2s           | 14.4s                     | 66ms                   | 367x                     |
 | Token/latency daily time series    | 9.4-459.0s      | 5.4-9.8s                  | 64-74ms                | 135-6,788x               |
 | Time-range trace count             | 315ms           | 558ms                     | 67ms                   | 4.7x                     |
@@ -105,12 +105,17 @@ Add the following columns to `trace_info`:
 - `total_tokens`
 - `cache_read_input_tokens`
 - `cache_creation_input_tokens`
+- `input_cost`
+- `output_cost`
+- `total_cost`
 
 These values are derived from the write paths that already produce them:
 
 - `trace_name` from trace tags
 - `session_id` from trace metadata
 - token values from `TOKEN_USAGE`
+- trace-level cost values from trace `COST` metadata, falling back to sums of legacy span cost
+  metrics during backfill
 
 After migration, the five token fields above (`input_tokens`, `output_tokens`, `total_tokens`,
 `cache_read_input_tokens`, and `cache_creation_input_tokens`) become the single-source-of-truth
@@ -122,6 +127,10 @@ fields on `trace_info`. MLflow should:
 4. reconstruct those rows from `trace_info` on downgrade before dropping the denormalized columns
 
 Non-denormalized custom trace metrics remain in `trace_metrics`.
+
+The trace-level cost fields store authoritative trace totals for gateway and trace-level readers.
+They are distinct from span cost fields, which support model/provider analytics. Both should be
+backfilled and kept consistent by their respective write paths before legacy cost rows are removed.
 
 `trace_name` should also become the authoritative storage and query field on `trace_info` for
 analytics and trace-name filtering. MLflow should:
@@ -172,9 +181,9 @@ that column.
 
 ### 3. Denormalize assessment analytics onto `assessments`
 
-Keep `experiment_id` on `assessments`, but remove its foreign key constraint. Add the following
-columns:
+Add the following columns:
 
+- `experiment_id`, without a foreign key constraint
 - `trace_timestamp_ms`
 - `aggregate_value`
 
@@ -188,7 +197,7 @@ Assessment analytics should use `assessments` as the driving table. The hot quer
 `aggregate_value` materializes the numeric aggregation path up front so hot queries do not
 repeatedly cast or reinterpret assessment values. The difference in query shape looks like this:
 
-Before:
+Before (simplified; the existing coercion path also handles supported string values):
 
 ```sql
 SELECT a.name,
@@ -222,15 +231,14 @@ GROUP BY name;
 ```
 
 The optimized query aggregates directly on a numeric column. Without `aggregate_value`, the hot path
-has to repeatedly inspect `value`, apply `CASE` / `CAST` logic, and decide whether JSON booleans,
-numeric strings, and true numeric values are aggregateable on every query. The write path should
-populate `aggregate_value` only for assessment values that MLflow intentionally treats as numeric in
-analytics and leave it null otherwise.
+has to repeatedly inspect `value`, apply `CASE` / `CAST` logic, and decide whether JSON numbers,
+booleans, and the supported `"yes"` / `"no"` categorical strings are aggregateable on every query.
+The write path should populate `aggregate_value` only for those values and leave it null for other
+strings, including JSON numeric strings such as `"0.8"`, to preserve existing reader semantics.
 
-`experiment_id` should remain denormalized but the foreign key constraint removed. MLflow already
-knows the experiment from the owning trace when it writes the assessment, so storing that value does
-not require an extra integrity lookup on every insert. Skipping the foreign key keeps this
-high-volume write path cheaper while preserving the same logical relationship.
+MLflow already knows the experiment from the owning trace when it writes the assessment, so storing
+`experiment_id` does not require an extra integrity lookup on every insert. Skipping the foreign key
+keeps this high-volume write path cheaper while preserving the same logical relationship.
 
 After migration, MLflow should:
 
@@ -239,6 +247,8 @@ After migration, MLflow should:
    that analytics readers use today
 3. retarget assessment analytics to `assessments.experiment_id`, `assessments.trace_timestamp_ms`,
    and `assessments.aggregate_value`
+4. whenever an owning trace's experiment or timestamp changes, transactionally update those fields
+  on all existing assessments and invalidate both the old and new rollup partitions
 
 ### 4. Query execution changes
 
@@ -277,16 +287,18 @@ Add three daily rollup tables:
 | `sql_span_cost_daily_rollups`    | `(workspace, experiment_id, rollup_day, metric_name, model_name?, model_provider?)` | `model_name`, `model_provider` | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
 | `sql_assessment_daily_rollups`   | `(workspace, experiment_id, rollup_day, metric_name, assessment_name?)`             | `assessment_name`              | `sample_count`, `sum_value`, `min_value`, `max_value`                                        |
 
-Each row should also have a deterministic `rollup_key` primary key derived from the grain. Lookup
-indexes should start with `(workspace, experiment_id, rollup_day, metric_name)`, with secondary
-dimension indexes for the common dimension filters.
+Each row should also have a deterministic, fixed-length `rollup_key` primary key derived from a
+canonical type-tagged encoding of the grain. The encoding must distinguish null, empty string, and
+dimension presence before hashing so legal user dimension values cannot collide or exceed the key
+column length. Lookup indexes should start with `(workspace, experiment_id, rollup_day, metric_name)`,
+with secondary dimension indexes for the common dimension filters.
 
 The trace metric table stores one row per
 `(workspace, experiment_id, rollup_day, metric_name, dimension grain)`. For trace metrics it stores
 `sample_count`, `sum_value`, `min_value`, `max_value`, and daily `p50_value`, `p90_value`, and
 `p99_value`. Daily percentiles are not composable into coarser buckets, so readers should use these
-percentile columns only for daily bucketed `P50`, `P90`, and `P99` requests. Non-daily or unbucketed
-percentile requests should stay on the raw exact path.
+percentile columns only for single-experiment, complete UTC-day `P50`, `P90`, and `P99` requests.
+Multi-experiment, non-daily, or unbucketed percentile requests should stay on the raw exact path.
 
 The span-cost rollup table stores daily `input_cost`, `output_cost`, and `total_cost` aggregates by
 model and provider grains. The assessment rollup table stores daily assessment counts and numeric
@@ -294,26 +306,27 @@ aggregates over `aggregate_value`, both globally and by assessment name. It inte
 group by exact `assessment_value`: user-defined numeric scores, free-form strings, and structured
 values can be effectively unbounded, causing the rollup to approach the raw assessment table's
 cardinality. Queries grouped by exact assessment value therefore stay on the raw path. This does not
-affect numeric `AVG`, `SUM`, `MIN`, or `MAX` rollups over `aggregate_value`, which remain grouped by
-assessment name.
+affect numeric `AVG` rollups over `aggregate_value`, which remain grouped by assessment name.
 
-The rollup reader should use these tables for exact daily `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`
-queries and for supported daily trace metric percentiles. Rollup eligibility, fallback, and
-maintenance behavior should be centralized behind backend-specific planning code rather than
-scattered across individual query paths. Requests with arbitrary filters, exact assessment-value
-dimensions, unsupported dimensions, unsupported percentile values, or bucket widths other than one
-day should fall back to the raw query path.
+The rollup reader should use these tables for supported daily `COUNT`, `SUM`, and `AVG` queries and
+for supported daily trace metric percentiles. Rollup eligibility, fallback, and maintenance behavior
+should be centralized behind backend-specific planning code rather than scattered across individual
+query paths. Requests with arbitrary filters, exact assessment-value dimensions, unsupported
+dimensions or aggregations, unsupported percentile values, or bucket widths other than one day
+should fall back to the raw query path.
 
 The Traces table currently requests exact assessment-value counts when infinite pagination is
 enabled, and infinite pagination is enabled by default. To keep that raw fallback bounded, add a
 server setting named `MLFLOW_TRACE_METRICS_MAX_ASSESSMENT_VALUE_DISTRIBUTION_ROWS`, defaulting to
-`1000000`. It limits the number of source assessment rows that an exact-value distribution may
-aggregate; it does not truncate returned groups or counts.
+`1000000`. It limits the number of source assessment rows, after experiment, time, validity, and
+request filters are applied, that an exact-value distribution may aggregate; it does not truncate
+returned groups or counts.
 
 Exact assessment-value distribution queries should be guarded by that setting so the raw fallback
 remains bounded. This guard applies whether or not SQL rollups are enabled. If the guard blocks the
 query, the UI should treat the global distribution as unavailable rather than presenting partial
-page-local counts as complete results.
+page-local counts as complete results. The server should apply the same rule when the number of
+result groups exceeds the API response limit, unless full pagination is implemented.
 
 A periodic server job fills the tables. Each pass should:
 
@@ -325,6 +338,9 @@ A periodic server job fills the tables. Each pass should:
 4. skip partitions that already have a coverage marker row
 5. rebuild a bounded number of missing partitions per pass
 6. upsert rollup rows by deterministic rollup key
+
+Invalidated partitions should be tracked durably until a rebuild completes. This ensures deletes or
+moves can repair an old partition even when no source rows remain there.
 
 The freshness threshold keeps the job away from traces that are still being actively written.
 Because SQL rollups are disabled by default, this late-mutation restriction is also off by default.
@@ -395,8 +411,10 @@ CREATE INDEX idx_assessments_exp_name_valid
 -- then index into cost-bearing spans by trace id and span start time.
 CREATE INDEX idx_spans_cost_trace_time_cover
     ON spans (trace_id, start_time_unix_nano)
-    INCLUDE (total_cost, dimension_attributes)
-    WHERE total_cost IS NOT NULL;
+  INCLUDE (input_cost, output_cost, total_cost, dimension_attributes)
+  WHERE input_cost IS NOT NULL
+     OR output_cost IS NOT NULL
+     OR total_cost IS NOT NULL;
 
 -- Supports daily span-cost rollup build and repair jobs, which scan cost-bearing spans by
 -- experiment and day rather than by trace id.
@@ -427,11 +445,13 @@ CREATE INDEX idx_spans_cost_exp_time_cover
 - Batched deletes from `trace_metrics`, `span_metrics`, and trace metadata will create dead tuples.
   Rollout guidance should mention normal autovacuum follow-up or `VACUUM (ANALYZE)` after large
   cleanup operations.
-- If such an online pre-migration phase is implemented, it should remain strictly additive and must
-  not advance Alembic schema version state until the final cutover migration runs.
-- Downgrade should reconstruct token rows in `trace_metrics` from `trace_info`, cost rows in
-  `span_metrics` from `spans`, trace-name tag rows from `trace_info.trace_name`, and `TRACE_SESSION`
-  metadata rows from `trace_info.session_id` before dropping the denormalized columns.
+- If such an online pre-migration phase is implemented, either represent it as an explicit additive
+  Alembic revision or require the final migration to detect and validate pre-created columns and
+  indexes before continuing. The final migration must not blindly recreate those objects.
+- The migration that removes or permits cleanup of legacy EAV rows must reconstruct token rows in
+  `trace_metrics` from `trace_info`, cost rows in `span_metrics` from `spans`, trace-name tag rows
+  from `trace_info.trace_name`, and `TRACE_SESSION` metadata rows from `trace_info.session_id` before
+  an old version can be deployed or the denormalized columns can be dropped.
 - Use `Float(53)` / `DOUBLE PRECISION` for denormalized token, span-cost, and aggregate numeric
   columns to match the existing analytics numeric path.
 - In the Alembic migration code, `batch_op` should be used only for SQLite compatibility paths.
@@ -445,7 +465,7 @@ Representative measured improvements on the 10M trace / 30M span / 30M assessmen
 | Query / replay request                       | Upstream master | Prototype without rollups | Prototype with rollups | Rollup speedup vs master | Rollup speedup vs no rollups |
 | -------------------------------------------- | --------------- | ------------------------- | ---------------------- | ------------------------ | ---------------------------- |
 | Full 32-day UI replay, 20 requests           | 1,891.9s        | 119.4s                    | 36.8s                  | 51.5x                    | 3.2x                         |
-| `cost_over_time_by_model`                    | 110.3s          | 21.3s                     | 56ms                   | 1,976x                   | 382x                         |
+| `cost_over_time_by_model`                    | 110.3s          | 21.3s                     | 56ms                   | 1,972x                   | 381x                         |
 | `cost_breakdown_by_model`                    | 24.2s           | 14.4s                     | 66ms                   | 367x                     | 218x                         |
 | `input_tokens` daily sum                     | 298.9s          | 5.5s                      | 74ms                   | 4,047x                   | 74x                          |
 | `output_tokens` daily sum                    | 360.9s          | 5.4s                      | 66ms                   | 5,468x                   | 82x                          |
@@ -458,21 +478,12 @@ Representative measured improvements on the 10M trace / 30M span / 30M assessmen
 | `assessment_distribution` on the Traces tab  | 10.0s           | 8.6s                      | 7.9s                   | 1.3x                     | 1.1x                         |
 | `time_range_trace_count`                     | 315ms           | 558ms                     | 67ms                   | 4.7x                     | 8.4x                         |
 
-These numbers are benchmark results from the same 10M-trace dataset using daily buckets for a fixed
-32-day range from 2026-06-07 20:42:04 UTC through 2026-07-09 20:42:03 UTC. That range contains all
-10M traces and avoids a moving `last 30 days` window. The upstream master column is a clean
-`upstream/master` checkout using the original EAV-backed schema. The two prototype columns use the
-optimized prototype with SQL rollups disabled and enabled, respectively. The with-rollups column is
-a direct replay after removing the exact assessment-value rollup; exact-value distributions
-therefore use the raw PostgreSQL path. Its timings are medians from three repeated replays, whose
-total request times were 46.1s, 36.8s, and 36.0s. The exact assessment distribution had a 7.9s
-median, compared with 61ms when the removed high-cardinality rollup served it. The other filtered
-assessment requests remained on the raw path in both implementations and had medians close to the
-previous raw measurements. Background periodic jobs were disabled during the replay to avoid
-maintenance contention. These results are not guarantees for every deployment. Queries outside the
-rollup-supported shape, especially arbitrary filtered requests, allowed exact assessment-value
-distributions, and non-daily exact percentile queries, still fall back to the raw path and remain
-the main residual cost.
+These numbers are benchmark results from the same 10M-trace dataset using daily buckets over 32-day
+windows that contain all traces. The upstream master column uses the original EAV-backed schema; the
+prototype columns use the optimized schema with SQL rollups disabled and enabled. The with-rollups
+values are medians from three fixed-range replays after removing the exact assessment-value rollup,
+so exact-value distributions use raw PostgreSQL. The proposed source-row cap was disabled for this
+measurement.
 
 ## Trade-offs
 
@@ -514,7 +525,8 @@ benchmarks justify it.
 - Ship through a standard Alembic migration.
 - Optionally support a phased rollout where operators first run an additive pre-migration utility to
   add the new columns, create compatible indexes, and backfill data idempotently before the main
-  migration window.
+  migration window. The final migration must detect and validate those pre-created objects, or the
+  additive phase must be represented as its own Alembic revision.
 - Reserve downtime for the final cutover steps: schema-version advancement, final catch-up backfill,
   read/write retargeting, legacy-row cleanup, and any destructive DDL such as constraint or column
   drops.
@@ -524,8 +536,8 @@ benchmarks justify it.
   rollups, enforce a configurable immutability window for analytic trace facts, controlled by
   `MLFLOW_SQL_TRACE_ROLLUPS_FRESHNESS_SECONDS` and defaulting to 24 hours, so periodic rollup jobs
   only need to process closed days and delete-triggered dirty partitions.
-- Downgrade should reconstruct removed metric, tag, and metadata rows before dropping the
-  denormalized columns.
+- Before deploying an old reader, stop writes, reconstruct and validate removed metric, tag, and
+  metadata rows, and only then drop denormalized columns that the old version cannot use.
 
 ## Open question
 
