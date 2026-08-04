@@ -332,8 +332,8 @@ class IcebergTraceBackend(AbstractTraceBackend):
 
 #### Runtime Composition
 
-Tracking-store selection remains authoritative. MLflow constructs the configured tracking store as
-it does today, then optionally decorates it with a trace backend:
+Tracking-store selection remains authoritative for non-trace operations. MLflow constructs the
+configured tracking store as it does today, then optionally composes it with a trace backend:
 
 ```python
 tracking_store = tracking_store_registry.get_store(store_uri, artifact_uri)
@@ -346,7 +346,8 @@ store = TraceBackendTrackingStore(tracking_store, trace_backend)
 
 `TraceBackendTrackingStore` exposes the existing tracking-store API. It forwards methods in the
 `AbstractTraceBackend` contract to `trace_backend` and forwards every other method and property to
-the selected `tracking_store`.
+the selected `tracking_store`. It is the compatibility coordinator between the two interfaces. It
+does not require the trace backend to use the tracking store for trace persistence.
 
 ```python
 class TraceBackendTrackingStore:
@@ -406,8 +407,14 @@ third-party backends register a short identifier and a builder with the signatur
 `builder(tracking_store, backend_config) -> AbstractTraceBackend`. Third-party discovery uses a
 dedicated `mlflow.trace_backends` Python entry-point group.
 
+The tracking store is available to implementations as context, but using it is optional and is not a
+storage dependency in the `AbstractTraceBackend` contract. A backend may ignore it and own both hot
+and cold trace storage, as a separately operated ClickHouse backend might. The Iceberg backend
+instead uses it deliberately for its SQL hot tier, shared MLflow metadata, and publication
+coordination.
+
 The `MLFLOW_TRACE_BACKEND` environment variable or equivalent CLI flag selects the backend. When
-unset, the tracking store is unchanged. MLflow decorates the selected store at most once in its
+unset, the tracking store is unchanged. MLflow composes the selected store at most once in its
 shared construction path.
 
 Builders validate store compatibility and backend capabilities before serving requests. The Iceberg
@@ -847,9 +854,10 @@ back any mismatch before proceeding. Readers remain pinned to the published cut.
 A pass that fails before the SQL publication transaction commits does not advance the published cut
 or evict hot SQL rows. Reads continue from the previous published cut and the existing hot state.
 Payloads or files written by an interrupted operation but never referenced by a committed snapshot
-or locator may remain unreachable in storage. This is an accepted phase-one trade-off; a separate
-CLI tool can be introduced in the future for admins to run on a schedule to detect orphaned
-payloads.
+or locator may remain unreachable in storage. The initial implementation must include an
+administrative CLI tool that identifies archive payloads and warehouse files not reachable from the
+authoritative published cut or an archived locator. It reports candidates without deleting them by
+default and supports explicitly removing candidates older than a safety window.
 
 **Single writer:** One designated MLflow instance runs the Iceberg maintenance job like the archival
 job today. Within that job, trace and assessment publication, deletion-queue draining, compaction,
