@@ -71,6 +71,8 @@ tracking-store class hierarchy and provides the same extension point for future 
   store first.
 - A restore flow that moves archived traces back into the hot SQL store.
 - Warehouse backends beyond local filesystem and S3 for the initial implementation.
+- Cascading experiment deletion to archived traces. As today, `mlflow gc` does not delete archived
+  traces with their experiment.
 - Mutation of archived trace tags, spans, trace metadata, payloads, or assessments. Assessments
   remain mutable in SQL until they are independently archived, and archived traces and assessments
   can still be deleted asynchronously.
@@ -153,13 +155,13 @@ The extracted contract covers the trace data plane:
 
 - trace creation, span logging, and trace retrieval
 - metadata and full-payload batch retrieval
-- trace search, deterministic pagination, completed-session discovery, metrics, and correlation
+- trace search, deterministic pagination, completed-session discovery, and metrics
 - trace-tag and assessment reads and mutations
 - trace deletion and archival
-- trace-to-run and prompt-to-trace associations because those operations validate trace existence
 
-Experiment, run, workspace, model-registry, artifact, and trace-archival configuration resolution
-remain tracking-store responsibilities.
+Experiment, run, workspace, model-registry, artifact, association persistence, and trace-archival
+configuration remain tracking-store responsibilities. For trace associations, the coordinator
+validates source traces through the backend before the tracking store persists them.
 
 The following classes illustrate the ownership model. The `AbstractTraceBackend` signatures define
 the complete public plugin contract, although its implementation may use internal mixins. The
@@ -212,14 +214,6 @@ class AbstractTraceBackend(ABC):
         long_retention_allowlist: set[str] | list[str] | None = None,
         max_traces_per_pass: int | None = None,
     ) -> int:
-        raise MlflowNotImplementedException()
-
-    def get_online_trace_details(
-        self,
-        trace_id: str,
-        source_inference_table: str,
-        source_databricks_request_id: str,
-    ) -> str:
         raise MlflowNotImplementedException()
 
     def search_traces(
@@ -292,36 +286,50 @@ class AbstractTraceBackend(ABC):
     ) -> list[Span]:
         raise MlflowNotImplementedException()
 
-    def link_traces_to_run(self, trace_ids: list[str], run_id: str) -> None:
-        raise MlflowNotImplementedException()
-
-    def unlink_traces_from_run(self, trace_ids: list[str], run_id: str) -> None:
-        raise MlflowNotImplementedException()
-
-    def link_prompts_to_trace(
-        self, trace_id: str, prompt_versions: list[PromptVersion]
-    ) -> None:
-        raise MlflowNotImplementedException()
-
-    def calculate_trace_filter_correlation(
-        self,
-        experiment_ids: list[str],
-        filter_string1: str,
-        filter_string2: str,
-        base_filter: str | None = None,
-    ) -> TraceFilterCorrelationResult:
-        raise MlflowNotImplementedException()
-
-
 class AbstractStore(AbstractTraceBackend, GatewayStoreMixin):
     """Tracking store and the default trace backend for compatibility."""
+
+
+class PrevalidatedTraceAssociationStoreMixin:
+  """Persists associations for traces validated by a separate backend.
+
+  Ordinary tracking-store association methods may validate source traces through
+  the store's own get_trace_info(), but trace identity belongs to the selected
+  backend and the tracking store must not call into that backend. TrackingStoreCoordinator
+  therefore validates each source trace and its workspace access through the backend
+  before calling these methods.
+
+  Implementations must not repeat source-trace validation. They must still validate
+  destination entities, enforce authorization, and persist the generic associations.
+  Keeping this optional capability separate from AbstractStore preserves compatibility
+  for stores used without a separate backend; unsupported combinations fail at startup.
+  """
+
+  def link_prevalidated_traces_to_run(
+    self, trace_ids: list[str], run_id: str
+  ) -> None:
+    raise NotImplementedError()
+
+  def unlink_prevalidated_traces_from_run(
+    self, trace_ids: list[str], run_id: str
+  ) -> None:
+    raise NotImplementedError()
+
+  def link_prompts_to_prevalidated_trace(
+    self, trace_id: str, prompt_versions: list[PromptVersion]
+  ) -> None:
+    raise NotImplementedError()
+
+
+class SqlAlchemyStore(PrevalidatedTraceAssociationStoreMixin, AbstractStore):
+  """Persists prevalidated associations without requiring hot trace rows."""
 
 
 class IcebergTraceBackend(AbstractTraceBackend):
     """Hybrid SQL/Iceberg implementation described by this RFC."""
 
     def __init__(self, tracking_store: AbstractStore):
-        # This is the raw, undecorated store. Calls cannot recurse through this backend.
+        # This is the raw store, not the coordinator, so calls cannot recurse.
         self.tracking_store = tracking_store
 
     def start_trace(self, trace_info: TraceInfo) -> TraceInfo:
@@ -333,24 +341,32 @@ class IcebergTraceBackend(AbstractTraceBackend):
 #### Runtime Composition
 
 Tracking-store selection remains authoritative for non-trace operations. MLflow constructs the
-configured tracking store as it does today, then optionally composes it with a trace backend:
+configured tracking store as it does today, then optionally composes it with a trace backend in a
+higher-level coordinator:
 
 ```python
 tracking_store = tracking_store_registry.get_store(store_uri, artifact_uri)
-trace_backend = trace_backend_registry.get_backend(
-    name=configured_trace_backend,
+if configured_trace_backend_kind:
+  if not isinstance(tracking_store, PrevalidatedTraceAssociationStoreMixin):
+    raise MlflowException(
+      f"Tracking store {type(tracking_store).__name__} does not support "
+      "prevalidated trace associations required by a separate trace backend."
+    )
+  trace_backend = trace_backend_registry.get_backend(
+    kind=configured_trace_backend_kind,
     tracking_store=tracking_store,
-)
-store = TraceBackendTrackingStore(tracking_store, trace_backend)
+  )
+  store = TrackingStoreCoordinator(tracking_store, trace_backend)
+else:
+  store = tracking_store
 ```
 
-`TraceBackendTrackingStore` exposes the existing tracking-store API. It forwards methods in the
-`AbstractTraceBackend` contract to `trace_backend` and forwards every other method and property to
-the selected `tracking_store`. It is the compatibility coordinator between the two interfaces. It
-does not require the trace backend to use the tracking store for trace persistence.
+`TrackingStoreCoordinator` preserves the tracking-store API, routing trace-contract methods to the
+backend and everything else to the tracking store. The store remains backend-unaware. Iceberg uses
+the raw store as its SQL hot tier. A self-contained backend may ignore it.
 
 ```python
-class TraceBackendTrackingStore:
+class TrackingStoreCoordinator:
   def __init__(
     self,
     tracking_store: AbstractStore,
@@ -388,39 +404,56 @@ class TraceBackendTrackingStore:
 
   # Every other AbstractTraceBackend method is delegated explicitly in the same way.
 
+  def link_traces_to_run(self, trace_ids: list[str], run_id: str) -> None:
+    self._validate_traces(trace_ids)
+    self._tracking_store.link_prevalidated_traces_to_run(trace_ids, run_id)
+
+  def unlink_traces_from_run(self, trace_ids: list[str], run_id: str) -> None:
+    self._validate_traces(trace_ids)
+    self._tracking_store.unlink_prevalidated_traces_from_run(trace_ids, run_id)
+
+  def link_prompts_to_trace(
+    self, trace_id: str, prompt_versions: list[PromptVersion]
+  ) -> None:
+    self._validate_traces([trace_id])
+    self._tracking_store.link_prompts_to_prevalidated_trace(trace_id, prompt_versions)
+
+  def _validate_traces(self, trace_ids: list[str]) -> None:
+    for trace_id in trace_ids:
+      self._trace_backend.get_trace_info(trace_id)
+
   def __getattr__(self, name: str):
     # Only the non-trace tracking-store surface reaches this fallback.
     return getattr(self._tracking_store, name)
 ```
 
-Trace capabilities come from the backend; general capabilities come from the tracking store. The
-adapter rejects incompatible combinations. Explicit trace delegation keeps this boundary auditable
-and ensures that new trace operations require a compatibility decision.
-
-Association methods remain in the trace contract even when their rows stay in the tracking store,
-because they may need to validate a trace owned by the backend.
+Trace capabilities come from the backend; general capabilities come from the tracking store.
+Association methods are explicit because the backend validates source traces while the tracking
+store validates destinations, enforces authorization, and persists the relationships. Explicit
+delegation also makes new trace operations require a compatibility decision.
 
 #### Discovery and Configuration
 
 MLflow adds a `TraceBackendRegistry` following its existing store-registry pattern. Built-in and
-third-party backends register a short identifier and a builder with the signature
+third-party backends register a short `kind` and a builder with the signature
 `builder(tracking_store, backend_config) -> AbstractTraceBackend`. Third-party discovery uses a
-dedicated `mlflow.trace_backends` Python entry-point group.
-
-The tracking store is available to implementations as context, but using it is optional and is not a
-storage dependency in the `AbstractTraceBackend` contract. A backend may ignore it and own both hot
-and cold trace storage, as a separately operated ClickHouse backend might. The Iceberg backend
-instead uses it deliberately for its SQL hot tier, shared MLflow metadata, and publication
-coordination.
+dedicated `mlflow.trace_backends` Python entry-point group. The tracking store is available as
+optional context: Iceberg uses it for its SQL hot tier and shared metadata, while a separately
+operated ClickHouse backend could ignore it for trace persistence.
 
 The `MLFLOW_TRACE_BACKEND` environment variable or equivalent CLI flag selects the backend. When
-unset, the tracking store is unchanged. MLflow composes the selected store at most once in its
-shared construction path.
+unset, the tracking store remains unchanged and serves as the trace backend. The configured value
+identifies only the backend kind; each provider reads connection and storage settings from
+environment variables or a provider-owned configuration file.
 
-Builders validate store compatibility and backend capabilities before serving requests. The Iceberg
-backend requires a SQLAlchemy store, implements a workspace-aware hot/cold split and server-owned
-archival, supports asynchronous deletion, and rejects other archived mutations. Backends may also
-provide schema validation and migration, warming, health, and shutdown hooks.
+Builders validate store compatibility and backend capabilities before serving requests. A separate
+trace backend requires the selected tracking store to implement
+`PrevalidatedTraceAssociationStoreMixin`; unsupported combinations fail at startup, while stores
+used without a separate backend remain unchanged. `SqlAlchemyStore` implements the mixin, and
+`WorkspaceAwareSqlAlchemyStore` inherits it while retaining destination-run and workspace isolation
+checks. The Iceberg backend additionally requires a SQLAlchemy store for shared database state. It
+implements the workspace-aware hot/cold split and server-owned archival, supports asynchronous
+deletion, and rejects other archived mutations.
 
 ### Iceberg Implementation
 
@@ -442,11 +475,13 @@ The Iceberg backend implements a hybrid storage model.
 
 ```mermaid
 flowchart TD
-ingest["Trace ingest"] --> adapter["Tracking store adapter"]
-readReq["Read/search request"] --> adapter
+ingest["Trace ingest"] --> coordinator["Tracking store coordinator"]
+readReq["Read/search request"] --> coordinator
 maintenance["Archival maintenance"] --> backend["IcebergTraceBackend"]
-adapter --> backend
-backend -->|hot reads and writes| hotSql["SQL hot trace rows"]
+coordinator --> backend
+coordinator --> trackingStore["Tracking store"]
+backend -->|hot reads and writes| trackingStore
+trackingStore -->|persist| hotSql["SQL hot trace rows"]
 backend -->|locate traces and publish cut| coordination["SQL locators and publication state"]
 backend -->|upload and fetch| payload["Archive payloads (.pb)"]
 backend -->|publish projections| iceberg["Iceberg projection tables"]
@@ -801,7 +836,13 @@ payload without copying it.
 
 #### Assessment Archival and Archived Entity Deletion
 
-**Assessment archival:** Assessments have their own hot/cold lifecycle:
+**Assessment archival:** Assessments have their own hot/cold lifecycle to support delayed workflows
+such as human review queues, offline evaluation, incident analysis, and applying new scorers to
+historical traces. These assessments may be created or updated days or weeks after the trace becomes
+eligible for archival. Coupling the lifecycles would either reject these assessments or require a
+synchronous write to the slower cold tier.
+
+The independent lifecycle has three states:
 
 - A hot trace has only SQL assessments.
 - An archived trace may have recent assessments in SQL and older assessments in Iceberg.
@@ -878,18 +919,18 @@ necessarily return index space or keep planner statistics representative, so sus
 leave the hot database with bloated trace indexes and progressively worse query plans even though
 its logical row count remains bounded.
 
-MLflow should therefore add a separate SQL maintenance job. Archival records the affected tables and
-the number of archived traces and assessments since the last maintenance pass. Once that count
-reaches `MLFLOW_TRACE_SQL_MAINTENANCE_ARCHIVE_THRESHOLD`, the next scheduled run maintains the
-affected tables. The threshold defaults to `5,000,000`. The pass runs `REINDEX CONCURRENTLY` and
-`VACUUM (ANALYZE)` on PostgreSQL, `OPTIMIZE TABLE` on MySQL, `VACUUM` and `PRAGMA optimize` on
-SQLite, and online index rebuilds plus statistics updates on SQL Server.
+SQL maintenance is an opt-in phase of `mlflow gc`, not a separate job. Archival records affected
+tables and the number of rows archived since the last pass. Once that count reaches
+`MLFLOW_TRACE_SQL_MAINTENANCE_ARCHIVE_THRESHOLD` (default `5,000,000`), the next GC invocation with
+maintenance enabled runs `REINDEX CONCURRENTLY` and `VACUUM (ANALYZE)` on PostgreSQL,
+`OPTIMIZE TABLE` on MySQL, `VACUUM` and `PRAGMA optimize` on SQLite, and online index rebuilds plus
+statistics updates on SQL Server.
 
-Maintenance runs one table at a time, outside the archival publication transaction, and reports its
-duration and failures. Because these operations can consume substantial I/O or briefly block
-foreground work, `MLFLOW_TRACE_SQL_MAINTENANCE_CRON` has no default and must be configured to enable
-the job. When trace archival is enabled without this schedule, MLflow logs a startup warning that
-SQL maintenance is disabled.
+Maintenance runs one table at a time outside the archival transaction and emits structured start,
+completion, and failure logs with the table, operation, duration, and triggering row count. Because
+it can consume substantial I/O or briefly block foreground work,
+`MLFLOW_TRACE_SQL_MAINTENANCE_ENABLED` defaults to `false`. MLflow warns at startup when the trace
+backend uses a SQLAlchemy hot store, trace archival is enabled, and SQL maintenance is disabled.
 
 #### Read Path
 
@@ -947,16 +988,16 @@ The feature is opt-in. The proposed environment variables are:
 
 - Backend and storage: `MLFLOW_TRACE_BACKEND=iceberg`, `MLFLOW_ICEBERG_WAREHOUSE_URI`, and the
   existing `MLFLOW_TRACE_ARCHIVAL_CONFIG`. The migration command uses the same configuration.
-- SQL maintenance: `MLFLOW_TRACE_SQL_MAINTENANCE_ARCHIVE_THRESHOLD`, defaulting to `5,000,000`, and
-  `MLFLOW_TRACE_SQL_MAINTENANCE_CRON`, unset by default.
+- SQL maintenance: `MLFLOW_TRACE_SQL_MAINTENANCE_ENABLED`, defaulting to `false`, and
+  `MLFLOW_TRACE_SQL_MAINTENANCE_ARCHIVE_THRESHOLD`, defaulting to `5,000,000`.
 - Exact distributions: `MLFLOW_ICEBERG_TRACE_ASSESSMENT_DISTRIBUTION_MAX_TRACES`, unset by default;
   setting a positive value caps exact assessment distributions at that many matching traces across
   SQL and Iceberg.
 
 DuckDB sizing, archival concurrency, batch sizes, snapshot retention, and maintenance batch limits
 use conservative internal defaults. They should become operator settings only if production
-experience demonstrates a need. SQL maintenance settings apply only to the designated maintenance
-instance.
+experience demonstrates a need. SQL maintenance settings apply only to the designated `mlflow gc`
+invocation.
 
 ## Benchmarks
 
