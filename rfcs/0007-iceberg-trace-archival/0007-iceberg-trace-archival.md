@@ -461,6 +461,11 @@ deletion, and rejects other archived mutations.
 transactionally updates hot trace rows, archived locators, and publication state. Its builder
 rejects other tracking stores at startup.
 
+PyIceberg and DuckDB are optional dependencies installed through an `iceberg` extra rather than base
+MLflow requirements. Selecting the Iceberg backend without that extra fails at startup with an
+actionable installation error. MLflow declares bounded supported version ranges and tests both the
+minimum version and the latest release satisfying each range in CI.
+
 Cold query planning must remain independent of DuckDB. The planner produces an internal plan that
 describes Iceberg scans, projected columns, predicates, ordering, limits, the pinned published cut,
 and any Arrow inputs. A cold-query executor translates that plan for an engine and returns typed
@@ -535,7 +540,10 @@ The catalog uses these internal SQL tables:
 
 These come from PyIceberg's SQL catalog model and are created through MLflow Alembic migrations so
 they can be managed like other MLflow schema changes. This means literally copying the SQLAlchemy
-schema into MLflow and generating an Alembic migration.
+schema into MLflow and generating an Alembic migration. CI compares MLflow's copied definitions with
+PyIceberg's models at both ends of the supported PyIceberg version range declared by MLflow. A
+mismatch blocks dependency updates until MLflow adds any required migration and updates the copied
+definitions.
 
 The backend also adds three MLflow-owned coordination tables:
 
