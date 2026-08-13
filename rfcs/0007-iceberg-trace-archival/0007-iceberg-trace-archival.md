@@ -340,9 +340,9 @@ class IcebergTraceBackend(AbstractTraceBackend):
 
 #### Runtime Composition
 
-Tracking-store selection remains authoritative for non-trace operations. MLflow constructs the
-configured tracking store as it does today, then optionally composes it with a trace backend in a
-higher-level coordinator:
+Tracking-store selection remains authoritative for non-trace operations. On the server, MLflow
+constructs the configured tracking store as it does today, then optionally composes it with a trace
+backend in a higher-level coordinator:
 
 ```python
 tracking_store = tracking_store_registry.get_store(store_uri, artifact_uri)
@@ -363,7 +363,9 @@ else:
 
 `TrackingStoreCoordinator` preserves the tracking-store API, routing trace-contract methods to the
 backend and everything else to the tracking store. The store remains backend-unaware. Iceberg uses
-the raw store as its SQL hot tier. A self-contained backend may ignore it.
+the raw store as its SQL hot tier. Composing above the store avoids a subclass for every backend and
+store combination while letting a self-contained backend ignore the raw store and scale
+independently.
 
 ```python
 class TrackingStoreCoordinator:
@@ -430,7 +432,8 @@ class TrackingStoreCoordinator:
 Trace capabilities come from the backend; general capabilities come from the tracking store.
 Association methods are explicit because the backend validates source traces while the tracking
 store validates destinations, enforces authorization, and persists the relationships. Explicit
-delegation also makes new trace operations require a compatibility decision.
+delegation also makes new trace operations require a compatibility decision. The trace backend
+encapsulates storage-specific routing such as SQL/Iceberg fan-out and result merging.
 
 #### Discovery and Configuration
 
@@ -444,7 +447,10 @@ operated ClickHouse backend could ignore it for trace persistence.
 The `MLFLOW_TRACE_BACKEND` environment variable or equivalent CLI flag selects the backend. When
 unset, the tracking store remains unchanged and serves as the trace backend. The configured value
 identifies only the backend kind; each provider reads connection and storage settings from
-environment variables or a provider-owned configuration file.
+environment variables or a provider-owned configuration file. Backend selection is server-side
+configuration. `RestStore` remains a transport client, and attempting to compose it with a trace
+backend fails during store construction. Remote clients send all trace requests to the server
+selected by the tracking URI.
 
 Builders validate store compatibility and backend capabilities before serving requests. A separate
 trace backend requires the selected tracking store to implement
@@ -942,12 +948,15 @@ backend uses a SQLAlchemy hot store, trace archival is enabled, and SQL maintena
 
 #### Read Path
 
-Point reads check the hot SQL store first. If the trace is archived, `archived_trace_locators`
-routes the read to its Iceberg partition and payload. Archived traces merge recent SQL assessments
-with older Iceberg assessments, with SQL taking precedence for the same `assessment_id`.
+Point and batch reads check the hot SQL store first. For archived traces,
+`archived_trace_locators` routes each read to its Iceberg partition and payload. The Iceberg backend
+merges recent SQL assessments with older Iceberg assessments, with SQL taking precedence for the
+same `assessment_id`.
 
 Search queries merge hot SQL and cold Iceberg results while preserving MLflow ordering and page
 tokens. Pagination crosses the handoff boundary without returning duplicates or skipping traces.
+Reads skip assessment storage unless assessments are requested, filtered, or aggregated, and skip
+Iceberg when the trace range is fully hot.
 
 Metric queries merge SQL and Iceberg aggregates. When rollups are complete and the affected
 partitions have neither pending deletions nor SQL assessments on archived traces, the query reads
