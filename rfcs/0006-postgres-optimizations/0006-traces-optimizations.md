@@ -13,7 +13,7 @@ PostgreSQL-specific query planning and indexes, by:
 
 - denormalizing hot analytics fields onto `trace_info`, `spans`, and `assessments`
 - rewriting hot queries to read those columns directly
-- adding targeted indexes for assessment and span-cost workloads
+- adding targeted indexes for session, assessment, and span-cost workloads
 - adding SQL daily rollup tables whose population and use are opt-in
 - cleaning up duplicated metric, tag, and metadata rows once the denormalized columns become
   authoritative
@@ -173,8 +173,7 @@ Model name and provider are fixed, first-class dimensions of span-cost analytics
 stored as nullable columns rather than in the existing `dimension_attributes` JSON column. Span cost
 aggregation and grouping should read these columns directly. Span costs remain authoritative for
 model/provider breakdowns, while gateway budget accounting should read the authoritative trace-level
-total from `trace_info.total_cost` so each gateway trace is counted once without a span join. A
-nullable `dimension_attributes_state` marker preserves the legacy JSON representation on downgrade.
+total from `trace_info.total_cost` so each gateway trace is counted once without a span join.
 
 After migration, MLflow should:
 
@@ -182,7 +181,7 @@ After migration, MLflow should:
 2. write cost, model, and provider values directly to the new columns
 3. retarget raw analytics and rollup construction to the new columns
 4. delete existing cost rows from `span_metrics` in batches and drop `dimension_attributes`
-5. reconstruct cost rows and `dimension_attributes` from the denormalized columns on downgrade
+5. reconstruct cost rows and `dimension_attributes` from non-null denormalized columns on downgrade
    before dropping those columns
 
 ### 3. Denormalize assessment analytics onto `assessments`
@@ -469,6 +468,10 @@ MySQL, MSSQL, and SQLite should keep the same leading key order and drop unsuppo
 partial-index syntax rather than treating these indexes as PostgreSQL-only objects.
 
 ```sql
+-- Supports session filtering, session-count aggregation, and completed-session queries.
+CREATE INDEX index_trace_info_experiment_id_session_id
+    ON trace_info (experiment_id, session_id);
+
 -- Drives assessment time-series queries by experiment and trace timestamp without joining
 -- through trace_info.
 CREATE INDEX idx_assessments_exp_trace_ts
@@ -595,7 +598,6 @@ require normal autovacuum follow-up or `VACUUM (ANALYZE)`.
 Downgrade procedure: stop all writers; reconstruct and validate reserved token metrics and
 `TOKEN_USAGE` metadata, trace `COST` metadata, span cost metrics, trace-name tags, session metadata,
 and model/provider `dimension_attributes`; then run the schema downgrade and deploy the old version.
-Reconstructed dimension JSON must preserve null-versus-empty semantics.
 
 ## Open questions
 
