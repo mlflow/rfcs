@@ -8,7 +8,7 @@ rfc_pr:
 
 | Author(s)              | [Patrick Koss](https://github.com/PatrickKoss)     |
 | :--------------------- | :------------------------------------------------- |
-| **Date Last Modified** | 2026-08-05                                         |
+| **Date Last Modified** | 2026-08-14                                         |
 
 <!-- markdownlint-disable MD025 -->
 
@@ -39,7 +39,10 @@ keeping the expensive, churning knowledge in core:
 - **`AuthorizationBackend`** — owns the allow/deny decision given an `Identity`
   and a **normalized** `AuthorizationRequirement`.
 
-Exactly one of each is configured per server.
+Exactly one of each is configured per server. Alongside the contracts, the
+separate basic-auth app is soft-deprecated: auth becomes an optional stage of the
+main Flask and FastAPI apps, and today's basic auth becomes the built-in
+`basic-auth` provider plus `database` backend.
 
 The load-bearing design rule: **core retains sole ownership of the
 route → requirement mapping**, expressed as a single authoritative
@@ -68,31 +71,32 @@ same outcome for the same input.**
 
 # Basic example
 
-The operator-facing change is a small config edit. The shape of the config
-mirrors the existing basic-auth INI (`mlflow/server/auth/basic_auth.ini`).
+Auth becomes a property of the ordinary MLflow server rather than a separate
+app. The operator names the plugins they want; if they name none, the server
+runs with no auth, exactly as an unauthenticated `mlflow server` does today.
 
-**Default — identical to today's behavior.** An operator who upgrades and
-changes nothing gets exactly the current basic-auth + database RBAC:
+**Turning on today's behavior.** The built-in plugins reproduce the current
+basic-auth + database RBAC:
 
-```ini
-[mlflow]
-default_permission = READ
-database_uri = sqlite:///auth.db
-admin_username = admin
-admin_password = password
-
-authn_provider = basic-auth   # the authn half of today's basic auth
-authz_backend  = database     # the RFC 0005 role resolver, wrapped as a backend
+```bash
+mlflow server \
+  --authn-provider basic-auth \
+  --authz-backend database
 ```
 
 An external deployment selects different plugins by name. The plugins configure
-themselves — MLflow's INI carries only the *selection*:
+themselves; MLflow carries only the *selection*:
 
-```ini
-[mlflow]
-authn_provider = my-oidc
-authz_backend  = my-policy-engine
+```bash
+export MLFLOW_AUTHN_PROVIDER=my-oidc
+export MLFLOW_AUTHZ_BACKEND=my-policy-engine
+mlflow server
 ```
+
+The basic-auth INI (`mlflow/server/auth/basic_auth.ini`) does not gain any
+plugin-selection keys. After this refactor it is simply the `basic-auth`
+plugin's own config file, on the same footing as whatever config mechanism any
+other plugin chooses.
 
 **The plugin author's whole job.** An authorization plugin implements one
 required method, and it never learns MLflow's routing:
@@ -174,6 +178,16 @@ and prompt-optimization jobs are all recent additions with their own validators.
 That duplication is the single hardest thing to maintain in a plugin approach,
 and it is exactly what this RFC is designed to prevent.
 
+**Underlying all three: auth is a wrapper app, not part of the server.** All of
+the above lives in `mlflow/server/auth/__init__.py`, a separate app selected with
+`--app-name basic-auth` that wraps the tracking server. Auth is therefore
+something bolted onto MLflow rather than a stage of its request path, which is
+why the FastAPI half has to be threaded back in through middleware and a
+synthetic request context in the first place. Making auth pluggable while leaving
+it in a wrapper would mean every plugin inherits that shape. So this RFC also
+moves the auth stage into the main Flask and FastAPI apps and soft-deprecates the
+wrapper — see "Configuration and where auth lives in the server."
+
 RFC 0005 deferred the "pluggable authorization resolver" and flagged the small
 resolver interface as a known hook-in point for "a future extension RFC." This
 is that RFC.
@@ -192,9 +206,10 @@ is that RFC.
 - **Multiple simultaneous providers.** Exactly one `AuthenticationProvider` and
   one `AuthorizationBackend` per server. See "Alternatives" for why a chain was
   dropped.
-- **Plugin configuration format.** MLflow's INI selects plugins by name. How a
-  plugin reads its own settings (env vars, its own file, a secret mount) is the
-  plugin's business.
+- **Plugin configuration format.** MLflow selects plugins by name, via a server
+  flag or env var. How a plugin reads its own settings (env vars, its own file, a
+  secret mount) is the plugin's business — including basic auth, whose INI becomes
+  plugin-internal.
 - **Plugin-side caching.** Each plugin owns its own cache, TTL, and invalidation
   strategy. Core does not wrap backends in a decision cache.
 - **Changing RFC 0005's role storage or the MLflow role model.** Roles remain a
@@ -278,11 +293,26 @@ class IdentityStore(Protocol):
     def upsert(self, identity: Identity, provider: str) -> None: ...
 ```
 
-This is **a new table, separate from basic auth's `users` table.** Basic auth
-sits behind the same plugin boundary as any other provider, so core must be
-agnostic to its storage. Mixing external identities into the basic-auth users
-table would conflate "principal MLflow has seen" with "local account with a
-password hash," and would make basic auth's schema a de facto core dependency.
+This is **a new table owned by core, and every provider's principals land in
+it — including basic auth's.** Basic auth sits behind the same plugin boundary as
+any other provider, so core cannot read that plugin's `users` table; but core
+does need one reliable table it can always query for "who has this server
+authenticated." Giving basic auth a private path would leave core with two
+lookups and a conditional, which is exactly the inconsistency this table exists
+to remove.
+
+So the `basic-auth` provider goes through the same `upsert` on every successful
+login as any other provider, and existing basic-auth users are backfilled into
+the identity table by a migration when the server first starts on the new
+schema. Basic auth keeps its own `users` table, now narrowed to what only it
+needs: the credential material (password hash) and its local `is_admin` flag.
+
+This duplicates the username across two tables, which is a real cost. It is
+accepted deliberately: the alternative is core branching on which provider is
+configured every time it needs to name a person, and a "reliable table core can
+always query" that is only reliable for non-default deployments is not reliable.
+The identity table is the sole core-facing source; the basic-auth table becomes
+plugin-internal credential storage.
 
 The record exists because several MLflow features need to name a person who is
 not necessarily a local account:
@@ -296,7 +326,11 @@ not necessarily a local account:
 
 Providers never write to this table; core does. The upsert is idempotent and
 attribute-refreshing, so a display name changed at the IdP propagates on next
-login.
+login. For v1 the record is read-only from the provider's point of view: MLflow
+admins cannot edit a display name locally or mark a principal disabled
+independently of the IdP. That would turn the record from a projection into a
+store with its own conflict-resolution rules, which is a larger change than this
+RFC needs.
 
 #### Trusting identity over request payload
 
@@ -304,9 +338,9 @@ Several MLflow write paths currently take user attribution from the request body
 — most visibly the `mlflow.user` tag on run creation. With a resolved `Identity`
 in hand, core should **overwrite** those attributions from the authenticated
 principal rather than trusting a client-supplied value, whenever an auth provider
-is active. Kubeflow's MLflow auth integration already does this downstream; it
-belongs in core once identity is a first-class object. The seam exists
-(`g.mlflow_authenticated_user`); this RFC makes it authoritative.
+is active. A client-settable attribution field is not attribution; it is a
+suggestion. The seam already exists (`g.mlflow_authenticated_user`); this RFC
+makes it authoritative.
 
 ### AuthenticationProvider
 
@@ -322,24 +356,20 @@ class AuthChallenge:
 
 
 @dataclass(frozen=True)
-class AuthenticationResult:
-    """Exactly one outcome per provider call."""
-    kind: Literal["authenticated", "challenge"]
-    identity: Identity | None = None
-    challenge: AuthChallenge | None = None
+class Authenticated:
+    """The provider identified the caller."""
+    identity: Identity
 
-    @property
-    def is_authenticated(self) -> bool:
-        return self.kind == "authenticated"
 
-    # Factories the *plugin* calls to build its return value.
-    @staticmethod
-    def success(identity: Identity) -> "AuthenticationResult":
-        return AuthenticationResult("authenticated", identity=identity)
+@dataclass(frozen=True)
+class ChallengeRequired:
+    """The provider could not identify the caller and wants the client to
+    authenticate. Core turns the challenge into a response."""
+    challenge: AuthChallenge
 
-    @staticmethod
-    def needs_challenge(challenge: AuthChallenge) -> "AuthenticationResult":
-        return AuthenticationResult("challenge", challenge=challenge)
+
+# Exactly one outcome per provider call.
+AuthenticationResult = Authenticated | ChallengeRequired
 
 
 class AuthenticationProvider(Protocol):
@@ -348,9 +378,14 @@ class AuthenticationProvider(Protocol):
     def authenticate(self, request: "AuthRequest") -> AuthenticationResult: ...
 ```
 
+Two classes rather than one class with a `kind` discriminator: each result type
+carries exactly the fields it needs, and neither has an optional field that is
+really mandatory-in-one-case. There is no `Authenticated` without an identity and
+no `ChallengeRequired` without a challenge, and a type checker enforces that
+rather than a docstring. Core dispatches with `isinstance`, or with a `match`
+statement whose exhaustiveness the checker verifies.
+
 `AuthenticationProvider.authenticate` is **the only method core calls.**
-`AuthenticationResult.success(...)` / `.needs_challenge(...)` are constructors
-the plugin uses to build what it returns; core never calls them.
 
 ### AuthRequest: one interface, both frameworks
 
@@ -395,7 +430,6 @@ class RequestContext:
     operation: str               # the OPERATION_REGISTRY key, e.g. "GetRun", "graphql.mlflowGetRun"
     method: str                  # HTTP method
     path: str                    # request path
-    request_id: str              # per-request correlation id, also emitted in audit logs
     surface: Literal["rest", "graphql", "gateway"]
 
 
@@ -409,9 +443,6 @@ class AuthorizationQuery:
 @dataclass(frozen=True)
 class Decision:
     allowed: bool
-    # READ/USE/EDIT/MANAGE/NO_PERMISSIONS. None when the backend does not model
-    # permission levels (a boolean-only system).
-    effective_permission: str | None = None
     # True/False when the backend has an administrator concept and can answer;
     # None when it has no such concept, in which case core falls back to its own
     # super-admin rule.
@@ -468,7 +499,7 @@ At startup, core computes the set of `(resource_type, action)` pairs the
 `OPERATION_REGISTRY` can emit and diffs it against `capabilities()`. Behavior on
 a gap is operator-selectable:
 
-| `authz_compatibility` | Behavior on an uncovered `(resource_type, action)` |
+| `--authz-compatibility` | Behavior on an uncovered `(resource_type, action)` |
 | :--- | :--- |
 | `strict` (default) | server refuses to start, naming the uncovered pairs |
 | `lenient` | server starts with a loud warning; requests hitting an uncovered pair are **denied** at request time with an explanatory reason |
@@ -492,7 +523,14 @@ accept that those features are unreachable until the plugin catches up.
    (`mlflow/server/auth/sqlalchemy_store.py:2075`), fold against
    `default_permission` exactly as `_get_role_permission_or_default()` does
    (`:584`), then `allowed = getattr(perm, f"can_{action}")`. Return
-   `Decision(allowed, effective_permission=perm.name)`.
+   `Decision(allowed)`.
+
+The permission *level* (`READ`/`USE`/`EDIT`/`MANAGE`) stays where it already
+lives: inside the DB backend and RFC 0005's role API. It is not part of the
+`Decision` contract, because core does not act on it — core only needs
+allow/deny. The admin UI that displays "Bob has EDIT on experiment 42" continues
+to read it from the RFC 0005 store directly, which is a DB-backend feature and
+was never going to be answerable by a boolean external system anyway.
 
 This is a mechanical extraction of the body already inside every `validate_can_*`
 function — the same `_role_permission_for()` / `_get_role_permission_or_default()`
@@ -528,7 +566,6 @@ contract holds.
 | Capability | DB (default) | A boolean external system | A policy engine |
 | :--- | :--- | :--- | :--- |
 | `allowed` | yes | yes | yes |
-| `effective_permission` level | yes | no (boolean only) | optional |
 | `is_admin` | yes (user row) | `None` (no concept), or via policy | via policy |
 | cheap `list_authorized` | yes (one grant query) | usually not | often, via partial evaluation |
 | per-check cost | in-process | one network call | one network call |
@@ -545,70 +582,45 @@ remote backend cannot reuse any of it without re-deriving "GetRun means read on
 the parent experiment." That re-derivation, multiplied across ~105 validators and
 re-synced every release, is the maintenance trap.
 
-#### The refactor: validators become requirement descriptors
+#### The refactor: validators split into extraction and decision
 
-Split each validator into two halves:
+Each validator is split into two halves:
 
-- **Requirement resolver** (stays in core, one per operation): a pure extraction
-  `resolve(request) -> [AuthorizationRequirement]`. It pulls `run_id` from the
-  body, resolves its experiment and workspace, and returns
-  `AuthorizationRequirement("experiment", experiment_id, "read", workspace)`. No
-  decision.
-- **The decision** moves to a single chokepoint that calls `backend.authorize`.
-
-The dispatch tables change from `class → validator()` to
-`class → RequirementDescriptor`:
-
-```python
-@dataclass(frozen=True)
-class RequirementDescriptor:
-    # Pure extraction. May return several requirements (e.g. a bulk metric-history
-    # read across N runs checks read on each).
-    resolve: Callable[[Request], list[AuthorizationRequirement]]
-
-# BEFORE_REQUEST_HANDLERS becomes, e.g.:
-GetRun:           RequirementDescriptor(resolve=lambda r: [_require_run(r, "read")]),
-LogMetric:        RequirementDescriptor(resolve=lambda r: [_require_run(r, "update")]),
-CreateExperiment: RequirementDescriptor(resolve=lambda r: [_require_workspace_create(r)]),
-```
-
-`_require_run(r, action)` is the extraction half of today's
-`_get_permission_from_run_id` (`:887`); it returns a requirement instead of a
-`Permission`. The single chokepoint — replacing the validator call in
-`_before_request` (`:3068`) and the validator call inside
-`fastapi_permission_middleware` (`:5125`) — is:
-
-```python
-def _authorize(req, identity: Identity, descriptor) -> Response | None:
-    if descriptor is None:
-        return _handle_unmapped_route(req)          # fail-closed; see the registry section
-    requirements = descriptor.resolve(req)
-    for decision in backend_authorize_all(identity, requirements, _ctx(req)):
-        if not decision.allowed:
-            return make_forbidden_response(decision.reason)
-    return None
-```
-
-`backend_authorize_all` issues one `authorize` per requirement, concurrently and
-with bounded parallelism when there is more than one — which is why the backend
-protocol needs no batch method.
+- **Requirement resolution** stays in core, one per operation, and becomes a pure
+  extraction: given the request, produce the `AuthorizationRequirement`(s) it
+  implies. For `GetRun` that means pulling the run id, resolving its parent
+  experiment and workspace, and emitting
+  `("experiment", experiment_id, "read", workspace)` — the extraction half of
+  today's `_get_permission_from_run_id` (`:887`), returning a requirement instead
+  of a `Permission`. No decision is made here. An operation may emit several
+  requirements (a bulk metric-history read across N runs checks read on each).
+- **The decision** moves out of the validators entirely, into a single chokepoint
+  that calls `backend.authorize` — replacing the validator call in
+  `_before_request` (`:3068`) and the one inside `fastapi_permission_middleware`
+  (`:5125`). Any denial short-circuits into a 403 carrying `Decision.reason`; an
+  operation with no registry entry is denied (see the registry section). When an
+  operation yields more than one requirement, core issues the `authorize` calls
+  concurrently with bounded parallelism — which is why the backend protocol needs
+  no batch method.
 
 The dispatch functions (`_find_validator` at `:3020`, `_find_fastapi_validator`
-at `:4970`) keep their structure — the same regex/exact-match ordering
+at `:4970`) keep their structure and their existing match ordering
 (logged-models → webhooks → exact `(path, method)` → traces regex, and on the
-FastAPI side gateway → OTel → jobs → assistant → native artifact proxy → MCP) —
-they just return a `RequirementDescriptor` instead of a `Callable[[], bool]`. The
-fail-closed trace default (`lambda: False` at `:3062`) becomes a descriptor that
-always denies.
+FastAPI side gateway → OTel → jobs → assistant → native artifact proxy → MCP);
+what they return changes from "a callable that decides" to "a declaration of what
+this operation requires." The fail-closed trace default (`lambda: False` at
+`:3062`) stays fail-closed.
 
-The plugin never sees `_find_validator`, the protobuf classes, the gateway path
-regexes, or the GraphQL field names. It only ever receives an
-`AuthorizationQuery`.
+The exact type carrying that declaration is an implementation concern and is left
+to PR review — what matters at RFC level is the split itself, and that the
+declaration is *pure extraction with no decision in it*. The plugin never sees
+`_find_validator`, the protobuf classes, the gateway path regexes, or the GraphQL
+field names. It only ever receives an `AuthorizationQuery`.
 
 #### Special cases that already exist and survive cleanly
 
 - **`sender_is_admin` validators** (webhooks at `:2909`, and the admin-gated
-  user/role routes): become a descriptor producing
+  user/role routes): become an operation whose requirement is
   `("system", None, "manage", None)`. Core's super-admin gate, or the backend's
   `Decision.is_admin`, handles it.
 - **`lambda: True` "authenticated but unrestricted" routes** (jobs and assistant
@@ -641,7 +653,9 @@ class Protection(Enum):
 class OperationSpec:
     operation: str                  # "GetRun", "graphql.mlflowSearchRuns", "gateway.invoke"
     protection: Protection
-    descriptor: RequirementDescriptor | None  # required iff AUTHORIZED
+    # How to derive this operation's requirement(s) from the request.
+    # Required iff AUTHORIZED; its exact type is left to implementation.
+    requirements: ... | None
 
 
 OPERATION_REGISTRY: dict[str, OperationSpec] = { ... }
@@ -681,9 +695,18 @@ Under the plugin model the GraphQL field → requirement map joins
 dropped. The middleware (`resolve` at `:4312`) resolves each field to a
 requirement and calls the same `backend.authorize` chokepoint as REST; its
 existing two-phase pattern (pre-resolve check, then `_post_resolve` filtering at
-`:4401`) maps onto `authorize` (pre) and `list_authorized` (post). The CI guard
-enforces that *every* query/mutation field is classified: read-only metadata
-fields may be `AUTHENTICATED`; data-bearing fields must be `AUTHORIZED`.
+`:4401`) maps onto `authorize` (pre) and `list_authorized` (post).
+
+**Every GraphQL field that returns data is `AUTHORIZED`.** There is no
+`AUTHENTICATED` tier on the GraphQL surface and no unprotected data field: if a
+field returns anything derived from tenant data, it carries a requirement. The
+sole exception is pure server capability discovery — the GraphQL equivalent of
+`/mlflow/server-info`, which is already treated as unprotected on the REST side
+(`mlflow/server/auth/__init__.py:3317`) because it exposes no tenant data. The CI
+guard enforces this: a GraphQL field classified as anything other than
+`AUTHORIZED`, other than that one allowlisted capability field, fails the build.
+This is what makes the current seven-field `PROTECTED_FIELDS` list a closed
+question rather than a list someone has to remember to extend.
 
 #### Gateway granularity
 
@@ -725,6 +748,16 @@ response is also the fiddliest code in the auth server.
 that down into the store query as a filter, so pagination works natively and no
 backfill is needed.
 
+The store-side half of this is already moving independently:
+[mlflow/mlflow#24964](https://github.com/mlflow/mlflow/issues/24964) proposes
+allowing `IN (...)` on identifier attributes for the collection search endpoints
+and exposing `experiment_ids` on the few experiment-scoped endpoints that lack
+it. That is precisely the mechanism this section needs to push an authorized id
+set into the query. This RFC therefore does not re-specify it — it supplies the
+other half, the contract by which core asks the authorization backend *which* ids
+to push. If #24964 lands first, `list_authorized` has a filter to write into on
+day one; if it does not, the fallback path below applies until it does.
+
 ```python
 @dataclass(frozen=True)
 class AuthorizedResources:
@@ -753,25 +786,58 @@ class AuthorizedResources:
 mode a deployment is in.
 
 Whether to push the predicate all the way into the tracking-store SQL (rather
-than as an id list on the request) is an optimization left to implementation.
+than as an id list on the request) is an optimization left to implementation, as
+is the size cap above which an id set is too large to push down and core degrades
+to `all=None` — a hundred-thousand-id filter is its own problem, but the
+threshold is a tuning question, not a design one.
 
-### Configuration
+### Configuration and where auth lives in the server
 
-MLflow's INI stays what it is today: **basic auth's config file**. It gains
-exactly three keys, all of them *selection*, not plugin settings:
+#### Auth moves into the main server; the basic-auth app is deprecated
 
-| Key | Default | Meaning |
-| :--- | :--- | :--- |
-| `authn_provider` | `basic-auth` | entry-point name of the authentication provider |
-| `authz_backend` | `database` | entry-point name of the authorization backend |
-| `authz_compatibility` | `strict` | startup behavior on a capability gap |
+Today auth is a separate WSGI app (`mlflow/server/auth/__init__.py`) that wraps
+the tracking server and is selected with `mlflow server --app-name basic-auth`.
+Everything auth-related — the `before_request` hook, the validators, the
+after-request filters — hangs off that wrapper. The FastAPI half then has to be
+threaded back in through middleware, which is why the request-context bridge at
+`:4499` exists at all.
+
+This RFC moves the auth call into **the main Flask app and the main FastAPI
+app**. Both own a single call into the chokepoint described above: if an
+authentication provider is configured, authenticate and authorize; if not, skip
+entirely and behave exactly like an unauthenticated server. Auth stops being a
+bolted-on wrapper and becomes an ordinary, optional stage of the request path.
+
+`--app-name basic-auth` is **soft-deprecated, not removed.** Selecting it
+continues to work and is translated into
+`authn_provider=basic-auth, authz_backend=database`, so existing deployments and
+existing `MLFLOW_AUTH_CONFIG_PATH` INI files keep working unchanged. The flag
+emits a deprecation warning naming the replacement, and is removed no earlier
+than one minor release after the plugin surface ships.
+
+#### Selecting plugins
+
+Selection is a server-level concern, so it is a CLI flag with an environment
+variable equivalent — the pattern MLflow already uses for server options — not a
+key inside any plugin's config file:
+
+| CLI flag | Env var | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `--authn-provider` | `MLFLOW_AUTHN_PROVIDER` | unset (no auth) | entry-point name of the authentication provider |
+| `--authz-backend` | `MLFLOW_AUTHZ_BACKEND` | unset (no auth) | entry-point name of the authorization backend |
+| `--authz-compatibility` | `MLFLOW_AUTHZ_COMPATIBILITY` | `strict` | startup behavior on a capability gap |
+
+Configuring an authentication provider without an authorization backend, or the
+reverse, is a startup error: a server that knows who you are but not what you may
+do has no coherent posture.
 
 **Plugins configure themselves.** A plugin decides whether it reads env vars, its
 own file, a mounted secret, or a service-discovery endpoint. Core does not define
 `[authn.<name>]` sections, does not parse plugin settings, and does not pass a
-config dict to plugin factories. This keeps `AuthConfig`
-(`mlflow/server/auth/config.py:10`) from becoming a registry of every plugin's
-schema, and it means a plugin's configuration can evolve without an MLflow
+config dict to plugin factories. The basic-auth INI and `AuthConfig`
+(`mlflow/server/auth/config.py:10`) become entirely internal to the `basic-auth`
+plugin — core never reads them — so they cannot become a registry of every
+plugin's schema, and a plugin's configuration can evolve without an MLflow
 release.
 
 Implementations are discovered through the entry-point pattern MLflow already
@@ -787,11 +853,12 @@ database   = "mlflow.server.auth.backends:DefaultDbAuthorizationBackend"
 ```
 
 **Backward-compatibility shim:** if the legacy `authorization_function` key is
-present and `authn_provider` is absent, core synthesizes a provider that wraps
-that function (adapting its `Authorization` return to `Identity(username=...)`)
-and selects `authz_backend = database`. Existing configs keep working unchanged,
-including on the FastAPI path — the shim replaces the synthetic-request-context
-bridge at `:4499`, so custom functions stop needing Flask at all.
+present in the basic-auth INI and no provider was selected on the command line,
+the `basic-auth` plugin synthesizes a provider that wraps that function (adapting
+its `Authorization` return to `Identity(username=...)`), paired with the
+`database` backend. Existing configs keep working unchanged, including on the
+FastAPI path — the shim replaces the synthetic-request-context bridge at `:4499`,
+so custom functions stop needing Flask at all.
 
 ### Error handling and fail-closed
 
@@ -814,10 +881,12 @@ outage is diagnosable rather than merely opaque.
   cache, so mitigation is entirely the plugin's responsibility — a deliberate
   trade (plugins know their invalidation semantics; core does not) but a real
   one. A busy UI page issuing many REST/GraphQL calls multiplies this.
-- **A boolean backend loses the effective permission level.** A system that
-  answers only allow/deny leaves `Decision.effective_permission` as `None`, so
-  RFC 0005's admin-UI "what is Bob's level on experiment 42?" degrades to
-  allow/deny under such a deployment. Acceptable, but it must be documented.
+- **Permission-level UI is DB-backend-only.** `Decision` carries allow/deny, not
+  a permission level, so RFC 0005's admin-UI "what is Bob's level on experiment
+  42?" is answerable only under the DB backend, which reads it from its own
+  store. Under an external backend that view has no source. Acceptable — an
+  external system's model of "level" would not map onto MLflow's four anyway —
+  but it must be documented.
 - **Grant authoring is DB-backend-specific.** The after-request handler
   `set_can_manage_experiment_permission` (`:3103`) writes a grant on resource
   creation — meaningless for a backend whose grants live externally. Core must
@@ -829,6 +898,10 @@ outage is diagnosable rather than merely opaque.
 - **Capability negotiation can block upgrades.** `strict` mode means a lagging
   plugin blocks an MLflow upgrade. That is the point, but `lenient` exists
   precisely because it is sometimes the wrong trade-off.
+- **Workspace resolution stays a per-request store round trip.** The workspace
+  lookup happens in core, *before* the backend call, because it is needed to build
+  the requirement. It keeps its existing cache (`workspace_cache_ttl_seconds`),
+  but a remote backend cannot absorb or avoid it.
 - **Implementation cost.** Splitting ~105 fused validators into extraction +
   descriptor, then routing every surface through one chokepoint, is a sizeable
   refactor of `mlflow/server/auth/__init__.py` (5,407 lines today). The risk is
@@ -882,27 +955,31 @@ it every release — the precise cost the issue raises.
 
 The change is largely additive, with a few deliberate behavior corrections.
 
-**basic-auth is unchanged.** It becomes `BasicAuthProvider` (the authn half of
-today's `authenticate_request_basic_auth`) plus `DefaultDbAuthorizationBackend`
-(the authz half — the RFC 0005 resolver). The default config selects exactly
-these, so an operator who upgrades and changes nothing sees identical behavior.
-**All authorization checks remain the same after the migration**: same resources,
-same required permission levels, same admin short-circuit, same fail-closed
-defaults. This is asserted by the CI guard plus a characterization test that runs
-the existing auth integration suite unmodified against the new chokepoint.
+**basic-auth behaves the same; it just moves.** It becomes `BasicAuthProvider`
+(the authn half of today's `authenticate_request_basic_auth`) plus
+`DefaultDbAuthorizationBackend` (the authz half — the RFC 0005 resolver), served
+by the main app rather than the wrapper app. `--app-name basic-auth` keeps
+working and is translated into that pair, so an operator who upgrades and changes
+nothing sees identical behavior, including their existing INI. **All
+authorization checks remain the same after the migration**: same resources, same
+required permission levels, same admin short-circuit, same fail-closed defaults.
+This is asserted by the CI guard plus a characterization test that runs the
+existing auth integration suite unmodified against the new chokepoint.
 
 **Additive (non-breaking):** the `Identity` / `Decision` types, the identity
 record table, the entry-point groups, the `OPERATION_REGISTRY`, and the
-`authn_provider` / `authz_backend` / `authz_compatibility` config keys.
+`--authn-provider` / `--authz-backend` / `--authz-compatibility` flags and their
+env-var equivalents.
 
 **Behavior changes, called out explicitly:**
 
 - **GraphQL authorization extends beyond the seven hardcoded fields.** GraphQL
   auth is already on by default (`MLFLOW_SERVER_ENABLE_GRAPHQL_AUTH` defaults to
   `True`), but only `PROTECTED_FIELDS` (`:4302`) is checked. Under the registry
-  every field is classified, so fields that are currently reachable without an
-  authorization check start being checked. This is a deliberate fail-closed
-  correction, scoped to the auth-enabled server; the flag itself is dropped.
+  every data-returning field is authorized, so fields that are currently
+  reachable without an authorization check start being checked. This is a
+  deliberate fail-closed correction, scoped to the auth-enabled server; the flag
+  itself is dropped.
 - **The FastAPI unmapped-route path flips from fail-open to fail-closed.** Today
   an unmatched FastAPI route falls through to `call_next` (`:5135`). Under the
   registry it denies. The CI guard makes this discoverable before release;
@@ -915,43 +992,41 @@ record table, the entry-point groups, the `OPERATION_REGISTRY`, and the
   `authorization_function` returning a `werkzeug Authorization` is shimmed (the
   returned object is adapted to `Identity(username=...)`), so it keeps working but
   is soft-deprecated.
+- **`--app-name basic-auth` is soft-deprecated.** It keeps working, translated
+  into `--authn-provider basic-auth --authz-backend database`, and warns. Auth now
+  runs inside the main Flask and FastAPI apps rather than a wrapper app.
+- **Existing basic-auth users are backfilled into the core identity table** by a
+  schema migration on first startup. The basic-auth `users` table keeps its
+  credential columns.
 
 **Sequencing.**
 
-1. Land the `OPERATION_REGISTRY` + descriptor refactor and the CI guard with the
-   decision still made by the existing DB code path. No plugin surface yet; this
-   is pure consolidation and is independently valuable.
-2. Introduce the two protocols, the identity record, and the default plugins,
-   with the legacy `authorization_function` shim live.
-3. Document the entry-point migration; deprecate the shim one minor release
-   later.
+1. Land the `OPERATION_REGISTRY` refactor and the CI guard with the decision
+   still made by the existing DB code path. No plugin surface yet; this is pure
+   consolidation and is independently valuable.
+2. Move the auth stage into the main Flask and FastAPI apps behind the
+   plugin-selection flags, introduce the two protocols, the identity record and
+   its migration, and the built-in plugins — with both the legacy
+   `authorization_function` shim and the `--app-name basic-auth` translation live.
+3. Document the migration; remove the shim and the `--app-name` translation no
+   earlier than one minor release later.
 
 RFC 0005's role model and resolver interface are a prerequisite — this RFC
 assumes 0005 has landed.
 
 # Open questions
 
+Two, both about the same thing: who owns "admin" once an external system owns
+identity.
+
 - **Are `system` / super-admin operations backend-gated or core-only?** Truly
   global operations (create user, delete workspace) use `sender_is_admin` today
   (`:1374`). Do we model them as `("system", None, "manage")` and let a backend
   authorize them, or keep super-admin a core-only gate that a backend can only
-  *assert* (via `Decision.is_admin`) but not *grant*? Leaning toward core-only for
-  `system` ops, backend-decided everywhere else.
+  *assert* (via `Decision.is_admin`) but not *grant*?
 - **How is `is_admin=None` resolved?** When a backend reports no admin concept,
-  core falls back to "its own super-admin rule" — which today means the local user
-  row's `is_admin` flag. Under an external provider there may be no local row with
+  core falls back to its own super-admin rule — today, the local user row's
+  `is_admin` flag. Under an external provider there may be no local row with
   meaningful admin state. Options: a configured list of admin principals, an
   `authorize(("system", None, "manage", None))` probe, or simply no admins outside
   the DB backend.
-- **Does `list_authorized` need an id-set size bound?** Pushing a
-  hundred-thousand-id filter into a store query is its own problem. A cap that
-  degrades to `all=None` above some threshold is probably right, but the threshold
-  is an implementation question.
-- **Should the identity record be writable by MLflow admins?** Correcting a
-  display name locally, or marking a principal disabled independently of the IdP,
-  is plausible but expands the record from a cache into a store with its own
-  conflict-resolution rules. Leaning toward read-only-from-IdP for v1.
-- **Per-request workspace-resolution cost under remote backends.** The workspace
-  lookup happens in core, *before* the backend call, to build the requirement. It
-  stays in core and keeps its existing cache (`workspace_cache_ttl_seconds`), but
-  it adds a store round-trip per request that a remote backend can't avoid.
