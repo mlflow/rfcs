@@ -1,7 +1,7 @@
 ---
 start_date: 2026-08-18
 mlflow_issue: https://github.com/mlflow/mlflow/issues/23202
-rfc_pr:
+rfc_pr: https://github.com/mlflow/rfcs/pull/34
 ---
 
 <!-- markdownlint-disable-file MD041 -->
