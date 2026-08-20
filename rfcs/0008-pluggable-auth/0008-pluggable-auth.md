@@ -254,44 +254,84 @@ to the backend.
 The authn output and the authz subject. It replaces the thin `Authorization`.
 
 The field set is deliberately minimal: **the only first-class attributes are the
-ones core itself consumes.** Everything else an authorization system might want
-to reason over — IdP groups, raw token claims, tenant ids, employee numbers —
-travels in one opaque `metadata` mapping that core never interprets.
+ones core itself consumes.** Everything else goes in one of two opaque maps,
+split by who reads it. `authz_metadata` (IdP groups, token claims, tenant ids)
+goes to the backend verbatim. `display_metadata` (profile link, department,
+avatar) is stored and served to the UI.
 
 ```python
 @dataclass(frozen=True)
 class Identity:
-    # Stable principal key. The authz subject, and the link key for the local
-    # identity record. MUST be stable across logins.
+    # Stable, opaque principal id. The authz subject and the primary key of the
+    # local identity record. MUST be stable across logins and MUST NOT be reused
+    # after a principal is deleted at the provider. For an OIDC provider this is
+    # typically `iss` + `sub`; for basic auth it is the local user row's id.
+    id: str
+
+    # Login handle. Human-typed, human-readable, and NOT assumed stable — an IdP
+    # may rename a principal. Core displays it and uses it for the `mlflow.user`
+    # attribution tag, but every join and every grant is keyed on `id`.
     username: str
 
-    # Optional display attributes. Core stores these on the identity record and
-    # uses them for UI rendering and work assignment. None when the provider
-    # does not supply them.
+    # Optional display attributes core itself consumes: the UI renders these and
+    # review queues assign work by them. None when the provider does not supply
+    # them.
     email: str | None = None
     display_name: str | None = None
-    profile_url: str | None = None   # the user's page on the IdP; hyperlinked in the UI
 
-    # Opaque provider payload, passed through to the authorization backend
-    # verbatim. Core never reads a key out of this. Groups, JWT claims, SAML
-    # attributes, and tenant ids all live here.
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Opaque provider payload for the authorization backend. Core never reads a
+    # key out of this. Groups, JWT claims, SAML attributes, tenant ids.
+    authz_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    # Opaque provider payload for rendering. Stored on the identity record and
+    # served to the UI; never sent to the authorization backend. `profile_url`
+    # (the principal's page at the IdP, hyperlinked in the UI) lives here.
+    display_metadata: Mapping[str, Any] = field(default_factory=dict)
 ```
+
+`id` rather than `username` is the key because an IdP rename must not detach a
+principal from its grants, and a recycled username must not inherit the previous
+holder's access. `username` stays because humans type it and the UI shows it, but
+it is a label, not a key.
+
+The two maps are separate because they have different readers and different blast
+radius. `authz_metadata` crosses into the decision path; `display_metadata` only
+reaches a template. Merging them would push group claims to the browser and
+profile URLs into policy input. How the UI renders an unknown `display_metadata`
+key, or whether that should itself be pluggable, is left to a future RFC.
 
 `frozen=True` makes the identity hashable, which matters for plugins that key
 their own caches on it.
 
 #### The identity record and why core stores it
 
-Core keeps its own table of authenticated identities, keyed by `username`,
-holding `email`, `display_name`, `profile_url`, the provider name, and
-first-seen / last-seen timestamps. On every successful authentication core
-upserts the row before authorization runs:
+Core keeps its own table of authenticated identities, keyed by `Identity.id`,
+holding `username`, `email`, `display_name`, `display_metadata`, the provider
+name, and first-seen / last-seen timestamps. `authz_metadata` is deliberately not
+stored: it is decision input that goes stale the moment a group membership
+changes, and a stale copy is worse than no copy.
+
+On every successful authentication core upserts the row before authorization
+runs. The table exists to be read, so the store is read/write:
 
 ```python
 class IdentityStore(Protocol):
     def upsert(self, identity: Identity, provider: str) -> None: ...
+
+    def get(self, identity_id: str) -> IdentityRecord | None: ...
+
+    # Bulk read so a list response resolves every owner in one query, not N.
+    def get_many(self, identity_ids: Collection[str]) -> Mapping[str, IdentityRecord]: ...
+
+    # Backs the assignee picker and the admin user list.
+    def search(
+        self, query: str | None = None, max_results: int = 100, page_token: str | None = None
+    ) -> PagedList[IdentityRecord]: ...
 ```
+
+`search` is what makes review-queue assignment possible: you cannot assign work
+to a person the server cannot enumerate. These reads are core-facing — the
+backend receives the full `Identity` on every query and never reads this table.
 
 This is **a new table owned by core, and every provider's principals land in
 it — including basic auth's.** Basic auth sits behind the same plugin boundary as
@@ -304,8 +344,10 @@ to remove.
 So the `basic-auth` provider goes through the same `upsert` on every successful
 login as any other provider, and existing basic-auth users are backfilled into
 the identity table by a migration when the server first starts on the new
-schema. Basic auth keeps its own `users` table, now narrowed to what only it
-needs: the credential material (password hash) and its local `is_admin` flag.
+schema. That migration carries each user's existing row id forward as the
+`Identity.id`, so grants keyed on a basic-auth user survive untouched. Basic auth
+keeps its own `users` table, now narrowed to what only it needs: the credential
+material (password hash) and its local `is_admin` flag.
 
 This duplicates the username across two tables, which is a real cost. It is
 accepted deliberately: the alternative is core branching on which provider is
@@ -320,8 +362,8 @@ not necessarily a local account:
 - **Review queues** assign work to a user and stamp an owner
   (`_get_request_username()` in `mlflow/server/handlers.py:4778`, fed by
   `g.mlflow_authenticated_user` at `mlflow/server/auth/__init__.py:3083`).
-- **The UI** renders a display name rather than a raw principal string, and can
-  hyperlink `profile_url`.
+- **The UI** renders a display name rather than a raw principal id, and can
+  hyperlink a `profile_url` carried in `display_metadata`.
 - **Audit** needs a stable record of principals the server has authenticated.
 
 Providers never write to this table; core does. The upsert is idempotent and
@@ -443,10 +485,6 @@ class AuthorizationQuery:
 @dataclass(frozen=True)
 class Decision:
     allowed: bool
-    # True/False when the backend has an administrator concept and can answer;
-    # None when it has no such concept, in which case core falls back to its own
-    # super-admin rule.
-    is_admin: bool | None = None
     reason: str | None = None    # surfaced in the 403 body and the audit log
 
 
@@ -513,9 +551,9 @@ accept that those features are unreachable until the plugin catches up.
 
 `DefaultDbAuthorizationBackend.authorize(query)`:
 
-1. If the local user row is admin, return `Decision(allowed=True, is_admin=True)`
-   — reproduces the `sender_is_admin()` short-circuit at `:3089` (`sender_is_admin`
-   itself at `:1374`).
+1. If the local user row is admin, return `Decision(allowed=True)` — reproduces
+   the `sender_is_admin()` short-circuit at `:3089` (`sender_is_admin` itself at
+   `:1374`). The admin flag never leaves the backend.
 2. For `create`, reproduce `_user_can_create_in_workspace()` (`:642`).
 3. Otherwise call the *existing* resolver:
    `perm = store.get_role_permission_for_resource(user.id, requirement.resource_type,
@@ -540,6 +578,34 @@ methods, producing the same allow/deny. That is the backward-compatibility
 requirement, and it is asserted by a characterization test (see "Adoption
 strategy").
 
+#### Admin is not a field on `Decision`
+
+`Decision` carries no `is_admin`, and core depends only on `allowed`. Admin does
+two jobs in today's code, and both already have a home in this contract:
+
+- **As a gate.** `sender_is_admin` is the validator for gateway budget policies
+  (`:2677`), workspace CRUD (`:2742`), and webhooks (`:2910`). That is an
+  authorization question with an authorization answer: the operation becomes a
+  `("system", None, "manage", None)` requirement and the backend returns
+  `allowed`. A backend with an admin concept uses it, one without writes a policy
+  rule, and core cannot tell the difference.
+- **As a bypass.** Admins skip response filtering and the search backfill:
+  `filter_experiment_ids` (`:1768`), `filter_search_experiments` (`:3441`), and
+  the FastAPI response filter (`:5232`). That is not "is this person an admin,"
+  it is "may they see everything of this type here" — exactly what
+  `list_authorized` returning `all=True` says. Reusing it removes a parallel code
+  path rather than adding one.
+
+So no privileged boolean crosses the plugin boundary. The DB backend keeps its
+`is_admin` column and its admin-management screens; that is RFC 0005's local role
+model, and it stays local for the same reason grant authoring does (see
+"Drawbacks"). An external backend expresses privilege through `authorize` and
+`list_authorized`.
+
+The cost is one backend call where today there is a local column read. That is
+in-process under the DB backend, and one round trip under a remote one on
+operations that are rare by construction.
+
 #### Worked example: is the interface sufficient?
 
 To show the tuple is rich enough for an external system without shipping one,
@@ -554,9 +620,10 @@ shaped so the mapping is mechanical:
 | `workspace` | `namespace` | direct |
 
 A policy-engine backend has an even simpler job: serialize
-`(subject.username, subject.metadata, requirement, context)` as the policy input
-and read `allow` back. `Identity.metadata` is what makes that work — a policy can
-reason over arbitrary IdP attributes without MLflow knowing what they are.
+`(subject.id, subject.username, subject.authz_metadata, requirement, context)` as
+the policy input and read `allow` back. `Identity.authz_metadata` is what makes
+that work — a policy can reason over arbitrary IdP attributes without MLflow
+knowing what they are.
 
 Neither adapter is proposed for the MLflow repo. They are here to show the
 contract holds.
@@ -566,7 +633,7 @@ contract holds.
 | Capability | DB (default) | A boolean external system | A policy engine |
 | :--- | :--- | :--- | :--- |
 | `allowed` | yes | yes | yes |
-| `is_admin` | yes (user row) | `None` (no concept), or via policy | via policy |
+| admin-only ops (`system` / `manage`) | yes (user row) | yes, if it can model the resource | via policy |
 | cheap `list_authorized` | yes (one grant query) | usually not | often, via partial evaluation |
 | per-check cost | in-process | one network call | one network call |
 
@@ -619,10 +686,16 @@ field names. It only ever receives an `AuthorizationQuery`.
 
 #### Special cases that already exist and survive cleanly
 
-- **`sender_is_admin` validators** (webhooks at `:2909`, and the admin-gated
-  user/role routes): become an operation whose requirement is
-  `("system", None, "manage", None)`. Core's super-admin gate, or the backend's
-  `Decision.is_admin`, handles it.
+- **`sender_is_admin` validators** (webhooks at `:2910`, workspace CRUD at
+  `:2742`, gateway budget policies at `:2677`): become an operation whose
+  requirement is `("system", None, "manage", None)`, decided by the backend like
+  any other. See "Admin is not a field on `Decision`".
+- **The admin *bypass* paths** — admins skipping response filters and the search
+  backfill (`:1768`, `:3441`, `:5232`) — become `list_authorized` returning
+  `all=True`, not a separate privileged branch.
+- **The user/role management routes** (`:4010`, `:4108`) administer RFC 0005's
+  local role store, so they are registered only when the DB backend is
+  configured, alongside the grant-authoring handlers under "Drawbacks".
 - **`lambda: True` "authenticated but unrestricted" routes** (jobs and assistant
   via `_get_require_authentication_validator()` at `:4862`, plus
   `GET_CURRENT_USER`): become a `REQUIRE_AUTHENTICATED` sentinel — identity
@@ -773,8 +846,10 @@ class AuthorizedResources:
 
 - The **DB backend** answers from one grant query — the same query
   `_role_based_read_predicate` (`:1704`) and `filter_experiment_ids` (`:1749`)
-  already use, so this is a reshape, not new cost. It returns `all=True` for a
-  workspace admin, otherwise the explicit id set.
+  already use, so this is a reshape, not new cost. It returns `all=True` for an
+  admin or a workspace-wide grant, otherwise the explicit id set. That `all=True`
+  also replaces today's "admins skip the response filter" branch (`:1768`,
+  `:3441`, `:5232`).
 - A **policy engine** can often answer via partial evaluation.
 - A **boolean-only external system** returns `all=None`; core falls back to
   filtering the page it fetched, with concurrent per-item `authorize` calls. This
@@ -854,11 +929,14 @@ database   = "mlflow.server.auth.backends:DefaultDbAuthorizationBackend"
 
 **Backward-compatibility shim:** if the legacy `authorization_function` key is
 present in the basic-auth INI and no provider was selected on the command line,
-the `basic-auth` plugin synthesizes a provider that wraps that function (adapting
-its `Authorization` return to `Identity(username=...)`), paired with the
-`database` backend. Existing configs keep working unchanged, including on the
-FastAPI path — the shim replaces the synthetic-request-context bridge at `:4499`,
-so custom functions stop needing Flask at all.
+the `basic-auth` plugin synthesizes a provider that wraps that function, paired
+with the `database` backend. The wrapper adapts the returned `Authorization` to
+an `Identity`: `username` comes from `.username`, and `id` is the matching local
+user row's id, falling back to the username when there is no local row. A legacy
+function only ever produced a username, so that is the strongest key available.
+Existing configs keep working unchanged, including on the FastAPI path — the shim
+replaces the synthetic-request-context bridge at `:4499`, so custom functions stop
+needing Flask at all.
 
 ### Error handling and fail-closed
 
@@ -881,12 +959,20 @@ outage is diagnosable rather than merely opaque.
   cache, so mitigation is entirely the plugin's responsibility — a deliberate
   trade (plugins know their invalidation semantics; core does not) but a real
   one. A busy UI page issuing many REST/GraphQL calls multiplies this.
-- **Permission-level UI is DB-backend-only.** `Decision` carries allow/deny, not
-  a permission level, so RFC 0005's admin-UI "what is Bob's level on experiment
-  42?" is answerable only under the DB backend, which reads it from its own
-  store. Under an external backend that view has no source. Acceptable — an
-  external system's model of "level" would not map onto MLflow's four anyway —
-  but it must be documented.
+- **A permission *level* is only directly readable under the DB backend.**
+  `Decision` carries allow/deny, so RFC 0005's admin view "Bob has EDIT on
+  experiment 42" reads the level from the DB backend's own store.
+
+  For rendering this costs little, because the UI needs to know which controls to
+  draw, not a level. It asks the question it means: *may this principal update
+  experiment 42?* and if not, *may they read it?* Two `authorize` calls in
+  descending order of privilege, stopping at the first allow, cover it under every
+  backend, and both the browser and the backend can cache the positive answers.
+
+  What does not survive is the *administrative* view, "show me every grant Bob
+  holds." That screen edits RFC 0005's roles, so it belongs to the DB backend for
+  the same reason grant authoring does. An external backend administers its grants
+  in its own console.
 - **Grant authoring is DB-backend-specific.** The after-request handler
   `set_can_manage_experiment_permission` (`:3103`) writes a grant on resource
   creation — meaningless for a backend whose grants live externally. Core must
@@ -990,8 +1076,8 @@ env-var equivalents.
 - **`Identity` replaces the `Authorization` return contract** of
   `authenticate_request()`. A third party that wrote a custom
   `authorization_function` returning a `werkzeug Authorization` is shimmed (the
-  returned object is adapted to `Identity(username=...)`), so it keeps working but
-  is soft-deprecated.
+  returned object is adapted to an `Identity`, as described under
+  "Configuration"), so it keeps working but is soft-deprecated.
 - **`--app-name basic-auth` is soft-deprecated.** It keeps working, translated
   into `--authn-provider basic-auth --authz-backend database`, and warns. Auth now
   runs inside the main Flask and FastAPI apps rather than a wrapper app.
@@ -1016,17 +1102,12 @@ assumes 0005 has landed.
 
 # Open questions
 
-Two, both about the same thing: who owns "admin" once an external system owns
-identity.
-
-- **Are `system` / super-admin operations backend-gated or core-only?** Truly
-  global operations (create user, delete workspace) use `sender_is_admin` today
-  (`:1374`). Do we model them as `("system", None, "manage")` and let a backend
-  authorize them, or keep super-admin a core-only gate that a backend can only
-  *assert* (via `Decision.is_admin`) but not *grant*?
-- **How is `is_admin=None` resolved?** When a backend reports no admin concept,
-  core falls back to its own super-admin rule — today, the local user row's
-  `is_admin` flag. Under an external provider there may be no local row with
-  meaningful admin state. Options: a configured list of admin principals, an
-  `authorize(("system", None, "manage", None))` probe, or simply no admins outside
-  the DB backend.
+- **Bootstrapping the first administrator under an external backend.** With no
+  `is_admin` crossing the plugin boundary, a fresh server has no privileged
+  principal until the external system grants one, and the MLflow screens that
+  would grant it are themselves gated. For a policy engine or a Kubernetes
+  cluster this is not circular: the operator provisions the rule out of band
+  before MLflow starts, which is the expected path. Should core also offer a
+  startup escape hatch (a configured list of principals treated as
+  `system`-authorized) for backends where that is awkward, or is that a standing
+  back door that should not exist?
