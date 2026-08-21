@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
+
+# Personal working notes (not shared)
+.local/
