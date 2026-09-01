@@ -364,7 +364,8 @@ infrastructure; registry-specific trace linkage (SKILL spans,
 2. Browse the returned list of matching skills with names,
    descriptions, and latest versions.
    **UI path:** Scan the card-based list view. Each card shows the
-   skill name, description, latest version badge, status badge, and
+   skill icon (the default skill glyph when the skill has no icons),
+   name, description, latest version badge, status badge, and
    tags.
 3. Get details on a promising result:
    ```bash
@@ -577,9 +578,20 @@ composite key `(workspace, organization, name)`. The
 `organization` field scopes ownership (e.g., a team or publisher
 name) and defaults to `""` (empty string) when not specified.
 Key fields include `name` (unique within workspace and
-organization), `description`,
+organization), `description`, `icons`,
 `status` (read-only, derived from the parent-resolved version),
 `latest_version` (read-only, highest active version number), and `aliases`.
+
+`icons` is a mutable list of icon descriptors, MLflow-managed
+presentation metadata following the same icon shape as the MCP Server
+Registry (RFC-0004): each icon has a `src` plus optional `sizes`,
+`mimeType`, and `theme`, so UIs can share one rendering path across
+registries. Unlike RFC-0004, there is no payload to fall back to when
+`icons` is unset: the Agent Skills format defines no icon field, so the
+API returns exactly what was stored (null when never set) and the UI
+shows its default skill glyph. The same field, with the same semantics,
+exists on `AgentPlugin` (whose manifest format likewise defines no
+icon).
 A skill name is unique within its `(workspace, organization)`, whether the
 skill was registered standalone or created by importing a packaged plugin.
 Both standalone registration and packaged import reject a name that is already
@@ -618,7 +630,7 @@ deployments where MLflow serves artifacts; the external source types (`git`,
 `oci`, `zip`) have no such requirement.
 
 `register_skill()` creates the parent Skill when needed (with null
-`description`) and otherwise reuses the existing parent, except that it fails
+`description` and `icons`) and otherwise reuses the existing parent, except that it fails
 when the name is already taken by a member of a packaged plugin (see the
 uniqueness rule above). To
 set parent-level metadata, use `create_skill()` before registering
@@ -638,10 +650,13 @@ is `(workspace, organization, name)`, where `name` is extracted from
 `organization` remains an MLflow registry namespace and is not written into the
 canonical manifest.
 
-The parent retains mutable MLflow-managed presentation metadata. Each version
+The parent retains mutable MLflow-managed presentation metadata
+(`description` and `icons`). Each version
 separately preserves publisher metadata in its immutable `plugin_json`. When
-parent presentation fields are unset, the UI may fall back to the latest
+the parent `description` is unset, the UI may fall back to the latest
 resolved manifest metadata; the API returns parent fields as stored.
+`icons` has no such fallback, because the Agent Plugins manifest defines
+no icon field: when unset the UI shows its default plugin glyph.
 
 Agent plugins use a dedicated URI namespace. A parent is addressed as
 `agent-plugins:/<name>`, or `agent-plugins:/@<organization>/<name>` when an
@@ -1163,7 +1178,7 @@ independently of the plugin (see below).
 | Permission | Operations |
 |---|---|
 | `READ` | Search entities (including finding agent plugins by member), get versions, resolve aliases, list tags |
-| `EDIT` | Create entities, create versions, set tags, update description, status transitions (activate, deprecate), set aliases. Mapped to `can_update` in MLflow's permission framework. |
+| `EDIT` | Create entities, create versions, set tags, update presentation metadata (description, icons), status transitions (activate, deprecate), set aliases. Mapped to `can_update` in MLflow's permission framework. |
 | `MANAGE` | Delete aliases, delete tags, soft-delete versions, hard-delete entities, manage permissions. Mapped to `can_delete` in MLflow's permission framework. |
 
 This follows the same pattern as the model registry and MCP Server
@@ -1194,7 +1209,9 @@ input covers user-visible discovery metadata: Skill name and description; and
 Agent Plugin
 name, parent description, resolved manifest description, manifest keywords,
 manifest author name, and organization. Manifest keywords remain distinct from
-mutable MLflow tags. Detail views show metadata, version history, aliases, and
+mutable MLflow tags. List cards and detail views show the entity's icon,
+falling back to a default glyph when `icons` is unset (icons are not part
+of free-text search or structured filtering). Detail views show metadata, version history, aliases, and
 tags; an agent plugin's detail also lists its skill members. To find which
 agent plugins include a given skill, search agent plugins by member name rather
 than reading a stored field on the skill.

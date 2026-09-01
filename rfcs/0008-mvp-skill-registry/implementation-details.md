@@ -19,6 +19,7 @@ workspace-scoped.
 | `organization` | `String(256)` | PK, default `''` (empty string) |
 | `name` | `String(256)` | PK |
 | `description` | `String(5000)` | |
+| `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `search_text` | `Text` | derived discovery projection of name and description (plus member `keywords` on import) |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
@@ -161,6 +162,7 @@ an alias cannot bypass the kill switch (see Deletion semantics).
 | `organization` | `String(256)` | PK, default `''` (empty string) |
 | `name` | `String(256)` | PK |
 | `description` | `String(5000)` | |
+| `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `creation_timestamp` | `BigInteger` | millis since epoch |
@@ -372,7 +374,23 @@ used by the Model Registry and RFC-0004:
 ```python
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypedDict
+
+from typing_extensions import NotRequired
+
+
+class RegistryIcon(TypedDict):
+    """Icon descriptor for registry presentation metadata.
+
+    Deliberately the same shape as RFC-0004's MCPIcon (which follows the
+    upstream MCP server.json icon schema), so UIs share one icon
+    renderer across the MCP, skill, and agent plugin registries.
+    """
+
+    src: str
+    sizes: NotRequired[list[str]]
+    mimeType: NotRequired[str]
+    theme: NotRequired[str]
 
 
 class SkillStatus(StrEnum):
@@ -387,6 +405,7 @@ class Skill:
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None  # mutable user-defined icons; API returns null when unset
     workspace: str | None = None
     status: SkillStatus | None = None  # read-only, derived from parent-resolved version
     tags: dict[str, str] = field(default_factory=dict)
@@ -403,6 +422,7 @@ class Skill:
 | `name` | `str` | Human-readable name, unique within `(workspace, organization)` |
 | `organization` | `str` | Scopes ownership (e.g., team or publisher); defaults to `""` (empty string) |
 | `description` | `str` | Optional human-readable description of the skill |
+| `icons` | `list[RegistryIcon] \| None` | Mutable MLflow-managed presentation metadata; returned exactly as stored (null when never set). No payload fallback exists: the Agent Skills format defines no icon field, so the UI shows its default glyph when unset |
 | `status` | `SkillStatus \| None` | Read-only; derived from the parent-resolved version: highest active version number if present, otherwise highest non-deleted non-active version number. `None` when the skill has no non-`deleted` version |
 | `aliases` | `dict[str, int]` | Stable version pointers (e.g., `{"production": 2}`); read-only, populated from `skill_aliases` table |
 | `latest_version` | `int \| None` | Read-only; highest version number among `active` versions if one exists, otherwise highest non-`deleted` non-`active` version. `None` when the skill has no non-`deleted` version |
@@ -692,6 +712,7 @@ class AgentPlugin:
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None  # mutable user-defined icons; API returns null when unset
     workspace: str | None = None
     status: SkillStatus | None = None  # read-only, derived from parent-resolved version
     tags: dict[str, str] = field(default_factory=dict)
@@ -705,9 +726,11 @@ class AgentPlugin:
 
 `AgentPlugin.status` is read-only and comes from the same latest-resolved
 version as `latest_version`. Both are `None` when the plugin has no
-non-`deleted` version. Parent `description` is mutable MLflow presentation
-metadata. When unset, the UI may fall back to the resolved
-`plugin_json["description"]`; the API returns the parent value as stored.
+non-`deleted` version. Parent `description` and `icons` are mutable MLflow
+presentation metadata. When `description` is unset, the UI may fall back to
+the resolved `plugin_json["description"]`; the API returns the parent value
+as stored. `icons` has no fallback (the Agent Plugins manifest defines no
+icon field): the UI shows its default plugin glyph when unset.
 
 ### AgentPluginVersion entity
 
@@ -956,6 +979,7 @@ class SkillRegistryMixin:
         self, name: str,
         organization: str = "",
         description: str | None = None,
+        icons: list[RegistryIcon] | None = None,
     ) -> Skill:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -978,6 +1002,7 @@ class SkillRegistryMixin:
         name: str,
         organization: str = "",
         description: str | None = NOT_SET,
+        icons: list[RegistryIcon] | None = NOT_SET,
     ) -> Skill:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1096,6 +1121,7 @@ class SkillRegistryMixin:
         self, name: str,
         organization: str = "",
         description: str | None = None,
+        icons: list[RegistryIcon] | None = None,
     ) -> AgentPlugin:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1118,6 +1144,7 @@ class SkillRegistryMixin:
         name: str,
         organization: str = "",
         description: str | None = NOT_SET,
+        icons: list[RegistryIcon] | None = NOT_SET,
     ) -> AgentPlugin:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1491,7 +1518,8 @@ and `search_agent_plugins` appear in both layers, mirroring
 class MlflowClient:
     # --- Skills ---
     def create_skill(
-        self, *, name: str, organization: str = "", description: str | None = None
+        self, *, name: str, organization: str = "", description: str | None = None,
+        icons: list[RegistryIcon] | None = None,
     ) -> Skill: ...
 
     def get_skill(self, *, name: str, organization: str = "") -> Skill: ...
@@ -1506,7 +1534,8 @@ class MlflowClient:
     ) -> PagedList[Skill]: ...
 
     def update_skill(
-        self, *, name: str, organization: str = "", description: str | None = NOT_SET
+        self, *, name: str, organization: str = "", description: str | None = NOT_SET,
+        icons: list[RegistryIcon] | None = NOT_SET,
     ) -> Skill: ...
 
     def delete_skill(self, *, name: str, organization: str = "") -> None: ...
@@ -1554,7 +1583,8 @@ class MlflowClient:
 
     # --- Agent plugins ---
     def create_agent_plugin(
-        self, *, name: str, organization: str = "", description: str | None = None
+        self, *, name: str, organization: str = "", description: str | None = None,
+        icons: list[RegistryIcon] | None = None,
     ) -> AgentPlugin: ...
 
     def create_agent_plugin_version(
@@ -1604,7 +1634,8 @@ class MlflowClient:
     ) -> PagedList[AgentPlugin]: ...
 
     def update_agent_plugin(
-        self, *, name: str, organization: str = "", description: str | None = NOT_SET
+        self, *, name: str, organization: str = "", description: str | None = NOT_SET,
+        icons: list[RegistryIcon] | None = NOT_SET,
     ) -> AgentPlugin: ...
 
     def delete_agent_plugin(
@@ -1995,10 +2026,12 @@ class CreateSkillRequest(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
 
 
 class UpdateSkillRequest(BaseModel):
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
 
 
 class CreateSkillVersionRequest(BaseModel):
@@ -2025,10 +2058,12 @@ class CreateAgentPluginRequest(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
 
 
 class UpdateAgentPluginRequest(BaseModel):
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
 
 
 class PluginJSONPayload(BaseModel):
@@ -2143,6 +2178,7 @@ class SkillResponse(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
     status: str | None = None
     latest_version: int | None = None
     aliases: list[SkillAliasResponse] = Field(default_factory=list)
@@ -2185,6 +2221,7 @@ class AgentPluginResponse(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
+    icons: list[RegistryIcon] | None = None
     status: str | None = None
     latest_version: str | None = None
     aliases: list[AgentPluginAliasResponse] = Field(default_factory=list)
@@ -2282,7 +2319,7 @@ flag also accepted; for example, `mlflow skills get skills:/code-review` and
 | `mlflow skills register zip` | `register_skill(source=ZipSource(...))` | Register from a ZIP archive |
 | `mlflow skills register` | `register_skill(source="./local-path")` | Register from a local directory (uploaded to MLflow artifact storage) |
 | `mlflow skills get` | `get_skill()` | Get skill metadata |
-| `mlflow skills update` | `update_skill()` | Update skill description |
+| `mlflow skills update` | `update_skill()` | Update skill presentation metadata (description, icons) |
 | `mlflow skills search` | `search_skills()` | Search skills |
 | `mlflow skills get-version` | `get_skill_version()` | Get a specific version |
 | `mlflow skills search-versions` | `search_skill_versions()` | Search versions of a skill |
@@ -2300,7 +2337,7 @@ flag also accepted; for example, `mlflow skills get skills:/code-review` and
 | `mlflow agent-plugins register` | `register_agent_plugin()` | Create or reuse the parent and register a canonical version |
 | `mlflow agent-plugins get` | `get_agent_plugin()` | Get agent plugin metadata |
 | `mlflow agent-plugins get-version` | `get_agent_plugin_version()` | Get a specific version |
-| `mlflow agent-plugins update` | `update_agent_plugin()` | Update agent plugin description |
+| `mlflow agent-plugins update` | `update_agent_plugin()` | Update agent plugin presentation metadata (description, icons) |
 | `mlflow agent-plugins search` | `search_agent_plugins()` | Search agent plugins |
 | `mlflow agent-plugins search-versions` | `search_agent_plugin_versions()` | Search agent plugin versions |
 | `mlflow agent-plugins set-alias` | `set_agent_plugin_alias()` | Set an agent plugin alias |
