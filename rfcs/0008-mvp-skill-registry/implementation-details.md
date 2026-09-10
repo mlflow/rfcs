@@ -181,6 +181,7 @@ PrimaryKey: `(workspace, organization, name)`.
 | `version_major` | `Integer` | extracted SemVer major component |
 | `version_minor` | `Integer` | extracted SemVer minor component |
 | `version_patch` | `Integer` | extracted SemVer patch component |
+| `version_prerelease_sort_key` | `String(512)` | order-preserving encoding of the prerelease identifiers, so SemVer precedence is a plain `ORDER BY` |
 | `plugin_json` | `JSON` | canonical Agent Plugins manifest; immutable after creation, with the version field canonicalized (normalized) on ingest |
 | `search_text` | `Text` | derived discovery projection of name, mutable parent description, organization, and this version's manifest description, keywords, and author name; parent search matches the latest-resolved version's value |
 | `source_type` | `String(20)` | server-set; `git`, `oci`, `zip`, `mlflow`, `assembled` |
@@ -199,10 +200,32 @@ CASCADE delete.
 **Version ordering.** All versions are valid SemVer (semverish inputs are
 normalized on creation). Latest resolution first selects active candidates, or
 non-deleted non-active candidates when none are active. Semantic precedence
-determines the result. The numeric components narrow candidates efficiently;
-full prerelease precedence is applied in application code. Creation time breaks
-equal semantic precedence, including versions that differ only in build
-metadata.
+determines the result. `version_major`/`version_minor`/`version_patch` narrow
+candidates efficiently, and `version_prerelease_sort_key` carries full
+prerelease precedence, so the whole comparison is a single SQL `ORDER BY` with
+no application-side re-sort. Creation time breaks equal semantic precedence,
+including versions that differ only in build metadata.
+
+`version_prerelease_sort_key` is derived from `version` on write and encodes
+the prerelease identifiers so that plain lexicographic comparison reproduces
+SemVer precedence. It is digits only, so the ordering does not depend on the
+server's collation. On the case-insensitive collations MySQL 8.0 and a common
+SQL Server install use, ordering on a raw prerelease string would make
+`1.0.0-Alpha` and `1.0.0-alpha` compare equal and resolve
+non-deterministically. It is deliberately **excluded** from
+`ix_agent_plugin_versions_latest_lookup`:
+`version_major`/`version_minor`/`version_patch` prune candidates inside the
+index, `version_prerelease_sort_key` refines the order over the few rows that
+survive, and keeping a `String(512)` column out of that index leaves it well
+inside MySQL/InnoDB's 3072-byte key limit.
+
+The MCP Server Registry
+([RFC-0004](../0004-mcp-registry/0004-mcp-registry.md)) already orders versions
+this way — same column, same ordering, same index exclusion — and the skill
+registry calls its encoder rather than adding a second implementation. See
+[`SqlMCPServerVersion`](https://github.com/mlflow/mlflow/blob/v3.16.0/mlflow/store/tracking/dbmodels/models.py#L4038),
+[`SqlMCPServer._version_order_by()`](https://github.com/mlflow/mlflow/blob/v3.16.0/mlflow/store/tracking/dbmodels/models.py#L3881),
+and [`encode_prerelease_sort_key()`](https://github.com/mlflow/mlflow/blob/v3.16.0/mlflow/utils/semver_utils.py#L126).
 
 **Index:** `ix_agent_plugin_versions_latest_lookup` on `(workspace,
 organization, name, status, version_major, version_minor, version_patch,
