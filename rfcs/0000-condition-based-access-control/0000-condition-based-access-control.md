@@ -258,9 +258,13 @@ conditionsByCapability = {
 between them — whereas a *level* implies every lower capability it bundles. Keying
 a condition on a level (e.g. "EDIT: tags.stage='dev'") would be ambiguous: EDIT
 contains `can_read`, so it is unclear whether the condition also gates reads.
-Keying on the atomic capability makes each condition **independent by construction**
-— a `can_read` condition can never gate a `can_update` operation, and vice versa —
-so there is **no condition inheritance between capabilities** to reason about.
+Keying on the atomic capability makes each condition **independent by construction**.
+For example, a `can_read` condition `tags.stage = 'dev'` gates *reading* existing
+experiments by their tag, but has nothing to say about `can_use` in its
+create-in-workspace sense — there is no resource yet, so the tag condition simply
+does not apply to create. Because the condition is attached to `can_read`, not to a
+level that bundles both, there is **no inheritance between capabilities** to reason
+about: the read gate does not have to be argued out of applying to create.
 
 Rules:
 
