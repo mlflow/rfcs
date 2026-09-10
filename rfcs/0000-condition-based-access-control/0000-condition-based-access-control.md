@@ -266,6 +266,18 @@ does not apply to create. Because the condition is attached to `can_read`, not t
 level that bundles both, there is **no inheritance between capabilities** to reason
 about: the read gate does not have to be argued out of applying to create.
 
+**Alternative considered — a flat condition set, filtered at evaluation time.** The
+grant could instead hold a single flat set of clauses, and the permission model could
+decide *at evaluation time* which clauses apply to the current action (e.g. skip a
+`request.*` clause on a read, skip a resource clause on create). This works
+mechanically, but it is opaque from a **reading and authoring** standpoint: looking at
+a grant, an admin cannot tell which clause governs which action — the mapping lives in
+engine logic, not in the grant. That silent filtering means the system is not visibly
+honoring the clauses as written; two grants with the same clause set can behave
+differently depending on rules the reader can't see. Keying each clause to an explicit
+capability makes the action↔condition mapping **authored and visible** on the grant, so
+what you read is what is enforced.
+
 Rules:
 
 - **Independent per capability.** Each capability's filter is self-contained and
