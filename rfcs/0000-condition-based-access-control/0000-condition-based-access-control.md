@@ -441,49 +441,23 @@ flowchart TD
     PERM_CHECK -->|No| DENY3[403 — insufficient permission]
 ```
 
-```python
-def authorize(user_id, resource_type, resource_id, workspace, capability, request_attributes, resource):
-    """Authorize a single operation, identified by the capability it checks.
+The resolver evaluates a single operation, identified by the **capability** it
+checks, in four steps:
 
-    Args:
-        capability: the capability this operation checks
-            (e.g. GetRun -> "can_read", UpdateRun -> "can_update").
-        request_attributes: attributes the operation's validator read from the
-            request (e.g. {"tag_key": ...}); empty/None for reads and searches.
-        resource: The resource object (already loaded for workspace resolution,
-                  tags eager-loaded).
-    """
-    # Step 1: Load candidate grants. Conditions are loaded lazily (Step 3) only for
-    # grants that survive the coarse pattern/level match — never eagerly joined.
-    grants = store.get_grants(user_id, resource_type, resource_id, workspace)
+1. **Load candidate grants** for the user / resource_type / workspace — the coarse
+   grant query, unchanged from today. Conditions are *not* joined here.
+2. **Coarse pass** — keep only grants whose level actually confers the checked
+   capability (pattern/parent match + the level ceiling). No conditions, no resource
+   load yet; if none survive, deny.
+3. **Fine pass** — for the survivors, lazily load **only this capability's**
+   conditions and evaluate them (absent ⇒ unconditional): the request phase first
+   (against the `request_attributes` the operation's validator surfaced — no resource
+   needed), then the resource phase (against the loaded resource's tags/aliases).
+4. **Max-wins** across the grants that authorized the capability.
 
-    # Step 2: Coarse pass — keep grants whose level actually confers `capability`
-    # (pattern/parent match + level ceiling). No conditions, no resource load yet.
-    candidates = [g for g in grants if capability_in_level(capability, g.permission)]
-    if not candidates:
-        return NO_PERMISSIONS
-
-    # Step 3: Fine pass — for surviving grants, load and evaluate ONLY this
-    # capability's conditions (absent = unconditional). Request phase first (no
-    # resource needed), then resource phase. request_attributes came from the
-    # operation's validator (see "Request context extraction").
-    conds = store.get_conditions(  # lazy: keyed by surviving grant ids + capability
-        [g.id for g in candidates], capability
-    )
-    authorized = [
-        g for g in candidates
-        if _request_conditions_match(conds.get(g.id), request_attributes)
-        and _resource_conditions_match(conds.get(g.id), resource)
-    ]
-
-    # Step 4: Max-wins across grants that authorized this capability.
-    return max((g.permission for g in authorized), default=NO_PERMISSIONS)
-```
-
-Both `_request_conditions_match` / `_resource_conditions_match` treat an absent
-condition set as **unconditional** (return `True`), so a capability with no rows
-authorizes freely. On the search path, `capability` is `can_read` and the request
-phase is vacuous — matching the fast/slow-path filter above.
+An absent condition set is treated as **unconditional**, so a capability with no
+rows authorizes freely. On the search path the capability is `can_read` and the
+request phase is vacuous — matching the fast/slow-path filter above.
 
 ### Request context extraction
 
@@ -656,6 +630,63 @@ The fast path ensures no performance regression for the common case (uncondition
 wildcard grants). The slow path only triggers when all grants are conditional,
 and uses tags already present on the search result objects — no extra DB queries.
 
+## Relationship to RFC 0008 (pluggable auth)
+
+This proposal is designed to layer onto the merged pluggable-auth contract (RFC
+0008) without changing its core shape. RFC 0008 already establishes the split this
+design relies on: **core owns route knowledge and resolves the requirement; the
+backend owns the decision.** Conditions slot into that split cleanly.
+
+**What already fits, unchanged:**
+
+- **Capabilities are 0008's action verbs.** 0008's six actions
+  (`read | use | update | delete | manage | create`) map 1:1 onto the capability
+  booleans (`can_read`, …). The capability a condition is keyed to is exactly the
+  `AuthorizationRequirement.action` core already emits — so "which condition applies
+  to this operation" needs no new routing: it is the action 0008 already resolves.
+- **The decision stays in the backend.** Core never evaluates a condition; it only
+  supplies the attributes a condition references (below). This is the same
+  "core resolves structure, backend decides" pattern 0008 uses for `workspace`
+  (and #32 uses for the parent tier).
+- **The condition store is backend-private.** `role_permission_conditions` is the
+  **default DB backend's** realization; it is not part of the 0008 contract. A
+  third-party backend (OPA, etc.) expresses equivalent conditions in its own policy
+  language. The contract only covers the attribute channels and the search shape
+  below.
+
+**What this proposal adds to the 0008 shapes (proposed extensions):**
+
+1. **`request_attributes` on `AuthorizationRequirement`** — a
+   `Mapping[str, str]` of the mutation's attempted input values (e.g.
+   `{"tag_key": "stage"}`), surfaced by the **per-operation validator already in the
+   call path** (see *Request context extraction*), which reads the request with the
+   same `_get_request_message` parse the handler uses. This is what lets the backend
+   evaluate a `request.*` condition without ever seeing the raw request — preserving
+   0008's rule that `RequestContext` never carries request material. Extraction (core)
+   is distinct from evaluation (backend).
+2. **`resource_attributes` on `AuthorizationRequirement`** — the target resource's
+   tags/aliases for the single-resource path, supplied wholesale by core (it already
+   loads the resource to resolve workspace/parent). Type-bounded and loaded only when
+   a surviving grant is conditioned (the two-phase / lazy-load flow above). This lets
+   the backend evaluate a `tags.*`/`aliases.*` condition without reading the resource
+   DB (the 0008 boundary).
+3. **A `predicate` channel on `AuthorizedResources`** for search. 0008's
+   `list_authorized` returns `AuthorizedResources{all, resource_ids}`; a resource
+   condition on a wildcard grant is neither "all" nor a finite id set, so it is
+   emitted as a **filter predicate** core ANDs into the store search. The shape stays
+   flat — `{all, resource_ids, predicate}` — because id-match and condition-test are
+   evaluated in separate phases (coarse then fine), never fused into one clause. When
+   the store grammar cannot express the predicate, it degrades to 0008's existing
+   `all=None` per-row fallback.
+
+**Boundary summary:** core extracts request attributes and loads resource
+attributes (the only party that can read the request and the resource DB); the
+backend owns every decision and every condition. `request_attributes` /
+`resource_attributes` are the *same category of act* as 0008 resolving
+`workspace`/`action` — dispatch inputs, not authorization logic. A backend that does
+not model conditions simply ignores the extra attributes and behaves as an
+unconditional RBAC backend.
+
 ## API change
 
 `add_role_permission` gains an optional `conditions` parameter — a mapping from
@@ -787,65 +818,6 @@ Conditions could degrade performance if unconstrained:
   resolution (`eager=True` subquery load).
 - **No condition logic in SQL.** The DB returns grants + condition rows; all
   evaluation is in application code.
-
-## Relationship to RFC 0008 (pluggable auth)
-
-This proposal is designed to layer onto the merged pluggable-auth contract (RFC
-0008) without changing its core shape. RFC 0008 already establishes the split this
-design relies on: **core owns route knowledge and resolves the requirement; the
-backend owns the decision.** Conditions slot into that split cleanly.
-
-**What already fits, unchanged:**
-
-- **Capabilities are 0008's action verbs.** 0008's six actions
-  (`read | use | update | delete | manage | create`) map 1:1 onto the capability
-  booleans (`can_read`, …). The capability a condition is keyed to is exactly the
-  `AuthorizationRequirement.action` core already emits — so "which condition applies
-  to this operation" needs no new routing: it is the action 0008 already resolves.
-- **The decision stays in the backend.** Core never evaluates a condition; it only
-  supplies the attributes a condition references (below). This is the same
-  "core resolves structure, backend decides" pattern 0008 uses for `workspace`
-  (and #32 uses for the parent tier).
-- **The condition store is backend-private.** `role_permission_conditions` is the
-  **default DB backend's** realization; it is not part of the 0008 contract. A
-  third-party backend (OPA, etc.) expresses equivalent conditions in its own policy
-  language. The contract only covers the attribute channels and the search shape
-  below.
-
-**What this proposal adds to the 0008 shapes (proposed extensions):**
-
-1. **`request_attributes` on `AuthorizationRequirement`** — a
-   `Mapping[str, str]` of the mutation's attempted input values (e.g.
-   `{"tag_key": "stage"}`), surfaced by the **per-operation validator already in the
-   call path** (see *Request context extraction*), which reads the request with the
-   same `_get_request_message` parse the handler uses. This is what lets the backend
-   evaluate a `request.*` condition without ever seeing the raw request — preserving
-   0008's rule that `RequestContext` never carries request material. Extraction (core)
-   is distinct from evaluation (backend).
-2. **`resource_attributes` on `AuthorizationRequirement`** — the target resource's
-   tags/aliases for the single-resource path, supplied wholesale by core (it already
-   loads the resource to resolve workspace/parent). Type-bounded and loaded only when
-   a surviving grant is conditioned (the two-phase / lazy-load flow above). This lets
-   the backend evaluate a `tags.*`/`aliases.*` condition without reading the resource
-   DB (the 0008 boundary).
-3. **A `predicate` channel on `AuthorizedResources`** for search. 0008's
-   `list_authorized` returns `AuthorizedResources{all, resource_ids}`; a resource
-   condition on a wildcard grant is neither "all" nor a finite id set, so it is
-   emitted as a **filter predicate** core ANDs into the store search. The shape stays
-   flat — `{all, resource_ids, predicate}` — because id-match and condition-test are
-   evaluated in separate phases (coarse then fine), never fused into one clause. When
-   the store grammar cannot express the predicate, it degrades to 0008's existing
-   `all=None` per-row fallback.
-
-**Boundary summary:** core extracts request attributes and loads resource
-attributes (the only party that can read the request and the resource DB); the
-backend owns every decision and every condition. `request_attributes` /
-`resource_attributes` are the *same category of act* as 0008 resolving
-`workspace`/`action` — dispatch inputs, not authorization logic. A backend that does
-not model conditions simply ignores the extra attributes and behaves as an
-unconditional RBAC backend.
-
-# Drawbacks and Design Rationale
 
 ## Relationship to the allow-only model
 
