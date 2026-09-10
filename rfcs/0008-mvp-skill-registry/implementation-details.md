@@ -16,8 +16,8 @@ workspace-scoped.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, default `'default'` |
-| `organization` | `String(256)` | PK, default `''` (empty string) |
-| `name` | `String(256)` | PK |
+| `organization` | `String(64)` | PK, default `''` (empty string) |
+| `name` | `String(128)` | PK |
 | `description` | `String(5000)` | |
 | `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `search_text` | `Text` | derived discovery projection of name and description (plus member `keywords` on import) |
@@ -42,8 +42,8 @@ uniqueness constraint to detect a name collision.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `skills` |
-| `organization` | `String(256)` | PK, FK to `skills` |
-| `name` | `String(256)` | PK, FK to `skills` |
+| `organization` | `String(64)` | PK, FK to `skills` |
+| `name` | `String(128)` | PK, FK to `skills` |
 | `version` | `Integer` | PK, server-assigned monotonic integer |
 | `source_type` | `String(20)` | server-set; `git`, `oci`, `zip`, `mlflow` |
 | `source` | `String(2048)` | nullable pointer to skill content |
@@ -117,9 +117,9 @@ digest).
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `skills` |
-| `organization` | `String(256)` | PK, FK to `skills` |
-| `name` | `String(256)` | PK, FK to `skills` |
-| `key` | `String(256)` | PK |
+| `organization` | `String(64)` | PK, FK to `skills` |
+| `name` | `String(128)` | PK, FK to `skills` |
+| `key` | `String(250)` | PK |
 | `value` | `Text` | |
 
 ### `skill_version_tags`
@@ -127,10 +127,10 @@ digest).
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `skill_versions` |
-| `organization` | `String(256)` | PK, FK to `skill_versions` |
-| `name` | `String(256)` | PK, FK to `skill_versions` |
+| `organization` | `String(64)` | PK, FK to `skill_versions` |
+| `name` | `String(128)` | PK, FK to `skill_versions` |
 | `version` | `Integer` | PK, FK to `skill_versions` |
-| `key` | `String(256)` | PK |
+| `key` | `String(250)` | PK |
 | `value` | `Text` | |
 
 ### `skill_aliases`
@@ -138,8 +138,8 @@ digest).
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `skills` |
-| `organization` | `String(256)` | PK, FK to `skills` |
-| `name` | `String(256)` | PK, FK to `skills` |
+| `organization` | `String(64)` | PK, FK to `skills` |
+| `name` | `String(128)` | PK, FK to `skills` |
 | `alias` | `String(256)` | PK |
 | `version` | `Integer` | target `skill_versions.version` under the same parent; see alias integrity below |
 
@@ -159,8 +159,8 @@ an alias cannot bypass the kill switch (see Deletion semantics).
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, default `'default'` |
-| `organization` | `String(256)` | PK, default `''` (empty string) |
-| `name` | `String(256)` | PK |
+| `organization` | `String(64)` | PK, default `''` (empty string) |
+| `name` | `String(128)` | PK |
 | `description` | `String(5000)` | |
 | `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `created_by` | `String(256)` | |
@@ -175,9 +175,9 @@ PrimaryKey: `(workspace, organization, name)`.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `agent_plugins` |
-| `organization` | `String(256)` | PK, FK to `agent_plugins` |
-| `name` | `String(256)` | PK, FK to `agent_plugins` |
-| `version` | `String(256)` | PK; equal to canonical `plugin_json["version"]` |
+| `organization` | `String(64)` | PK, FK to `agent_plugins` |
+| `name` | `String(128)` | PK, FK to `agent_plugins` |
+| `version` | `String(128)` | PK; equal to canonical `plugin_json["version"]` |
 | `version_major` | `Integer` | extracted SemVer major component |
 | `version_minor` | `Integer` | extracted SemVer minor component |
 | `version_patch` | `Integer` | extracted SemVer patch component |
@@ -236,12 +236,15 @@ creation_timestamp)` supports both resolution paths.
 | Column | Type | Notes |
 |--------|------|-------|
 | `plugin_workspace` | `String(63)` | PK, FK to `agent_plugin_versions` |
-| `plugin_organization` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `plugin_name` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `plugin_version` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `member_organization` | `String(256)` | PK, FK to `skill_versions` |
-| `member_name` | `String(256)` | PK, FK to `skill_versions` |
-| `member_version` | `Integer` | PK, FK to `skill_versions` |
+| `plugin_organization` | `String(64)` | PK, FK to `agent_plugin_versions` |
+| `plugin_name` | `String(128)` | PK, FK to `agent_plugin_versions` |
+| `plugin_version` | `String(128)` | PK, FK to `agent_plugin_versions` |
+| `member_name` | `String(128)` | PK, FK to `skill_versions` |
+| `member_organization` | `String(64)` | FK to `skill_versions` |
+| `member_version` | `Integer` | FK to `skill_versions` |
+
+PrimaryKey: `(plugin_workspace, plugin_organization, plugin_name,
+plugin_version, member_name)`.
 
 FK: `(plugin_workspace, plugin_organization, plugin_name,
 plugin_version)` references `agent_plugin_versions`, CASCADE
@@ -259,12 +262,15 @@ and agent plugins share the same workspace;
 `plugin_workspace` is reused for the skill FK, so a membership never crosses a
 workspace boundary (see [Workspace admin utilities](#workspace-admin-utilities)).
 
-**Member-name uniqueness.** A `UNIQUE` constraint on `(plugin_workspace,
-plugin_organization, plugin_name, plugin_version, member_name)` enforces that
-member names are distinct within an agent plugin version. The primary key alone
-does not guarantee this, because it also includes `member_organization` and
-`member_version`; those two columns are retained for the `skill_versions` FK and
-as stored data, not to distinguish rows for uniqueness. For an assembled plugin
+**Member-name uniqueness.** The primary key is exactly the tuple that must be
+unique: `(plugin_workspace, plugin_organization, plugin_name, plugin_version,
+member_name)`. `member_organization` and `member_version` are `NOT NULL`
+columns outside the key, retained for the `skill_versions` FK and as stored
+data rather than to distinguish rows; an explicit index on `(plugin_workspace,
+member_organization, member_name, member_version)` backs that FK. Making the
+uniqueness tuple the primary key, rather than adding a separate `UNIQUE`
+alongside a wider key, avoids the widest index the schema would otherwise
+carry — see the key-length budget below. For an assembled plugin
 the `skills/<member-name>/` pull layout is keyed on the name alone, so a name
 collision would be ambiguous on disk, and the server rejects a create request
 whose member list repeats a name. For a packaged plugin the importer derives
@@ -282,9 +288,9 @@ rejected before insert.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `agent_plugins` |
-| `organization` | `String(256)` | PK, FK to `agent_plugins` |
-| `name` | `String(256)` | PK, FK to `agent_plugins` |
-| `key` | `String(256)` | PK |
+| `organization` | `String(64)` | PK, FK to `agent_plugins` |
+| `name` | `String(128)` | PK, FK to `agent_plugins` |
+| `key` | `String(250)` | PK |
 | `value` | `Text` | |
 
 ### `agent_plugin_version_tags`
@@ -292,10 +298,10 @@ rejected before insert.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `agent_plugin_versions` |
-| `organization` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `name` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `version` | `String(256)` | PK, FK to `agent_plugin_versions` |
-| `key` | `String(256)` | PK |
+| `organization` | `String(64)` | PK, FK to `agent_plugin_versions` |
+| `name` | `String(128)` | PK, FK to `agent_plugin_versions` |
+| `version` | `String(128)` | PK, FK to `agent_plugin_versions` |
+| `key` | `String(250)` | PK |
 | `value` | `Text` | |
 
 ### `agent_plugin_aliases`
@@ -303,16 +309,46 @@ rejected before insert.
 | Column | Type | Notes |
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK to `agent_plugins` |
-| `organization` | `String(256)` | PK, FK to `agent_plugins` |
-| `name` | `String(256)` | PK, FK to `agent_plugins` |
+| `organization` | `String(64)` | PK, FK to `agent_plugins` |
+| `name` | `String(128)` | PK, FK to `agent_plugins` |
 | `alias` | `String(256)` | PK |
-| `version` | `String(256)` | target agent plugin manifest version |
+| `version` | `String(128)` | target agent plugin manifest version |
 
 **Canonical manifest storage.** `plugin_json` uses SQLAlchemy's `JSON` type,
 following RFC-0004's `server_json` precedent. It maps to native JSON where the
 database supports it and to the platform's text-backed JSON representation for
 SQLite and SQL Server. The full payload is preserved, while identity, ordering,
 and search projections are materialized separately.
+
+**Key-length budget.** Columns that appear in composite keys share a fixed byte
+budget, set by the strictest index-key limit among the supported databases.
+Their widths are allocations from that budget, not estimates of how long the
+values actually get. MySQL/InnoDB caps an index key at 3072 bytes, and under
+`utf8mb4` every declared character costs 4 bytes; SQL Server caps a clustered
+primary key at 900 bytes. This registry is the first to put `organization`
+alongside `name` in every composite key, and `agent_plugin_version_members`
+carries two `(organization, name)` pairs in one key, so at `String(256)` most
+of these tables cannot be created at all: the widest keys reach 4348-5376 bytes
+and MySQL rejects the `CREATE TABLE` outright.
+
+Two things keep every key inside the limit. First,
+`agent_plugin_version_members` uses the member-name uniqueness tuple as its
+primary key rather than a wider key plus a separate `UNIQUE`, which avoids the
+widest index the schema would otherwise carry. Second, `organization` is `String(64)`, `name` and the
+agent plugin `version` are `String(128)`, and tag `key` is `String(250)` —
+matching [MLflow's existing tag-key width](https://github.com/mlflow/mlflow/blob/v3.16.0/mlflow/utils/validation.py#L76)
+and the [`String(128)` version width](https://github.com/mlflow/mlflow/blob/v3.16.0/mlflow/store/tracking/dbmodels/models.py#L4034)
+already used by the MCP Server Registry
+([RFC-0004](../0004-mcp-registry/0004-mcp-registry.md)), which resolved the same
+problem the same way. Every width remains at or above the corresponding
+registration-time validator, so no otherwise-valid value becomes unstorable.
+
+The largest remaining key is the `agent_plugin_version_tags` primary key at
+2532 bytes on MySQL and 633 bytes on SQL Server, and every primary key, unique
+constraint, and index in this section fits on all four supported engines.
+Widths not listed here — `alias`, `digest`, `source`/`ref`/`subpath`,
+`description`, `created_by`, `last_updated_by` — are unaffected, because they
+never appear in a composite key.
 
 **Workspace handling.** Every table is workspace-scoped, and the workspace
 is part of its primary key. Single-tenant deployments use `'default'`.
