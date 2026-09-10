@@ -304,7 +304,8 @@ borrowing them upward is always valid). The 5-condition limit is enforced on the
 
 ### Condition shape
 
-A condition is a filter expression string following the format:
+A condition is a filter expression string following the format below, reusing
+MLflow's existing search filter syntax:
 
 ```
 <entity>.<key> <operator> <value>
@@ -317,6 +318,30 @@ Example conditions:
 "aliases.champion EXISTS"
 "tags.stage IN ('dev', 'staging')"
 ```
+
+**Resource condition entities** (matched against the resource's current state):
+
+| Entity | Description | Example |
+|--------|-------------|---------|
+| `tags` | Resource tags (key-value pairs) | `tags.stage = 'dev'` |
+| `aliases` | Model aliases (registered_model only) | `aliases.champion EXISTS` |
+
+**Request condition entities** (matched against the incoming request payload):
+
+| Entity | Description | Example |
+|--------|-------------|---------|
+| `request` | Incoming request payload fields | `request.tag_key != 'stage'` |
+
+**Supported operators:**
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `=` | Equals | `tags.stage = 'dev'` |
+| `!=` | Not equals | `request.tag_key != 'stage'` |
+| `EXISTS` | Key/field is present | `tags.reviewed EXISTS` |
+| `NOT EXISTS` | Key/field is absent | `tags.stage NOT EXISTS` |
+| `IN` | Value in set | `tags.stage IN ('dev', 'staging')` |
+| `NOT IN` | Value not in set | `request.alias NOT IN ('champion', 'production')` |
 
 ### AND vs OR semantics
 
@@ -365,38 +390,6 @@ single unconditional grant will always override conditional grants of the same o
 lower permission level. Likewise, a capability **omitted** from a grant's
 `conditions` map is unconditional for the operations that check it — absence of a
 condition is never a denial.
-
-### Condition syntax
-
-Conditions reuse MLflow's existing search filter syntax:
-
-```
-<entity>.<key> <operator> <value>
-```
-
-**Resource condition entities:**
-
-| Entity | Description | Example |
-|--------|-------------|---------|
-| `tags` | Resource tags (key-value pairs) | `tags.stage = 'dev'` |
-| `aliases` | Model aliases (registered_model only) | `aliases.champion EXISTS` |
-
-**Request condition entities:**
-
-| Entity | Description | Example |
-|--------|-------------|---------|
-| `request` | Incoming request payload fields | `request.tag_key != 'stage'` |
-
-**Supported operators:**
-
-| Operator | Meaning | Example |
-|----------|---------|---------|
-| `=` | Equals | `tags.stage = 'dev'` |
-| `!=` | Not equals | `request.tag_key != 'stage'` |
-| `EXISTS` | Key/field is present | `tags.reviewed EXISTS` |
-| `NOT EXISTS` | Key/field is absent | `tags.stage NOT EXISTS` |
-| `IN` | Value in set | `tags.stage IN ('dev', 'staging')` |
-| `NOT IN` | Value not in set | `request.alias NOT IN ('champion', 'production')` |
 
 ### Two-phase evaluation
 
