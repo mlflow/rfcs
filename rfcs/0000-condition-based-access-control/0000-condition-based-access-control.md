@@ -442,13 +442,14 @@ flowchart TD
 ```
 
 ```python
-def authorize(user_id, resource_type, resource_id, workspace, capability, request, resource):
+def authorize(user_id, resource_type, resource_id, workspace, capability, request_attributes, resource):
     """Authorize a single operation, identified by the capability it checks.
 
     Args:
         capability: the capability this operation checks
             (e.g. GetRun -> "can_read", UpdateRun -> "can_update").
-        request: The incoming request (for request conditions).
+        request_attributes: attributes the operation's validator read from the
+            request (e.g. {"tag_key": ...}); empty/None for reads and searches.
         resource: The resource object (already loaded for workspace resolution,
                   tags eager-loaded).
     """
@@ -464,14 +465,14 @@ def authorize(user_id, resource_type, resource_id, workspace, capability, reques
 
     # Step 3: Fine pass — for surviving grants, load and evaluate ONLY this
     # capability's conditions (absent = unconditional). Request phase first (no
-    # resource needed), then resource phase.
-    request_context = _extract_request_context(request)
+    # resource needed), then resource phase. request_attributes came from the
+    # operation's validator (see "Request context extraction").
     conds = store.get_conditions(  # lazy: keyed by surviving grant ids + capability
         [g.id for g in candidates], capability
     )
     authorized = [
         g for g in candidates
-        if _request_conditions_match(conds.get(g.id), request_context)
+        if _request_conditions_match(conds.get(g.id), request_attributes)
         and _resource_conditions_match(conds.get(g.id), resource)
     ]
 
@@ -486,32 +487,42 @@ phase is vacuous — matching the fast/slow-path filter above.
 
 ### Request context extraction
 
-Each operation exposes its mutable input fields for request condition evaluation.
-Operations without mutable inputs (search, get, delete) have no request context —
-request conditions are vacuously true for them.
+Request attributes are extracted by the **per-operation validator that already exists
+in the call path** — not by a separate parallel registry. Today every mutating
+operation is mapped in `BEFORE_REQUEST_HANDLERS` to a `validate_can_*` function that
+already reads the request (e.g. `SetRegisteredModelAlias → validate_can_update_registered_model`,
+which parses the request to resolve the model), and that map is dispatched from the
+before-request hook (`_find_validator(request)` in `mlflow/server/auth/__init__.py`).
+This is exactly where request attributes are produced and where the condition check runs.
+
+Concretely, the validator for a mutating operation:
+1. parses its typed request via the same `_get_request_message(<Op>(), ...)` the handler
+   uses (so the field names come from the operation's own proto/schema — no second
+   source of truth to keep in sync);
+2. returns the attributes it read as a small `dict` (e.g. `{"tag_key": ...}`) on the
+   `AuthorizationRequirement.request_attributes` channel;
+3. the backend evaluates the `request.*` conditions for the checked capability against
+   that dict.
 
 ```python
-# Per-operation request context extractors
-REQUEST_CONTEXT_EXTRACTORS = {
-    SetExperimentTag: lambda req: {"tag_key": req.json["key"], "tag_value": req.json["value"]},
-    SetRegisteredModelAlias: lambda req: {"alias": req.json["alias"], "version": req.json["version"]},
-    SetRegisteredModelTag: lambda req: {"tag_key": req.json["key"], "tag_value": req.json["value"]},
-    SetModelVersionTag: lambda req: {"tag_key": req.json["key"], "tag_value": req.json["value"]},
-    SetTag: lambda req: {"tag_key": req.json["key"], "tag_value": req.json["value"]},
-    SetTraceTag: lambda req: {"tag_key": req.json["key"], "tag_value": req.json["value"]},
-    # Read/search/delete operations: no request context (None)
-    GetExperiment: None,
-    SearchExperiments: None,
-    DeleteExperiment: None,
-    # ...
-}
-
-def _extract_request_context(request) -> dict | None:
-    extractor = REQUEST_CONTEXT_EXTRACTORS.get(request.operation)
-    if extractor is None:
-        return None
-    return extractor(request)
+# The validator already in BEFORE_REQUEST_HANDLERS reads the request; it now also
+# surfaces the attributes it read. No parallel REQUEST_CONTEXT_EXTRACTORS map.
+def validate_can_update_experiment_set_tag():
+    req = _get_request_message(SetExperimentTag())          # same parse the handler does
+    return AuthzInput(
+        capability="can_update",
+        request_attributes={"tag_key": req.key, "tag_value": req.value},
+    )
 ```
+
+An operation whose validator surfaces no attributes (reads, searches, plain deletes)
+simply provides no `request_attributes`; `request.*` conditions are then vacuously
+true for it. Because the mapping lives on the operation's own validator — which must
+exist for the operation to be authorized at all — there is no separate registry that
+can drift out of sync, and the "which fields does this operation expose" knowledge
+stays next to the operation's existing request parsing. (The condition-kind validity
+check in *Condition-kind × capability validity* keys off exactly whether a mutating
+operation surfaces request attributes.)
 
 ### Extendable evaluation
 
@@ -590,9 +601,10 @@ means different things per type:
   value.
 
 So validity is **(kind × capability × resource_type)**, and the source of truth is
-the per-operation request-context extractor registry (below) — not a static table:
+whether the operation's validator surfaces request attributes (see *Request context
+extraction*) — not a static table:
 
-- **Request-condition validity is extractor-derived (fail-closed).** A `request.*`
+- **Request-condition validity is validator-derived (fail-closed).** A `request.*`
   condition may be attached to a capability **iff at least one operation of that
   resource_type at that capability carries request attributes** (has a non-null
   extractor). No extractor → the request condition has nothing to gate → **rejected
@@ -804,8 +816,9 @@ backend owns the decision.** Conditions slot into that split cleanly.
 
 1. **`request_attributes` on `AuthorizationRequirement`** — a
    `Mapping[str, str]` of the mutation's attempted input values (e.g.
-   `{"tag_key": "stage"}`), populated by a **core-owned per-operation extractor**
-   (the `REQUEST_CONTEXT_EXTRACTORS` registry above). This is what lets the backend
+   `{"tag_key": "stage"}`), surfaced by the **per-operation validator already in the
+   call path** (see *Request context extraction*), which reads the request with the
+   same `_get_request_message` parse the handler uses. This is what lets the backend
    evaluate a `request.*` condition without ever seeing the raw request — preserving
    0008's rule that `RequestContext` never carries request material. Extraction (core)
    is distinct from evaluation (backend).
@@ -1022,11 +1035,12 @@ no rows is inert (grants without condition rows behave unconditionally).
 
 2. **~~How to add test coverage for resource types with missing request and resource
    evaluators?~~ (resolved)** Rather than pass vacuously at request time, validity is
-   **derived from the request-context extractor registry and enforced at grant
-   creation** (see *Condition-kind × capability validity*): a request condition on a
-   (resource_type, capability) with no extractor is **rejected at creation**
-   (fail-closed), and a resource condition on a capability with no resource is
-   rejected likewise. A CI lint should still assert every registered operation has an
-   extractor entry (even if `None`) so the registry stays exhaustive. Remaining sub-
-   question: should the extractor registry be validated against the operation list in
-   CI, or at server startup?
+   **derived from whether the operation's validator surfaces request attributes and
+   enforced at grant creation** (see *Condition-kind × capability validity*): a request
+   condition on a (resource_type, capability) whose operations surface no request
+   attributes is **rejected at creation** (fail-closed), and a resource condition on a
+   capability with no resource is rejected likewise. Because extraction rides the
+   operation's existing validator (rather than a parallel registry), there is no
+   separate table that can silently omit an operation. Remaining sub-question: should
+   a CI lint assert every mutating operation's validator declares its surfaced
+   attributes, so the validity check is exhaustive?
