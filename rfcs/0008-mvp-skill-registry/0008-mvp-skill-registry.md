@@ -1166,6 +1166,49 @@ existing workspace-aware registry patterns (model registry, MCP
 registry). Cross-workspace sharing is out of scope for this RFC and
 should be solved at the platform level across all MLflow registries.
 
+**A plugin and the skills it pins are always in the same workspace.** The
+membership table stores that workspace once and uses it for both of its foreign
+keys, so a membership cannot cross a workspace boundary. The skill registry is
+the first MLflow registry whose schema links two root resources, so [deleting a
+workspace](https://mlflow.org/docs/latest/self-hosting/workspaces/getting-started/#delete-workspace), [consolidating every workspace into `default`](https://mlflow.org/docs/latest/self-hosting/workspaces/configuration/#admin-utility-migrate-to-default-workspace), or
+[moving named resources between workspaces](https://mlflow.org/docs/latest/self-hosting/workspaces/configuration/#admin-utility-move-resources-between-workspaces) can pull a plugin and its
+skills along together. One rule covers all three:
+
+> **A plugin travels with its skills.** An action on a plugin, or on a skill,
+> takes the whole bundle — unless a live plugin version outside that bundle
+> still pins one of those skills, in which case the action is refused and names
+> the blocking plugin versions.
+
+This is the rule the RFC already gives for cascade-deleting an agent plugin,
+with the final action swapped, so delete and move stay one mental model.
+
+Moving resources between workspaces shows the rule in practice. Skills and agent
+plugins are named `@organization/name`, matching their URI convention, or by a
+bare name for the empty organization:
+
+```bash
+# An agent plugin moves together with the skills it pins.
+mlflow db move-resources sqlite:///mlflow.db \
+    --from default --to team-a \
+    --resource-type agent_plugins --name @acme/pr-workflow
+# moved: acme/pr-workflow, acme/code-review
+
+# Repeat --name to move plugins from several organizations in one command.
+mlflow db move-resources sqlite:///mlflow.db \
+    --from default --to team-a \
+    --resource-type agent_plugins \
+    --name pr-workflow --name @acme/pr-workflow --name @beta/release-notes
+
+# Moving a pinned skill on its own is refused, and the error names what pins it.
+mlflow db move-resources sqlite:///mlflow.db \
+    --from default --to team-a \
+    --resource-type skills --name @acme/code-review
+```
+
+See [implementation-details.md: Workspace admin
+utilities](implementation-details.md#workspace-admin-utilities) for what each
+surface does and for the scenario matrix.
+
 ### Permissions
 
 The skill registry integrates with MLflow's existing permission

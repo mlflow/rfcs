@@ -1,8 +1,8 @@
 # RFC-0008: Skill Registry Implementation Details
 
 This document contains implementation-level specifications for
-RFC-0008 (Skill Registry). It covers database schema, entity
-dataclasses, store interface method signatures, REST API endpoints,
+RFC-0008 (Skill Registry). It covers database schema, workspace admin utilities,
+entity dataclasses, store interface method signatures, REST API endpoints,
 pagination/filtering, SDK convenience functions, and CLI mapping. These details
 support implementers; the main RFC covers the design rationale.
 
@@ -233,7 +233,8 @@ member's soft delete (status transition to `deleted`), which is allowed
 and handled as a derived withdrawal of the containing plugin versions
 across resolution, discovery, and pull (see Deletion semantics). Skills
 and agent plugins share the same workspace;
-`plugin_workspace` is reused for the skill FK.
+`plugin_workspace` is reused for the skill FK, so a membership never crosses a
+workspace boundary (see [Workspace admin utilities](#workspace-admin-utilities)).
 
 **Member-name uniqueness.** A `UNIQUE` constraint on `(plugin_workspace,
 plugin_organization, plugin_name, plugin_version, member_name)` enforces that
@@ -290,10 +291,14 @@ database supports it and to the platform's text-backed JSON representation for
 SQLite and SQL Server. The full payload is preserved, while identity, ordering,
 and search projections are materialized separately.
 
-**Workspace handling.** All tables carry a `workspace` column as part
-of the composite key. Single-tenant deployments use `'default'`.
+**Workspace handling.** Every table is workspace-scoped, and the workspace
+is part of its primary key. Single-tenant deployments use `'default'`.
 Child tables reference the parent by `(workspace, organization,
-name)`, so workspace is part of every table's primary key.
+name)`. The one table that does not name the column `workspace` is
+`agent_plugin_version_members`, which carries it as `plugin_workspace` and
+reuses it for both of its foreign keys; see [Workspace admin
+utilities](#workspace-admin-utilities) for what that means when an administrator
+moves or deletes a workspace's contents.
 
 **Timestamps.** Set at the application layer via
 `get_current_time_millis()`, not via DDL defaults.
@@ -366,6 +371,103 @@ used by the Model Registry and RFC-0004:
 - The `deleted` status is terminal. Internal audit or provenance paths
   may retain enough metadata to explain historical agent plugin
   snapshots, but deleted versions are not surfaced to consumers.
+
+## Workspace admin utilities
+
+Three admin surfaces move or remove a workspace's contents. For every other
+resource type they work by setting the `workspace` column on that resource's
+rows. Skills and agent plugins need more, for the reason below.
+
+| Surface | Effect |
+|---|---|
+| [`delete_workspace(name, mode=RESTRICT \| CASCADE \| SET_DEFAULT)`](https://mlflow.org/docs/latest/self-hosting/workspaces/getting-started/#delete-workspace) | Delete a workspace: refuse while it still holds resources, delete them, or set their `workspace` to `default`. |
+| [`mlflow db migrate-to-default-workspace`](https://mlflow.org/docs/latest/self-hosting/workspaces/configuration/#admin-utility-migrate-to-default-workspace) | Turn multi-tenancy off: set `workspace` to `default` on every row in every workspace. |
+| [`mlflow db move-resources --from A --to B --resource-type ...`](https://mlflow.org/docs/latest/self-hosting/workspaces/configuration/#admin-utility-move-resources-between-workspaces) | Set `workspace` to `B` on named resources currently in `A`. |
+
+**A plugin version and the skill versions it pins are always in the same
+workspace.** `agent_plugin_version_members` has one workspace column,
+`plugin_workspace`, and uses it for both foreign keys, so there is nowhere to
+record a member living in a different workspace. Any admin action that changes a
+plugin's workspace has to change its member skills' workspace too.
+
+**The rule: a plugin travels with its skills.** Acting on a plugin, or on a
+skill, takes the whole bundle — unless a live plugin version outside that bundle
+still pins one of those skills, in which case the action is refused and names
+the blocking plugin versions. Delete removes the bundle; move relocates it.
+
+This is the rule the RFC already gives for `delete_agent_plugin(cascade=True)`
+(see Deletion semantics): check first, fail atomically naming the blockers, and
+purge membership rows held only by soft-deleted plugin versions before checking.
+Move reuses it and swaps only the final action.
+
+*Live* means `status != 'deleted'`, for skill versions and plugin versions alike.
+
+### How each surface handles skills and agent plugins
+
+**Four of the five surfaces act on a whole workspace,** so a plugin and the
+skill versions it pins are always in scope together and no blocker is possible.
+Their intended behavior is unambiguous:
+
+- `delete_workspace(RESTRICT)` refuses while the workspace still holds any skill
+  or agent plugin, alongside the resources it already counts.
+- `delete_workspace(CASCADE)` deletes them, agent plugins before skills, so the
+  `agent_plugin_version_members` → `skill_versions` foreign key never blocks it.
+- `delete_workspace(SET_DEFAULT)` and `mlflow db migrate-to-default-workspace`
+  set `workspace` to `default`. Only the link table needs special handling; see
+  [Moving the link table](#moving-the-link-table).
+
+**Only `mlflow db move-resources` needs clarifying.** For example: when a plugin
+moves, does a skill that other live plugin versions also pin move with it? The
+scenario matrix below answers that and every related case. Three further
+constraints apply:
+
+- **Membership rows held by soft-deleted plugin versions are purged first,** so
+  they neither block the move nor dangle after it — including rows on a plugin
+  that is not itself moving. For example, an admin soft-deletes plugin version
+  `pr-workflow 1.0.0`, which leaves its membership rows in place; moving the
+  `code-review` skill it pinned then drops those rows instead of refusing.
+- **Resources are named by `(organization, name)`,** unlike every other movable
+  resource, which is named by `name` alone. The CLI takes a bare `name` for the
+  empty organization and `@organization/name` otherwise, matching the skill URI
+  convention, so one command can span several organizations.
+- **The move is atomic.** The check runs before anything moves, and `--dry-run`
+  reports the bundle and any blockers without writing.
+
+### Scenario matrix
+
+Plugin `P` has a live version that pins skill `S`. Membership is version-level,
+but delete and move act on the whole plugin or the whole skill, all versions, so
+the "who else pins this?" check runs at that level.
+
+| `S` is also pinned outside `P` by… | cascade-delete `P` *(reference)* | move `P` | move `S` alone |
+|---|---|---|---|
+| nothing | `P` and `S` are deleted | `P` and `S` move | refused, naming `P` |
+| a **live** plugin version | refused, naming the blockers | refused, naming the blockers | refused, naming `P` and the other plugin |
+| only a **soft-deleted** plugin version | `P` and `S` are deleted, the stale membership row is purged | `P` and `S` move, the stale row is purged | refused, naming `P` |
+
+The first column is `delete_agent_plugin(cascade=True)` (see Deletion
+semantics), not a workspace utility. It is here because the move rule is that
+rule with its final action swapped, so the two columns should read the same —
+and do.
+
+From the last column, we see that while any live plugin version pins a skill,
+that skill cannot be moved. And a skill that no live plugin version pins moves
+and deletes like any other resource.
+
+### Moving the link table
+
+`agent_plugin_version_members` cannot be moved by rewriting `plugin_workspace`
+in place. That one column anchors both the foreign key to
+`agent_plugin_versions` (`ON UPDATE CASCADE`) and the one to `skill_versions`
+(no `ON UPDATE`), so rewriting it while the referenced `skill_versions` rows are
+themselves mid-move breaks the skill-side key.
+
+Move the rows around their parents instead: in one transaction, delete them,
+move the parents, then re-insert them at the new workspace. No step leaves a
+membership row pointing at a parent that has already moved, so neither foreign
+key is ever violated, even on engines that check constraints after every
+statement rather than at commit. The existing foreign keys are enough — nothing
+in the schema changes.
 
 ## Entity dataclasses
 
