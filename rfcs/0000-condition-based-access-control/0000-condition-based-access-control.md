@@ -35,8 +35,8 @@ client.add_role_permission(
         # can read dev experiments; can mutate them only while stage=dev, and may
         # never rewrite the stage tag itself
         "can_read":   "tags.stage = 'dev'",
-        "can_update": "(can_read) + request.tag_key != 'stage'",
-        "can_use":    "(can_read)",
+        "can_update": "(can_read) + request.tag_key != 'stage'", # (can_read) shorthand used to copy conditions from can_read
+        "can_use":    "request.name != 'prod-experiment'", # (can_read) not re-used because resource conditions don't apply to create (resource doesn't exist yet)
     },
 )
 
@@ -216,7 +216,11 @@ cleared role sees them.
 
 # Detailed design
 
-## Condition model
+## Condition model (authoring & customer experience)
+
+This section covers what conditions are and how an admin authors them on a grant. The
+[Implementation](#implementation) section below covers grant-creation validation,
+evaluation, and how it maps onto the pluggable-auth contract.
 
 Conditions are filter expressions attached to role permission grants. They come
 in two types, evaluated at different phases of the request lifecycle:
@@ -266,17 +270,9 @@ does not apply to create. Because the condition is attached to `can_read`, not t
 level that bundles both, there is **no inheritance between capabilities** to reason
 about: the read gate does not have to be argued out of applying to create.
 
-**Alternative considered — a flat condition set, filtered at evaluation time.** The
-grant could instead hold a single flat set of clauses, and the permission model could
-decide *at evaluation time* which clauses apply to the current action (e.g. skip a
-`request.*` clause on a read, skip a resource clause on create). This works
-mechanically, but it is opaque from a **reading and authoring** standpoint: looking at
-a grant, an admin cannot tell which clause governs which action — the mapping lives in
-engine logic, not in the grant. That silent filtering means the system is not visibly
-honoring the clauses as written; two grants with the same clause set can behave
-differently depending on rules the reader can't see. Keying each clause to an explicit
-capability makes the action↔condition mapping **authored and visible** on the grant, so
-what you read is what is enforced.
+The alternative — a single flat clause set that the permission model filters per
+action at evaluation time — is rejected primarily because it hides which clause
+governs which action from the reader. See [Alternatives §E](#e-flat-condition-set-filtered-at-evaluation-time).
 
 Rules:
 
@@ -296,6 +292,11 @@ Rules:
 - **Evaluation:** an operation resolves to its capability `C`; the grant authorizes
   `C` iff `C ∈ level` **and** `conditionsByCapability[C]` is satisfied (absent =
   unconditional). Grants still compose with max-wins across grants.
+- **Maps onto RFC 0008 with no new routing.** The five capabilities are 0008's action
+  verbs (`read | use | update | delete | manage`, plus `create`); the capability a
+  condition is keyed to is exactly the `AuthorizationRequirement.action` core already
+  resolves — so "which condition applies to this operation" is the action 0008 already
+  emits, not a new dispatch.
 
 #### Capability composition (authoring shorthand)
 
@@ -407,6 +408,59 @@ lower permission level. Likewise, a capability **omitted** from a grant's
 `conditions` map is unconditional for the operations that check it — absence of a
 condition is never a denial.
 
+## Implementation
+
+This section covers the grant-creation validation, request-time evaluation, and how the
+model maps onto the merged pluggable-auth contract (RFC 0008).
+
+### Condition-kind × capability validity
+
+Which conditions may even be *attached* to a capability is a grant-creation rule (as
+opposed to the evaluation rules below). Not every condition kind is meaningful on
+every capability, and the answer is **resource-type dependent** — because a capability
+like `can_use` or `can_delete` means different things per type:
+
+- `can_use` on a workspace = *create* an experiment/model (sets initial values);
+  `can_use` on a gateway endpoint = *invoke* (sets no value).
+- `can_delete` on a run = plain remove (no value); `can_delete` on a registered
+  model via `DeleteRegisteredModelAlias(name, alias)` = deletes *by* an alias
+  value.
+
+So validity is **(kind × capability × resource_type)**, and the source of truth is
+whether the operation surfaces request attributes (see *Request context
+extraction*) — not a static table:
+
+- **Request-condition validity is derived from the operation's surfaced attributes (fail-closed).** A `request.*`
+  condition may be attached to a capability **iff at least one operation of that
+  resource_type at that capability carries request attributes** (has a non-null
+  extractor). No extractor → the request condition has nothing to gate → **rejected
+  at grant creation.** This also resolves the "missing evaluator" gap (see Open
+  questions): an unregistered/absent extractor fails closed at creation rather than
+  passing vacuously at request time.
+- **Resource-condition validity = existing-resource.** A `tags.*`/`aliases.*`
+  condition is valid on any capability that acts on an existing resource. The only
+  exclusion is the *create* sense (no resource yet — e.g. workspace `can_use`),
+  where a resource condition is vacuous.
+
+Combined with the level ceiling (a condition's capability must be conferred by the
+grant's level), grant creation rejects any condition whose (kind, capability,
+resource_type) is invalid.
+
+**Grant-creation processing.** For each capability entry supplied on the grant (the
+`conditions` map from *Condition model*), at creation time the filter string is:
+1. **Parsed** with the same parser as search `filter_string`.
+2. **Expanded** if it uses capability composition (`(can_read) + …`) — the referenced
+   lower capability's filter is inlined (higher-references-lower only).
+3. **Validated** — the capability must be conferred by the grant's level (ceiling,
+   no-escalation); entities/operators must be supported; and the (kind, capability,
+   resource_type) must be valid per the rule above.
+4. **Split** into individual clauses and stored as `role_permission_conditions` rows
+   tagged with `capability` + `entity`.
+
+Creation is **rejected with `INVALID_PARAMETER_VALUE`** if a filter is malformed, if a
+capability isn't conferred by the level, if the (kind, capability, resource_type) is
+invalid, or if any capability's *expanded* filter exceeds the 5-clause limit.
+
 ### Two-phase evaluation
 
 Conditions are evaluated in two phases, enabling early rejection before the
@@ -475,292 +529,175 @@ An absent condition set is treated as **unconditional**, so a capability with no
 rows authorizes freely. On the search path the capability is `can_read` and the
 request phase is vacuous — matching the fast/slow-path filter above.
 
-### Request context extraction
-
-Request attributes are extracted by the **per-operation validator that already exists
-in the call path** — not by a separate parallel registry. Today every mutating
-operation is mapped in `BEFORE_REQUEST_HANDLERS` to a `validate_can_*` function that
-already reads the request (e.g. `SetRegisteredModelAlias → validate_can_update_registered_model`,
-which parses the request to resolve the model), and that map is dispatched from the
-before-request hook (`_find_validator(request)` in `mlflow/server/auth/__init__.py`).
-This is exactly where request attributes are produced and where the condition check runs.
-
-Concretely, the validator for a mutating operation:
-1. parses its typed request via the same `_get_request_message(<Op>(), ...)` the handler
-   uses (so the field names come from the operation's own proto/schema — no second
-   source of truth to keep in sync);
-2. returns the attributes it read as a small `dict` (e.g. `{"tag_key": ...}`) on the
-   `AuthorizationRequirement.request_attributes` channel;
-3. the backend evaluates the `request.*` conditions for the checked capability against
-   that dict.
+The two phases are just a split of the surviving grant's clauses by entity — request
+clauses in Phase 1, resource clauses in Phase 2; a phase with no clauses passes:
 
 ```python
-# The validator already in BEFORE_REQUEST_HANDLERS reads the request; it now also
-# surfaces the attributes it read. No parallel REQUEST_CONTEXT_EXTRACTORS map.
-def validate_can_update_experiment_set_tag():
-    req = _get_request_message(SetExperimentTag())          # same parse the handler does
-    return AuthzInput(
-        capability="can_update",
-        request_attributes={"tag_key": req.key, "tag_value": req.value},
-    )
-```
-
-An operation whose validator surfaces no attributes (reads, searches, plain deletes)
-simply provides no `request_attributes`; `request.*` conditions are then vacuously
-true for it. Because the mapping lives on the operation's own validator — which must
-exist for the operation to be authorized at all — there is no separate registry that
-can drift out of sync, and the "which fields does this operation expose" knowledge
-stays next to the operation's existing request parsing. (The condition-kind validity
-check in *Condition-kind × capability validity* keys off exactly whether a mutating
-operation surfaces request attributes.)
-
-### Extendable evaluation
-
-Condition evaluation is delegated to a registry of evaluator functions, keyed by
-entity type. New condition types can be added in the future by registering an
-evaluator — no changes to the resolution engine or schema required.
-
-```python
-CONDITION_EVALUATORS: dict[str, Callable] = {}
-
-def register_condition_evaluator(entity: str, evaluator: Callable):
-    CONDITION_EVALUATORS[entity] = evaluator
-
-# Built-in evaluators:
-
-def _evaluate_tag_condition(condition, resource) -> bool:
-    tags = {t.key: t.value for t in resource.tags}
-    return _compare(tags.get(condition.key), condition.operator, condition.value)
-
-def _evaluate_alias_condition(condition, resource) -> bool:
-    aliases = getattr(resource, "aliases", {})
-    return _compare(aliases.get(condition.key), condition.operator, condition.value)
-
-def _evaluate_request_condition(condition, request_context) -> bool:
-    if request_context is None:
-        return True  # No request context for this operation — condition doesn't apply
-    value = request_context.get(condition.key)
-    if value is None:
-        return True  # Field not in this request — condition doesn't apply
-    return _compare(value, condition.operator, condition.value)
-
-def _compare(actual, operator, expected) -> bool:
-    if operator == "=": return actual == expected
-    elif operator == "!=": return actual != expected
-    elif operator == "EXISTS": return actual is not None
-    elif operator == "NOT EXISTS": return actual is None
-    elif operator == "IN": return actual in expected
-    elif operator == "NOT IN": return actual not in expected
-    return False
-
-register_condition_evaluator("tags", _evaluate_tag_condition)
-register_condition_evaluator("aliases", _evaluate_alias_condition)
-register_condition_evaluator("request", _evaluate_request_condition)
-```
-
-### Condition routing
-
-The resolver separates conditions by entity type for two-phase evaluation:
-
-```python
-def _request_conditions_match(conditions, request_context) -> bool:
-    """Evaluate only request.* conditions."""
+def _request_conditions_match(conditions, request_attributes) -> bool:
     request_conds = [c for c in conditions if c.entity == "request"]
     if not request_conds:
-        return True  # No request conditions on this grant
-    return all(evaluate_condition(c, request_context) for c in request_conds)
+        return True  # no request conditions on this grant
+    return all(evaluate_condition(c, request_attributes) for c in request_conds)
 
 def _resource_conditions_match(conditions, resource) -> bool:
-    """Evaluate only resource-state conditions (tags.*, aliases.*)."""
     resource_conds = [c for c in conditions if c.entity != "request"]
     if not resource_conds:
-        return True  # No resource conditions on this grant
+        return True  # no resource conditions on this grant
     return all(evaluate_condition(c, resource) for c in resource_conds)
 ```
 
-### Condition-kind × capability validity
+**RFC 0008 shape:** the two phases read from two additive fields on 0008's existing
+`AuthorizationRequirement`, defaulting empty so existing callers/backends are unaffected:
 
-Not every condition kind is meaningful on every capability, and the answer is
-**resource-type dependent** — because a capability like `can_use` or `can_delete`
-means different things per type:
+```python
+@dataclass(frozen=True)
+class AuthorizationRequirement:
+    resource_type: str
+    resource_id: str | None
+    action: str                              # ← the checked capability (read|use|update|delete|manage|create)
+    workspace: str | None
+    # --- added by this proposal (default empty → unconditional / today's behavior) ---
+    request_attributes: Mapping[str, str] = field(default_factory=dict)   # Phase 1: attempted input values
+    resource_attributes: Mapping[str, str] = field(default_factory=dict)  # Phase 2: target resource tags/aliases
+```
 
-- `can_use` on a workspace = *create* an experiment/model (sets initial values);
-  `can_use` on a gateway endpoint = *invoke* (sets no value).
-- `can_delete` on a run = plain remove (no value); `can_delete` on a registered
-  model via `DeleteRegisteredModelAlias(name, alias)` = deletes *by* an alias
-  value.
+Core populates `request_attributes` from the operation's request parsing (*Request
+context extraction*) and `resource_attributes` from the resource it already loaded — the
+latter only for grants that survived the coarse pass. The backend evaluates the
+`request.*` clauses (Phase 1) and `tags.*`/`aliases.*` clauses (Phase 2) against them,
+so it never reads the resource DB itself — core loads, the backend decides.
 
-So validity is **(kind × capability × resource_type)**, and the source of truth is
-whether the operation's validator surfaces request attributes (see *Request context
-extraction*) — not a static table:
+### Request context extraction
 
-- **Request-condition validity is validator-derived (fail-closed).** A `request.*`
-  condition may be attached to a capability **iff at least one operation of that
-  resource_type at that capability carries request attributes** (has a non-null
-  extractor). No extractor → the request condition has nothing to gate → **rejected
-  at grant creation.** This also resolves the "missing evaluator" gap (see Open
-  questions): an unregistered/absent extractor fails closed at creation rather than
-  passing vacuously at request time.
-- **Resource-condition validity = existing-resource.** A `tags.*`/`aliases.*`
-  condition is valid on any capability that acts on an existing resource. The only
-  exclusion is the *create* sense (no resource yet — e.g. workspace `can_use`),
-  where a resource condition is vacuous.
+Request attributes are produced in the auth call path, which already has the incoming
+request. Rather than a separate parallel registry of per-operation extractors, the
+operation's existing request-parsing (the same the handler uses to read its typed
+request) is reused to pull the attempted input values and forward them as
+`request_attributes` on the `AuthorizationRequirement`; the backend evaluates the
+`request.*` conditions for the checked capability against them. An operation that
+surfaces no attributes (reads, searches, plain deletes) forwards none, so `request.*`
+conditions are vacuously true for it — and whether an operation surfaces attributes is
+what the validity check in *Condition-kind × capability validity* keys off.
 
-Combined with the level ceiling (a condition's capability must be conferred by the
-grant's level), grant creation rejects any condition whose (kind, capability,
-resource_type) is invalid.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Auth as Auth (before-request)
+    participant Parse as Operation request-parsing
+    participant Backend
+
+    Client->>Auth: mutating request (e.g. SetExperimentTag)
+    Auth->>Parse: reuse handler's request parse
+    Parse-->>Auth: attempted input values (e.g. {tag_key, tag_value})
+    Auth->>Backend: authorize(requirement + request_attributes)
+    Backend-->>Auth: Decision (request.* conditions evaluated)
+```
+
+**RFC 0008 shape:** the extracted values populate the `request_attributes` field on
+`AuthorizationRequirement` (shown in *Two-phase evaluation → RFC 0008 shape*). This
+preserves 0008's rule that `RequestContext` never carries raw request material — the
+backend evaluates a `request.*` condition against the extracted attributes, never the
+request itself. Extraction (core) stays distinct from evaluation (backend).
+
+### Extendable evaluation
+
+Condition evaluation reuses MLflow's existing search-filter machinery
+(`mlflow/utils/search_utils.py`) — the same module the auth layer already imports for
+search filtering — rather than a new engine:
+
+- **Parsing:** `SearchUtils.parse_search_filter(<condition string>)` turns a clause into
+  the same `{type, key, comparator, value}` shape search already uses. (This is the
+  concrete backing for "conditions reuse MLflow's search filter syntax" in *Condition
+  shape*.)
+- **Comparators:** `SearchUtils.get_comparison_func(comparator)` supplies the operator
+  functions (`=`, `!=`, `IN`, `NOT IN`, `LIKE`, …) — no hand-written comparison table.
+- **Resource-state matching:** the existing `_does_<resource>_match_clause` pattern
+  (route by key type → read the tag/attribute off the loaded object → apply the
+  comparator) is exactly how a `tags.*` / `aliases.*` condition is checked; it is the
+  same in-memory matching the search `filter(...)` classmethods already perform on
+  loaded objects. `aliases.*` adds one key-type branch modeled the same way.
+
+The only genuinely new evaluator is for **`request.*`** conditions, because there is no
+resource to match against — the value comes from the forwarded `request_attributes` dict
+instead of a loaded object. It still reuses `get_comparison_func` for the comparison; it
+only changes *where the left-hand value is read from*:
+
+```python
+def _evaluate_request_condition(condition, request_attributes) -> bool:
+    if not request_attributes:
+        return True  # operation surfaced no attributes → condition doesn't apply
+    lhs = request_attributes.get(condition.key)
+    if lhs is None:
+        return True  # field not in this request → condition doesn't apply
+    return SearchUtils.get_comparison_func(condition.operator)(lhs, condition.value)
+```
+
+Extending to a future condition kind is likewise a thin adapter over the same parser +
+comparator functions — the engine and schema do not change.
 
 ### Search filtering
 
-Search operations check `can_read`, so search filtering consults **only each
-grant's `can_read` condition** (the other capabilities are irrelevant to reads,
-and request conditions never apply to search). Search results already include tags
-in their response objects, so no extra queries are needed.
+Search operations check `can_read`, so search filtering consults **only each grant's
+`can_read` condition** (the other capabilities are irrelevant to reads, and request
+conditions never apply to search — they are vacuous with no input value).
+
+Under RFC 0008, search filtering is **pushed into the store query** rather than applied
+to the response. `list_authorized(subject, resource_type, action="read", workspace)`
+returns an `AuthorizedResources` the backend builds from the user's `can_read` grants:
+
+- an **unconditional** wildcard read grant → `all=True` — the query runs unmodified;
+- **exact-id** read grants → the id set in `resource_ids`, pushed as an id filter;
+- a **conditioned** wildcard read grant → the `can_read` condition emitted as a
+  **`predicate`** (an MLflow search-filter string) that core ANDs into the store query.
+  Because a resource condition is already a search-filter expression and search results
+  carry tags, this composes directly with the user's own filter — no extra query.
+- when the store grammar cannot express the predicate (or the backend cannot
+  enumerate), it degrades to 0008's **`all=None`** per-row fallback, bounded by page
+  size — the only case where filtering touches the fetched page rather than the query.
+
+This replaces today's post-response filtering (fetch, then drop unreadable rows in
+Python), which is exactly what mlflow/mlflow #24964 tracks moving to pre-request
+filtering.
+
+### Relationship to RFC 0008 (pluggable auth) — cross-cutting notes
+
+The pieces of the 0008 mapping that belong to a specific mechanism are documented in
+their own sections: the capability↔`action` mapping (*Conditions are scoped per
+capability*), the proposed `request_attributes` field (*Request context extraction*),
+the proposed `resource_attributes` field (*Two-phase evaluation*), and the proposed
+`predicate` channel on `AuthorizedResources` (*Search filtering*).
+
+**Shape changes.** The two attribute channels are additive fields on 0008's existing
+`AuthorizationRequirement` (shown in *Two-phase evaluation → RFC 0008 shape*), and search
+adds a third channel on the `list_authorized` return type — all defaulting empty so
+existing callers and backends are unaffected:
 
 ```python
-def filter_search_results(user_id, resource_type, results, workspace, grants):
-    """Filter search results based on user's effective permissions."""
-
-    # Fast path: if user has any unconditional wildcard READ+ grant, return all
-    has_unconditional_wildcard = any(
-        g.resource_pattern == "*" and g.permission >= READ and not g.conditions
-        for g in grants
-        if g.resource_type == resource_type
-    )
-    if has_unconditional_wildcard:
-        return results  # Short-circuit — no per-result evaluation needed
-
-    # Slow path: evaluate per-result (only when all grants are conditional)
-    filtered = []
-    for result in results:
-        effective = [g for g in grants
-                     if g.resource_type == resource_type
-                     and (g.resource_pattern == "*" or g.resource_pattern == result.id)
-                     and _resource_conditions_match(g.conditions, result)]
-        if effective and max(g.permission for g in effective) >= READ:
-            filtered.append(result)
-    return filtered
+@dataclass(frozen=True)
+class AuthorizedResources:
+    all: bool | None
+    resource_ids: frozenset[str] | None = None
+    predicate: str | None = None             # ← added: search-filter string core ANDs into the store query
 ```
 
-The fast path ensures no performance regression for the common case (unconditional
-wildcard grants). The slow path only triggers when all grants are conditional,
-and uses tags already present on the search result objects — no extra DB queries.
+The remaining points are cross-cutting and do not attach to one mechanism:
 
-## Relationship to RFC 0008 (pluggable auth)
-
-This proposal is designed to layer onto the merged pluggable-auth contract (RFC
-0008) without changing its core shape. RFC 0008 already establishes the split this
-design relies on: **core owns route knowledge and resolves the requirement; the
-backend owns the decision.** Conditions slot into that split cleanly.
-
-**What already fits, unchanged:**
-
-- **Capabilities are 0008's action verbs.** 0008's six actions
-  (`read | use | update | delete | manage | create`) map 1:1 onto the capability
-  booleans (`can_read`, …). The capability a condition is keyed to is exactly the
-  `AuthorizationRequirement.action` core already emits — so "which condition applies
-  to this operation" needs no new routing: it is the action 0008 already resolves.
+- **Layers onto 0008 without changing its core shape.** 0008 already establishes the
+  split this design relies on — **core owns route knowledge and resolves the
+  requirement; the backend owns the decision** — and conditions slot into it: the three
+  additions above are new *fields/channels* on existing 0008 types, not a new contract.
 - **The decision stays in the backend.** Core never evaluates a condition; it only
-  supplies the attributes a condition references (below). This is the same
-  "core resolves structure, backend decides" pattern 0008 uses for `workspace`
-  (and #32 uses for the parent tier).
+  supplies the attributes a condition references. `request_attributes` /
+  `resource_attributes` are the *same category of act* as 0008 resolving
+  `workspace`/`action` — dispatch inputs, not authorization logic.
 - **The condition store is backend-private.** `role_permission_conditions` is the
   **default DB backend's** realization; it is not part of the 0008 contract. A
   third-party backend (OPA, etc.) expresses equivalent conditions in its own policy
-  language. The contract only covers the attribute channels and the search shape
-  below.
+  language — the contract covers only the attribute channels and the search shape.
+- **Graceful degradation.** A backend that does not model conditions simply ignores the
+  extra attributes and behaves as an unconditional RBAC backend.
 
-**What this proposal adds to the 0008 shapes (proposed extensions):**
-
-1. **`request_attributes` on `AuthorizationRequirement`** — a
-   `Mapping[str, str]` of the mutation's attempted input values (e.g.
-   `{"tag_key": "stage"}`), surfaced by the **per-operation validator already in the
-   call path** (see *Request context extraction*), which reads the request with the
-   same `_get_request_message` parse the handler uses. This is what lets the backend
-   evaluate a `request.*` condition without ever seeing the raw request — preserving
-   0008's rule that `RequestContext` never carries request material. Extraction (core)
-   is distinct from evaluation (backend).
-2. **`resource_attributes` on `AuthorizationRequirement`** — the target resource's
-   tags/aliases for the single-resource path, supplied wholesale by core (it already
-   loads the resource to resolve workspace/parent). Type-bounded and loaded only when
-   a surviving grant is conditioned (the two-phase / lazy-load flow above). This lets
-   the backend evaluate a `tags.*`/`aliases.*` condition without reading the resource
-   DB (the 0008 boundary).
-3. **A `predicate` channel on `AuthorizedResources`** for search. 0008's
-   `list_authorized` returns `AuthorizedResources{all, resource_ids}`; a resource
-   condition on a wildcard grant is neither "all" nor a finite id set, so it is
-   emitted as a **filter predicate** core ANDs into the store search. The shape stays
-   flat — `{all, resource_ids, predicate}` — because id-match and condition-test are
-   evaluated in separate phases (coarse then fine), never fused into one clause. When
-   the store grammar cannot express the predicate, it degrades to 0008's existing
-   `all=None` per-row fallback.
-
-**Boundary summary:** core extracts request attributes and loads resource
-attributes (the only party that can read the request and the resource DB); the
-backend owns every decision and every condition. `request_attributes` /
-`resource_attributes` are the *same category of act* as 0008 resolving
-`workspace`/`action` — dispatch inputs, not authorization logic. A backend that does
-not model conditions simply ignores the extra attributes and behaves as an
-unconditional RBAC backend.
-
-## API change
-
-`add_role_permission` gains an optional `conditions` parameter — a mapping from
-**capability** to an AND-ed filter string (MLflow's existing search filter
-syntax). A capability absent from the mapping is unconditional.
-
-```python
-store.add_role_permission(
-    role_id=5,
-    resource_type="experiment",
-    resource_pattern="*",
-    permission="EDIT",
-    conditions={
-        "can_read":   "tags.stage = 'dev'",
-        "can_update": "tags.stage = 'dev' AND request.tag_key != 'stage'",
-    },
-)
-```
-
-At creation time, for each capability entry the filter string is:
-1. Parsed using the same parser as search `filter_string`.
-2. Expanded if it uses capability composition (`(can_read) + …`) — the referenced
-   lower capability's filter is inlined (higher-references-lower only).
-3. Validated:
-   - the **capability** must be conferred by `permission` (level ceiling — e.g.
-     `can_update` requires ≥ EDIT); no-escalation.
-   - entities/operators must be registered/supported, and the **(kind, capability,
-     resource_type)** must be valid (request conditions only where an extractor
-     exists; resource conditions only on capabilities acting on existing state).
-4. Split into individual clauses and stored as `role_permission_conditions` rows
-   tagged with `capability` + `entity`.
-5. Rejected with `INVALID_PARAMETER_VALUE` if malformed, if a capability isn't
-   conferred by the level, if the (kind, capability, resource_type) is invalid, or
-   if any capability's **expanded** filter exceeds 5 AND clauses.
-
-The response returns each capability's condition as its filter string:
-
-```json
-{
-    "role_permission": {
-        "id": 5,
-        "role_id": 2,
-        "resource_type": "experiment",
-        "resource_pattern": "*",
-        "permission": "EDIT",
-        "conditions": {
-            "can_read": "tags.stage = 'dev'",
-            "can_update": "tags.stage = 'dev' AND request.tag_key != 'stage'"
-        }
-    }
-}
-```
-
-A grant with no `conditions` (or `conditions: null`) is fully unconditional —
-today's behavior. A capability omitted from a non-empty `conditions` map is
-unconditional for the operations that check it.
-
-## Schema change
+### Schema change
 
 ```sql
 CREATE TABLE role_permission_conditions (
@@ -801,16 +738,16 @@ VALUES
     (5, 'can_update', 'request', 'tag_key', '!=', 'stage');
 ```
 
-## Performance
+### Performance
 
-### Time complexity
+#### Time complexity
 
 - **Grant loading:** O(R) where R = number of roles for the user (typically 1-5). Unchanged.
 - **Condition evaluation per grant:** an operation consults only the **one capability** it checks; each condition is O(1) (a dict lookup + comparison; `IN`/`NOT IN` operands are parsed into a set at load time, so membership is also O(1)). A capability has at most 5 conditions, so per-grant evaluation is bounded constant work.
 - **Total per request:** O(G × C) where G = matching grants (typically 3-10), C = max 5 conditions on the checked capability. Worst case: 50 string comparisons.
 - **Search filtering:** O(N × G × C) where N = result count, consulting only each grant's `can_read` conditions. Fast path (unconditional wildcard grant exists) reduces to O(1).
 
-### Protection against unbounded growth
+#### Protection against unbounded growth
 
 Conditions could degrade performance if unconstrained:
 
@@ -822,7 +759,7 @@ Conditions could degrade performance if unconstrained:
 | Regex or complex matching | **Not supported.** Only `=`, `!=`, `EXISTS`, `NOT EXISTS`, `IN`, `NOT IN` — all O(1) per evaluation. No regex, no glob, no subquery. |
 | Condition evaluation on every search result | **Fast path:** if any unconditional wildcard READ+ grant exists, skip all per-result evaluation. Only degrades when ALL grants are conditional. |
 
-### DB impact
+#### DB impact
 
 - **Grant query is unchanged.** The coarse pass loads grants exactly as today (per
   user / resource_type / workspace). Condition rows are **not** joined here.
@@ -835,45 +772,7 @@ Conditions could degrade performance if unconstrained:
 - **No condition logic in SQL.** The DB returns grants + condition rows; all
   evaluation is in application code.
 
-## Relationship to the allow-only model
-
-MLflow RBAC has no explicit deny — grants are additive, and the highest matching
-permission wins. Conditions preserve this property cleanly: they specify what a
-grant DOES match (positive matching only), never what it excludes.
-
-```
-Grant A: (experiment, *, EDIT, condition: tag_equals stage=dev)
-Grant B: (experiment, *, READ, unconditional)
-
-Resource tagged stage=dev:
-  Grant A: condition met → EDIT
-  Grant B: unconditional → READ
-  Result: max(EDIT, READ) = EDIT
-
-Resource tagged stage=production:
-  Grant A: condition not met → excluded from evaluation
-  Grant B: unconditional → READ
-  Result: max(READ) = READ
-```
-
-**Key property preserved:** A condition can only narrow its own grant. It cannot
-reduce permissions conferred by other grants. If a user has an unconditional EDIT
-grant from any other role, no condition on any other grant can take that away.
-
-By restricting to positive operators (`=`, `EXISTS`), this design
-stays purely additive — each grant explicitly declares what it matches, with no
-negative logic. This aligns with how Kubernetes RBAC works (resources, verbs,
-namespaces — all positive matching) while adding attribute-awareness that K8s
-delegates to admission controllers.
-
-**Comparison to other systems:**
-
-| System | RBAC | Attribute-based restriction | Deny mechanism |
-|--------|------|---------------------------|---------------|
-| Kubernetes | Roles + Bindings | Admission controllers (separate layer) | Admission controller rejects |
-| IAM | Identity policies | Conditions on statements (incl. negation) | Explicit Deny overrides Allow |
-| PostgreSQL | GRANT/REVOKE | Row-Level Security (separate layer) | RLS filters rows |
-| **MLflow (proposed)** | Roles + Grants | Conditions on grants (positive only) | None — max-wins preserved |
+# Drawbacks
 
 - **Additional condition loading.** Conditions add a second, narrow query on the
   fine pass — but only for grants that survive the coarse pattern/level match and
@@ -964,6 +863,33 @@ Enumerate specific resource IDs in grants without conditions.
 - Breaks as new resources are created (admin must update grants)
 - No dynamic behavior — permissions don't follow resource attributes
 
+### E. Flat condition set (filtered at evaluation time)
+
+Attach conditions to a grant as a **single flat set of clauses**, rather than keyed
+per capability, and let the permission model decide *at evaluation time* which clauses
+apply to the current operation (e.g. skip a `request.*` clause on a read, skip a
+resource clause on create). This is the natural shape if conditions are viewed as
+"filters on the grant" rather than "gates on a capability."
+
+**Explored and rejected because:**
+- **Opaque to readers and authors.** Looking at a grant, an admin cannot tell which
+  clause governs which action — the action↔condition mapping lives in engine logic,
+  not in the grant. Two grants with the same clause set can behave differently
+  depending on filtering rules the reader cannot see.
+- **Does not visibly honor the authored clauses.** Silent per-action filtering means
+  the system enforces something other than the literal clause set as written; the
+  admin's intent for a specific action is inferred, not stated.
+- **Ambiguity the capability key removes for free.** "Does `tags.stage='dev'` gate
+  reads, edits, or both?" has no answer on a flat set without consulting the engine.
+  Keying each clause to an explicit capability (`can_read`, `can_update`, …) makes the
+  mapping **authored and visible**, so what you read is what is enforced — and it is
+  what makes conditions **independent per capability** with no inheritance to reason
+  about (see *Detailed design → Conditions are scoped per capability*).
+
+The chosen per-capability keying is strictly more explicit at the cost of some
+duplication (the same filter may appear under two capabilities), which is accepted as
+the honest price of removing the ambiguity above.
+
 ### Why conditions on grants won
 
 Conditions are the chosen approach because they:
@@ -1020,15 +946,3 @@ no rows is inert (grants without condition rows behave unconditionally).
 1. **Should platform admin be able to configure the conditions-per-grant limit?**
    The default is 5. Should this be a workspace-level or server-level setting
    that admins can adjust, or should it remain a fixed system limit?
-
-2. **~~How to add test coverage for resource types with missing request and resource
-   evaluators?~~ (resolved)** Rather than pass vacuously at request time, validity is
-   **derived from whether the operation's validator surfaces request attributes and
-   enforced at grant creation** (see *Condition-kind × capability validity*): a request
-   condition on a (resource_type, capability) whose operations surface no request
-   attributes is **rejected at creation** (fail-closed), and a resource condition on a
-   capability with no resource is rejected likewise. Because extraction rides the
-   operation's existing validator (rather than a parallel registry), there is no
-   separate table that can silently omit an operation. Remaining sub-question: should
-   a CI lint assert every mutating operation's validator declares its surfaced
-   attributes, so the validity check is exhaustive?
