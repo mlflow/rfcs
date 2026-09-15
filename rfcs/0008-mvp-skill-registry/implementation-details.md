@@ -18,13 +18,13 @@ workspace-scoped.
 | `workspace` | `String(63)` | PK, default `'default'` |
 | `organization` | `String(64)` | PK, default `''` (empty string) |
 | `name` | `String(128)` | PK |
-| `description` | `String(5000)` | |
+| `description` | `Text` | |
 | `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `search_text` | `Text` | derived discovery projection of name and description (plus member `keywords` on import) |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 PrimaryKey: `(workspace, organization, name)`.
 
@@ -53,8 +53,8 @@ uniqueness constraint to detect a name collision.
 | `status` | `String(20)` | default `'active'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 FK: `(workspace, organization, name)` references `skills`, CASCADE
 delete. This supports administrative hard deletion of the parent
@@ -161,12 +161,12 @@ an alias cannot bypass the kill switch (see Deletion semantics).
 | `workspace` | `String(63)` | PK, default `'default'` |
 | `organization` | `String(64)` | PK, default `''` (empty string) |
 | `name` | `String(128)` | PK |
-| `description` | `String(5000)` | |
+| `description` | `Text` | |
 | `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 PrimaryKey: `(workspace, organization, name)`.
 
@@ -191,8 +191,8 @@ PrimaryKey: `(workspace, organization, name)`.
 | `status` | `String(20)` | default `'active'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 FK: `(workspace, organization, name)` references `agent_plugins`,
 CASCADE delete.
@@ -229,7 +229,7 @@ and [`encode_prerelease_sort_key()`](https://github.com/mlflow/mlflow/blob/v3.16
 
 **Index:** `ix_agent_plugin_versions_latest_lookup` on `(workspace,
 organization, name, status, version_major, version_minor, version_patch,
-creation_timestamp)` supports both resolution paths.
+created_at)` supports both resolution paths.
 
 ### `agent_plugin_version_members`
 
@@ -261,6 +261,10 @@ across resolution, discovery, and pull (see Deletion semantics). Skills
 and agent plugins share the same workspace;
 `plugin_workspace` is reused for the skill FK, so a membership never crosses a
 workspace boundary (see [Workspace admin utilities](#workspace-admin-utilities)).
+
+**Index:** `ix_agent_plugin_version_members_member_name` on `(plugin_workspace,
+member_name, plugin_organization, plugin_name)` avoids a full table scan for the
+query "list me all agent plugins across organizations that bundle this skill".
 
 **Member-name uniqueness.** The primary key is exactly the tuple that must be
 unique: `(plugin_workspace, plugin_organization, plugin_name, plugin_version,
@@ -414,7 +418,7 @@ used by the Model Registry and RFC-0004:
 - Version delete operations (`delete_skill_version` and
   `delete_agent_plugin_version`) are soft deletes. They set
   `status='deleted'` when allowed by the lifecycle transition rules,
-  update `last_updated_timestamp`, remove aliases that point to the
+  update `last_updated_at`, remove aliases that point to the
   deleted version, and exclude the version from normal
   get/search/list/latest resolution. Active versions must first be
   unpublished or deprecated before they can be deleted. A soft-deleted
