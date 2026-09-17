@@ -649,7 +649,7 @@ class SkillVersion:
 | `organization` | `str` | Organization scope, from parent Skill |
 | `source` | `GitSource \| OCISource \| ZipSource \| MlflowSource \| None` | Typed source descriptor. External content (git, OCI, zip) uses the client-constructible classes; `mlflow` content uses `MlflowSource`, which the server populates on responses and a client never constructs (see Typed source classes). For `source_type="mlflow"`, `MlflowSource.path` is a server-set artifact path: for a standalone MLflow-stored skill it is the unique path where the server stored the uploaded content (and `subpath` is null), and for a skill created by importing an MLflow-stored packaged plugin it is the package's artifact base path (a self-contained internal `mlflow-artifacts:` pointer captured at import time), with `subpath` locating the skill within that tree. A skill created by importing a packaged plugin more generally carries a source derived from the package: the package's `source_type` and `source` with a `subpath` locating the skill within the package. Because an imported member's pointer is stored on the skill version itself, its content resolves without reference to any membership row. The REST API represents this as flat `source_type`, `source`, `ref`, `subpath` fields; the SDK wraps and unwraps the typed classes uniformly, so `source.subpath` is available for every source type |
 | `source_type` | `SkillSourceType \| None` | Server-set discriminator (`git`, `oci`, `zip`, `mlflow`), populated on responses. On create, a client that knows the type of an external pointer (CLI subcommand, SDK typed class) submits it and the server validates it against the source value; without an explicit type the server infers it (see the field-inference rules below). `mlflow` is flow-derived and never client-supplied. Together with `source` it determines how content is stored and how `pull` routes |
-| `digest` | `str \| None` | Content hash of the resolved skill content (the same notion as a dataset `digest`). Computed by the client during local inspection and submitted at registration and import; client-asserted and not server-verified. It identifies a version by content within a skill name. Stored, returned on get, and indexed so callers can group versions by content (clean diffs between agent plugin versions, and traces before and after a change linking to the same content); it does not drive import, which always creates a new member version (see Content digest) |
+| `digest` | `str \| None` | Content hash of the resolved skill content (the same notion as a dataset `digest`). Submitted when the creation client inspects the content; client-asserted and not server-verified. It identifies a version by content within a skill name. Stored, returned on get, and indexed so callers can group versions by content (clean diffs between agent plugin versions, and traces before and after a change linking to the same content); it does not drive import, which always creates a new member version (see Content digest) |
 | `status` | `SkillStatus` | Per-version lifecycle: `draft`, `active`, `deprecated`, `deleted` |
 | `aliases` | `list[str]` | Alias names currently pointing at this version (read-only, projected from alias table) |
 
@@ -717,15 +717,11 @@ be a plain content tree, and content reached only through a symlink is not part
 of the digest. Only file
 paths and contents contribute, so the `source`/`ref`/`subpath` that locate the
 content do not affect the result. For a standalone upload whose `subpath` is
-null the serialization covers the whole uploaded skill directory. The client
-computes the digest during the same local inspection that resolves the source
-and submits it at registration and at import. The server stores the submitted
-digest but never recomputes or verifies it: for external sources (git/oci/zip)
-it never fetches the content, and for content uploaded directly to MLflow
-artifact storage it likewise records the client-asserted value rather than
-rehashing the bytes, keeping the digest uniformly client-asserted across every
-source type and trusted the same way the client-submitted `name` and member
-`description`/`keywords` are.
+null the serialization covers the whole uploaded skill directory. A client
+that inspects content computes and submits the digest at registration or
+import. A surface that registers an external pointer without fetching it, such
+as the UI, may omit the digest. The server stores a submitted digest but never
+fetches content to compute or verify one.
 This mirrors the dataset `digest` concept already in MLflow: a hash that
 identifies a version by content within a given skill name, independent of
 where the content came from. Because it is content-only, the same bytes reached
@@ -754,13 +750,11 @@ before a re-import and one recorded after as exercising the same content. The
 registry exposes the field and indexes it so these comparisons are cheap; it does
 not itself build any diff or trace-linking feature on top of the field, and this
 RFC does not commit to one. When a version's digest is absent, it
-simply does not participate in digest grouping. The digest also drives an
-integrity check on pull: when a pulled version has a `digest` set, the client
-recomputes it over the fetched tree and fails on mismatch, and an agent plugin
-pull applies the same check per member (see Pull semantics). This is the one
-place the digest is recomputed after registration, and it stays client-side:
-the check compares fetched content against the client-asserted identity and is
-not a registry guarantee.
+simply does not participate in digest grouping. Pull always computes the fetched
+content's digest. It fails when that value differs from a recorded digest; when
+the version has no digest, the computed value is available to the pull workflow
+but is not written back to the registry. Agent plugin pull applies the same
+behavior per member (see Pull semantics).
 
 **MLflow artifact storage (`source_type="mlflow"`).** In addition to
 external source pointers, the registry supports storing skill content
@@ -1652,16 +1646,12 @@ def import_agent_plugin(
 
 
 def pull(
+    uri: str,
     *,
-    name: str | None = None,
-    organization: str = "",
-    entity_type: str = "skill",
-    version: int | str | None = None,
-    alias: str | None = None,
     destination: str = ".",
 ) -> str:
-    """Pull skill or agent plugin content from registered sources to a
-    local directory. Set entity_type to 'skill' or 'agent_plugin'."""
+    """Pull skill or agent plugin content identified by its registry URI
+    to a local directory."""
 
 
 # Example usage:
@@ -1871,9 +1861,10 @@ means "clear this nullable field". This mirrors the store-layer update
 contract so callers can distinguish partial updates from explicit
 nulling.
 
-`pull` is implemented in the SDK/CLI layer, not the store mixin. The
-client calls `get_skill_version` (or resolves an alias) to obtain the
-version's `source_type` and source pointer, then routes on `source_type`:
+`pull` is implemented in the SDK/CLI layer, not the store mixin. Its
+required URI determines the entity type, organization, name, and
+version or alias. The client resolves that URI to obtain the version's
+`source_type` and source pointer, then routes on `source_type`:
 `git` clone, `oci` pull, `zip` download, or `mlflow` artifact-tree
 download. For `mlflow`, the artifact base is always the version's `source`: the
 server-stored upload path for a standalone skill, or a package tree pointer
@@ -1911,10 +1902,10 @@ source is a local path it is about to upload or a remote git/oci/zip pointer it
 resolves with the user's own credentials. Because the server never reads
 content to derive it, `name` is always client-supplied; a raw REST caller that
 omits it is rejected with an error indicating that `name` must be provided
-explicitly. `digest` is computed by the
-client from the resolved content during the same inspection and submitted (see
-Content digest); the server stores the client-asserted value and does not
-recompute or verify it, for uploaded content or external pointers alike.
+explicitly. A client that inspects the resolved content computes and submits
+`digest` (see Content digest); a surface that submits an external pointer
+without fetching it may omit the field. The server does not compute or verify
+it.
 
 The server sets the stored `source_type`, and setting it needs no access to
 the content. For external pointers the request may carry an explicit
