@@ -145,8 +145,8 @@ work with local Docker, Podman-compatible sockets, and remote Docker hosts.
 
 | Env var                 | Default        | Purpose                         |
 | ----------------------- | -------------- | ------------------------------- |
-| `MLFLOW_DOCKER_HOST`    | Docker default | Daemon URL for Docker or Podman |
-| `MLFLOW_DOCKER_NETWORK` | `host`         | Container network mode          |
+| `MLFLOW_JOBS_DOCKER_HOST`    | Docker default | Daemon URL for the job executor's Docker or Podman client |
+| `MLFLOW_JOBS_DOCKER_NETWORK` | `host`         | Container network mode for job containers                  |
 
 #### Docker lifecycle
 
@@ -169,7 +169,7 @@ work with local Docker, Podman-compatible sockets, and remote Docker hosts.
 #### Networking
 
 The default Docker network mode is `host`, which keeps the initial configuration simple on Linux hosts. Operators can
-override this with `MLFLOW_DOCKER_NETWORK` for bridge networks, Docker Compose environments, or remote daemons.
+override this with `MLFLOW_JOBS_DOCKER_NETWORK` for bridge networks, Docker Compose environments, or remote daemons.
 
 The important requirement is not the specific network mode. It is that `MLFLOW_JOB_TRACKING_URI` must resolve from the
 container's network namespace. The executor should not try to guess that address.
@@ -193,21 +193,21 @@ The Kubernetes executor uses the official Kubernetes Python client and is expose
 
 | Env var                              | Default           | Purpose                                         |
 | ------------------------------------ | ----------------- | ----------------------------------------------- |
-| `MLFLOW_K8S_NAMESPACE`               | `default`         | Namespace where Jobs are created                |
-| `MLFLOW_K8S_USE_WORKSPACE_NAMESPACE` | `false`           | Uses the MLflow workspace name as the namespace |
-| `MLFLOW_K8S_SERVICE_ACCOUNT`         | Namespace default | Service account for the Job pod                 |
-| `MLFLOW_K8S_JOB_TTL`                 | `900`             | `ttlSecondsAfterFinished` for completed Jobs    |
-| `MLFLOW_K8S_EXTRA_ANNOTATIONS`       | Unset             | Extra pod annotations                           |
+| `MLFLOW_JOBS_K8S_NAMESPACE`               | `default`         | Namespace where Jobs are created                |
+| `MLFLOW_JOBS_K8S_USE_WORKSPACE_NAMESPACE` | `false`           | Uses the MLflow workspace name as the namespace |
+| `MLFLOW_JOBS_K8S_SERVICE_ACCOUNT`         | Namespace default | Service account for the Job pod                 |
+| `MLFLOW_JOBS_K8S_JOB_TTL`                 | `900`             | `ttlSecondsAfterFinished` for completed Jobs    |
+| `MLFLOW_JOBS_K8S_EXTRA_ANNOTATIONS`       | Unset             | Extra pod annotations                           |
 
 On Kubernetes, `MLFLOW_JOB_EXTRA_LABELS` is applied as labels on both the Job and Pod, while
-`MLFLOW_K8S_EXTRA_ANNOTATIONS` is applied as annotations on the Pod only.
+`MLFLOW_JOBS_K8S_EXTRA_ANNOTATIONS` is applied as annotations on the Pod only.
 
 #### Namespace selection
 
 Namespace resolution is:
 
-1. If `MLFLOW_K8S_USE_WORKSPACE_NAMESPACE=true` and the job has a workspace context, use the workspace name.
-2. Otherwise use `MLFLOW_K8S_NAMESPACE`.
+1. If `MLFLOW_JOBS_K8S_USE_WORKSPACE_NAMESPACE=true` and the job has a workspace context, use the workspace name.
+2. Otherwise use `MLFLOW_JOBS_K8S_NAMESPACE`.
 
 This makes workspace-to-namespace isolation possible without making it mandatory. When workspace namespaces are used,
 the namespace must already exist and be reachable by the MLflow service account.
@@ -304,6 +304,10 @@ Adoption is opt-in:
    you want this backend to run custom scorer code.
 4. Optionally set `MLFLOW_JOB_CUSTOM_SCORER_EXECUTOR_BACKEND` to `docker` or `kubernetes` if you want custom scorers
    routed to a backend different from `MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND`.
+
+To reduce the initial operator burden, MLflow will provide opinionated deployment examples: a Docker Compose setup
+that places the tracking server and job containers on a shared network, and a Helm chart or chart values that configure
+the Kubernetes executor's service account, namespace, Secrets, and recommended NetworkPolicy.
 
 The default path remains unchanged. Declarative jobs continue to use `local` unless an operator changes
 `MLFLOW_JOB_DEFAULT_EXECUTOR_BACKEND`.
