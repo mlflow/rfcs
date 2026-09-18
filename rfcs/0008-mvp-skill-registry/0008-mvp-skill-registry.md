@@ -76,7 +76,7 @@ server-set either way; `mlflow` content is always flow-derived and
 never client-declared. Content-derived fields are read from the
 skill's SKILL.md and computed by the client during local inspection and
 submitted with the request: a skill's `name` and content `digest` always, and a
-package member's `description` and `keywords` as well. The registry server never fetches a user-supplied source URL; this
+package member's `description` as well. The registry server never fetches a user-supplied source URL; this
 keeps skill registration consistent with agent plugin import and keeps
 fetching of untrusted URLs off the server.
 
