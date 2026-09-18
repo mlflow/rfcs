@@ -340,7 +340,7 @@ versions are in play.
    page shows linked skills on each row.
 
 The filter follows the precedent of the existing `prompt` filter for
-prompt-to-trace links, but reads the dedicated skill-link tables. Span
+prompt-to-trace links, but reads the dedicated skill-link table. Span
 attributes mark where activation happened but are not the query path.
 Links created at ingestion from attributes or content markers produce
 the same records. A skill in a named organization is qualified as in
@@ -501,34 +501,14 @@ to the implementation.
 
 A skill link is a lineage record associating a trace with a skill
 version. Prompt links store a composite `name/version` destination in
-the generic `entity_associations` table. Skills instead use two
-dedicated tables because both name-only and exact-version trace
-queries are required, and because one trace-level link can have many
-span-level observations with additional metadata. The SQL is
-illustrative; the Alembic migration emits the equivalent syntax for
-each supported database.
+the generic `entity_associations` table. Skills instead use a dedicated
+span-link table because each observation carries additional metadata.
+Trace queries use a correlated `EXISTS` against this table, so multiple
+observing spans still return each trace once. The SQL is illustrative;
+the Alembic migration emits the equivalent syntax for each supported
+database.
 
 ```sql
-CREATE TABLE trace_skill_links (
-  trace_id VARCHAR(50) NOT NULL,
-  skill_workspace VARCHAR(63) NOT NULL,
-  skill_organization VARCHAR(64) NOT NULL DEFAULT '',
-  skill_name VARCHAR(128) NOT NULL,
-  skill_version INTEGER NOT NULL,
-  created_time BIGINT NOT NULL,
-  PRIMARY KEY (
-    trace_id, skill_workspace, skill_organization,
-    skill_name, skill_version
-  ),
-  FOREIGN KEY (trace_id) REFERENCES trace_info(request_id) ON DELETE CASCADE
-);
-
-CREATE INDEX index_trace_skill_links_skill
-  ON trace_skill_links (
-    skill_workspace, skill_organization, skill_name,
-    skill_version, trace_id
-  );
-
 CREATE TABLE span_skill_links (
   trace_id VARCHAR(50) NOT NULL,
   span_id VARCHAR(50) NOT NULL,
@@ -538,19 +518,20 @@ CREATE TABLE span_skill_links (
   skill_version INTEGER NOT NULL,
   role VARCHAR(20) NOT NULL,
   digest VARCHAR(64),
-  created_time BIGINT NOT NULL,
+  created_at BIGINT NOT NULL,
   PRIMARY KEY (
     trace_id, span_id, skill_workspace, skill_organization,
     skill_name, skill_version
   ),
   FOREIGN KEY (trace_id) REFERENCES trace_info(request_id) ON DELETE CASCADE
 );
-```
 
-`trace_skill_links` contains at most one row per trace and concrete
-skill version. The reverse index supports both all-version queries by
-its `(workspace, organization, name)` prefix and exact-version queries
-by adding `version`.
+CREATE INDEX ix_span_skill_links_skill
+  ON span_skill_links (
+    skill_workspace, skill_organization, skill_name,
+    skill_version, trace_id
+  );
+```
 
 `span_skill_links` stores one row for each span where a skill was
 observed:
@@ -570,12 +551,11 @@ Storage behavior:
   coordinates remain historical facts.
 - **Access:** reading a link requires access to its trace. Resolving or
   navigating to the referenced skill separately requires skill access.
-- **Indexes:** the primary key supports lookup by trace. Trace search
-  uses `trace_skill_links`, so no additional index is needed.
+- **Indexes:** the primary key supports lookup by trace. The reverse
+  index supports name-only and exact-version trace queries.
 
-Each span observation creates the trace link if it does not
-already exist. Span-link inserts are idempotent. The span is also
-annotated with the `mlflow.skill.*` attributes in the
+Span-link inserts are idempotent. The span is also annotated with the
+`mlflow.skill.*` attributes in the
 [SDK method and attribute contract](#sdk-method-and-attribute-contract)
 for inspection in the trace view.
 
@@ -583,9 +563,8 @@ Links are materialized during span ingestion; there is no separate
 public linking endpoint. After the trace row exists, the server passes
 the links found in each ingestion batch to an internal
 `upsert_span_skill_links(trace_id, links)` tracking-store method. The
-method atomically upserts the span links and creates any missing trace
-links. It requires the trace to exist, but not a relational span row or
-a resolvable registry version.
+method atomically upserts the span links. It requires the trace to
+exist, but not a relational span row or a resolvable registry version.
 
 ## SDK method and attribute contract
 
@@ -692,21 +671,22 @@ shared test vectors guard the implementations.
 two newline bytes, one marker line, and a final newline byte.
 
 ```
-<!-- mlflow-skill: {"workspace":"default","organization":"","name":"code-review","version":3,"digest":"<64 lowercase hex>"} -->
+<!-- mlflow-skill: {"schema_version":1,"workspace":"default","organization":"","name":"code-review","version":3,"digest":"<64 lowercase hex>"} -->
 ```
 
-The JSON carries the version's registry coordinates and the digest
-computed by `pull`, in RFC-0008's raw, lowercase hexadecimal form.
-Before applying RFC-0008's digest algorithm, verification removes
+`schema_version` versions the marker format; parsers accept `1` and
+ignore unsupported versions. The JSON carries the registry coordinates
+and digest computed by `pull`, in RFC-0008's raw, lowercase hexadecimal
+form. Before applying RFC-0008's digest algorithm, verification removes
 exactly one well-formed final marker suffix; malformed or non-final
 markers remain part of the content. At OpenTelemetry ingestion, the
 server scans captured LLM input (never output) for the marker and
 creates links from each well-formed marker without resolving its
 coordinates or digest against the registry. Duplicate matches produce
-one trace link and one span link per observing span. In testing against
-OpenHands and Goose, the marker survived byte-for-byte wherever the
-harness captured LLM content in its spans; whether content is captured
-at all, often an opt-in, is the limiting factor.
+one link per observing span. In testing against OpenHands and Goose,
+the marker survived byte-for-byte wherever the harness captured LLM
+content in its spans; whether content is captured at all, often an
+opt-in, is the limiting factor.
 
 ## Autologger behavior
 
