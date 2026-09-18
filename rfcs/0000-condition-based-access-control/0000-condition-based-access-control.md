@@ -350,6 +350,31 @@ sequenceDiagram
     Core-->>Client: 200 OK or 403 Forbidden
 ```
 
+## MLflow UI
+
+Mutation conditions are compatible with the existing RBAC admin UI and surface as part of a
+role's configuration rather than as a separate concept.
+
+- **Display on roles.** A role's detail view lists its mutation conditions alongside its grants,
+  grouped by resource type. For each `(role, resource_type)` it shows the value condition and
+  the target condition as their filter strings, and an unconstrained condition renders as none.
+  Because conditions are stored and returned as filter strings, the UI displays them directly
+  with no special rendering.
+- **Create and edit.** An admin with manage permission on the role can add, update, or remove a
+  role's conditions through the `add`/`update`/`remove`/`list` management API. Editing is a text
+  field using the same filter grammar as MLflow search, and clearing a field maps to the
+  partial-update semantics, where a value sets or replaces, an empty value clears, and an
+  omitted value leaves the condition unchanged.
+- **Validation and errors.** The UI surfaces the write-time errors the API already returns: an
+  invalid filter (`INVALID_PARAMETER_VALUE`) and a duplicate `(role, resource_type)` on add
+  (`RESOURCE_ALREADY_EXISTS`).
+- **Read-only fallback.** A user who can view but not manage a role sees the conditions
+  read-only, consistent with how grants are shown.
+
+No new UI framework or data shape is required. The management API returns the same
+`MutationConditions` objects the UI renders, and the stored filter strings are human-readable as
+is.
+
 ## Database schema changes
 
 Mutation conditions are stored in one additive table keyed on `(role_id, resource_type)`,
