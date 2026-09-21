@@ -1126,6 +1126,19 @@ claim; the client-facing `MlflowClient` and `mlflow.genai` methods take
 only `source`, whose typed class carries the explicit type when there is
 one.
 
+### Audit metadata
+
+`created_by` and `last_updated_by` are server-derived audit fields. They are
+not accepted in REST request bodies or public `mlflow.genai` or
+`MlflowClient` methods. A REST handler obtains the authenticated principal
+and passes it to the store through internal parameters.
+
+On creation, the store initializes both fields to the authenticated
+principal. When a version-creation operation auto-creates its parent, the
+same principal is applied to both the parent and the new version. If the
+parent already exists, its audit fields are not overwritten. On update,
+`last_updated_by` is set to the authenticated principal.
+
 ```python
 from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
 
@@ -1145,6 +1158,7 @@ class SkillRegistryMixin:
         organization: str = "",
         description: str | None = None,
         icons: list[RegistryIcon] | None = None,
+        created_by: str | None = None,
     ) -> Skill:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1168,6 +1182,7 @@ class SkillRegistryMixin:
         organization: str = "",
         description: str | None = NOT_SET,
         icons: list[RegistryIcon] | None = NOT_SET,
+        last_updated_by: str | None = None,
     ) -> Skill:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1188,6 +1203,7 @@ class SkillRegistryMixin:
         subpath: str | None = None,
         digest: str | None = None,
         status: str = "active",
+        created_by: str | None = None,
     ) -> SkillVersion:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1227,6 +1243,7 @@ class SkillRegistryMixin:
         version: int,
         organization: str = "",
         status: SkillStatus | None = NOT_SET,
+        last_updated_by: str | None = None,
     ) -> SkillVersion:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1287,6 +1304,7 @@ class SkillRegistryMixin:
         organization: str = "",
         description: str | None = None,
         icons: list[RegistryIcon] | None = None,
+        created_by: str | None = None,
     ) -> AgentPlugin:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1310,6 +1328,7 @@ class SkillRegistryMixin:
         organization: str = "",
         description: str | None = NOT_SET,
         icons: list[RegistryIcon] | None = NOT_SET,
+        last_updated_by: str | None = None,
     ) -> AgentPlugin:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1342,6 +1361,7 @@ class SkillRegistryMixin:
         ref: str | None = None,
         subpath: str | None = None,
         status: str = "active",
+        created_by: str | None = None,
     ) -> AgentPluginVersion:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1357,6 +1377,7 @@ class SkillRegistryMixin:
         ref: str | None = None,
         subpath: str | None = None,
         status: str = "active",
+        created_by: str | None = None,
     ) -> tuple[AgentPluginVersion, list[SkillVersion]]:
         """Register a packaged agent plugin as a single unit of work. For each
         entry in member_skills (a name, a subpath locating the skill within the
@@ -1415,6 +1436,7 @@ class SkillRegistryMixin:
         version: str,
         organization: str = "",
         status: SkillStatus | None = NOT_SET,
+        last_updated_by: str | None = None,
     ) -> AgentPluginVersion:
         raise NotImplementedError(self.__class__.__name__)
 
