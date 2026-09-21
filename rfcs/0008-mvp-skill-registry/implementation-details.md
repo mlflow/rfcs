@@ -20,7 +20,7 @@ workspace-scoped.
 | `name` | `String(128)` | PK |
 | `description` | `Text` | |
 | `icons` | `JSON` | nullable; mutable presentation metadata, list of icon descriptors (see `RegistryIcon`) |
-| `search_text` | `Text` | derived discovery projection of name and description (plus member `keywords` on import) |
+| `search_text` | `Text` | derived discovery projection of name and description |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `created_at` | `BigInteger` | millis since epoch |
@@ -725,7 +725,7 @@ it never fetches the content, and for content uploaded directly to MLflow
 artifact storage it likewise records the client-asserted value rather than
 rehashing the bytes, keeping the digest uniformly client-asserted across every
 source type and trusted the same way the client-submitted `name` and member
-`description`/`keywords` are.
+`description` are.
 This mirrors the dataset `digest` concept already in MLflow: a hash that
 identifies a version by content within a given skill name, independent of
 where the content came from. Because it is content-only, the same bytes reached
@@ -1360,8 +1360,8 @@ class SkillRegistryMixin:
     ) -> tuple[AgentPluginVersion, list[SkillVersion]]:
         """Register a packaged agent plugin as a single unit of work. For each
         entry in member_skills (a name, a subpath locating the skill within the
-        package, a client-computed content digest, and optional description and
-        keywords), create the Skill when the name is free or add a version when
+        package, a client-computed content digest, and an optional
+        description), create the Skill when the name is free or add a version when
         the name has previously been a member of this same plugin (derived from
         this plugin's member rows), set search_text, and create a member
         SkillVersion whose source is derived from the package (the package's
@@ -1784,8 +1784,8 @@ class MlflowClient:
         and the packaged plugin version atomically; source_type is server-set
         and each member skill's source is derived from the package. Each
         member_skills entry carries a name, a subpath locating the skill within
-        the package, a client-computed content digest, and optional description
-        and keywords, read from its SKILL.md during local inspection. Returns
+        the package, a client-computed content digest, and an optional
+        description read from its SKILL.md during local inspection. Returns
         the packaged AgentPluginVersion and the member SkillVersions (all newly
         created) parsed from the ImportRegisterResponse."""
 
@@ -1903,7 +1903,7 @@ already holds (the submitted payload, the source pointer string, and bytes
 uploaded directly to it). This is the same rule the plugin import flow follows,
 and it keeps fetching of untrusted URLs off the server.
 
-A skill's `name` (and, for a package member, its `description` and `keywords`)
+A skill's `name` (and, for a package member, its `description`)
 is read from SKILL.md by the client (SDK or CLI) during inspection and
 submitted. The simplest
 invocation still omits the name because the client fills it in, whether the
@@ -2133,7 +2133,8 @@ agent plugins it is derived from the fields listed below.
 
 The two entity kinds store `search_text` in different places. A skill's
 discovery fields (name, description) all live on the parent row, so `search_text`
-is a column on the `skills` parent table. An agent plugin's discovery fields
+is a column on the `skills` parent table, recomputed whenever the description
+changes (for example through `update_skill`). An agent plugin's discovery fields
 come mostly from the manifest, which is version-scoped, so there is no
 `search_text` column on the `agent_plugins` parent; the column lives on
 `agent_plugin_versions`, and parent search joins to the latest-resolved version
@@ -2273,7 +2274,6 @@ class MemberSkillDefinition(BaseModel):
     name: str
     subpath: str  # path of this skill within the package
     description: str | None = None
-    keywords: list[str] | None = None
     digest: str | None = None  # client-computed content hash of this member's content
 
 
@@ -2640,10 +2640,9 @@ locates the skill within that stored package tree; because this pointer is
 persisted on the member skill version, the member resolves independently of its
 membership rows and survives a non-cascade delete of the plugin. The parent
 `Skill` stores the `description` from the submitted `MemberSkillDefinition` in
-its `description` column, from which `search_text` is derived, and folds the
-`keywords` (which have no column of their own) into `search_text` as well, so the
-skill returns a populated description and is discoverable by keyword and
-description search like any other skill. Each member skill is referenced by name in the member list (e.g.,
+its `description` column, from which `search_text` is derived, so the skill
+returns a populated description and is discoverable by name and description
+search like any other skill. Each member skill is referenced by name in the member list (e.g.,
 `skills:/code-review/1`). In the same transaction the server creates one
 packaged `AgentPluginVersion` whose `source_type` reflects where the
 package lives: the original typed source (preserving `ref` for Git
