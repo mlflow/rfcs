@@ -418,8 +418,9 @@ used by the Model Registry and RFC-0004:
 - Version delete operations (`delete_skill_version` and
   `delete_agent_plugin_version`) are soft deletes. They set
   `status='deleted'` when allowed by the lifecycle transition rules,
-  update `last_updated_at`, remove aliases that point to the
-  deleted version, and exclude the version from normal
+  update `last_updated_at` and `last_updated_by` to the authenticated
+  principal, remove aliases that point to the deleted version, and exclude
+  the version from normal
   get/search/list/latest resolution. Active versions must first be
   unpublished or deprecated before they can be deleted. A soft-deleted
   skill version also withdraws every agent plugin version that contains
@@ -1137,7 +1138,11 @@ On creation, the store initializes both fields to the authenticated
 principal. When a version-creation operation auto-creates its parent, the
 same principal is applied to both the parent and the new version. If the
 parent already exists, its audit fields are not overwritten. On update,
-`last_updated_by` is set to the authenticated principal.
+`last_updated_by` is set to the authenticated principal. This includes
+version soft-delete operations, which update the affected version row.
+Hard-delete operations remove their target rows and therefore do not update
+row-level audit fields. Changes to a parent's derived status or
+`latest_version` do not update the parent's audit fields.
 
 ```python
 from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
@@ -1248,8 +1253,11 @@ class SkillRegistryMixin:
         raise NotImplementedError(self.__class__.__name__)
 
     def delete_skill_version(
-        self, name: str, version: int,
+        self,
+        name: str,
+        version: int,
         organization: str = "",
+        last_updated_by: str | None = None,
     ) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1441,8 +1449,11 @@ class SkillRegistryMixin:
         raise NotImplementedError(self.__class__.__name__)
 
     def delete_agent_plugin_version(
-        self, name: str, version: str,
+        self,
+        name: str,
+        version: str,
         organization: str = "",
+        last_updated_by: str | None = None,
     ) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
