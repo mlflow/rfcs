@@ -73,10 +73,11 @@ against the source value, while a request without an explicit type
 falls back to inference (from the source value for external pointers,
 and from the creation flow otherwise). The stored discriminator is
 server-set either way; `mlflow` content is always flow-derived and
-never client-declared. Content-derived fields are read from the
-skill's SKILL.md and computed by the client during local inspection and
-submitted with the request: a skill's `name` and content `digest` always, and a
-package member's `description` as well. The registry server never fetches a user-supplied source URL; this
+never client-declared. A client that inspects the content submits the
+skill's `name` and `digest`, plus a package member's `description` and
+`keywords`. A surface that registers an external pointer without
+fetching it, such as the UI, requires the name and may omit the digest.
+The registry server never fetches a user-supplied source URL; this
 keeps skill registration consistent with agent plugin import and keeps
 fetching of untrusted URLs off the server.
 
@@ -1139,17 +1140,12 @@ package whose tree does not (for example, a Claude Code import or a directly
 registered source) keeps its original internal layout, so the pulled result
 reflects the source tree rather than a guaranteed Agent Plugins layout.
 
-**Digest verification.** When a pulled skill version has a `digest` set,
-the client recomputes the content digest over the fetched tree using the
-canonical hashing rule (see Content digest) and fails the pull if it does not
-match the recorded value, rather than installing content that differs from
-what the registering client asserted. On an agent plugin pull the same check
-runs per member: each member whose version carries a `digest` is verified
-against its fetched content, and any mismatch fails the whole pull rather than
-producing a divergent local plugin. A version with no `digest` is pulled
-without this check. Because the digest is client-asserted rather than
-server-verified, this compares the fetched content against the asserted
-identity; it is a client-side integrity check, not a registry guarantee.
+**Digest verification.** Pull always computes the digest of fetched skill
+content. When the version has a recorded digest, a mismatch fails the pull.
+When it does not, the computed digest is available to the pull workflow but
+is not written back to the registry. Agent plugin pull applies the same
+behavior to every member and fails the whole pull on any recorded-digest
+mismatch.
 
 `pull` is harness-agnostic. It downloads content but does not generate
 harness-specific manifests or place files in harness-specific

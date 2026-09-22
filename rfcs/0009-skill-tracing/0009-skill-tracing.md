@@ -5,7 +5,7 @@
 | mlflow_issue | |
 | rfc_pr       | https://github.com/mlflow/rfcs/pull/37 |
 
-| Author(s)              | [Bill Murdock](https://github.com/jwm4) (Red Hat) |
+| Author(s)              | [Bill Murdock](https://github.com/jwm4) (Red Hat), [Matthew Prahl](https://github.com/mprahl) (Red Hat) |
 | :--------------------- | :-- |
 | **Date Last Modified** | 2026-09-11 |
 | **AI Assistant(s)**    | Claude Code |
@@ -51,13 +51,8 @@ from the trace to the skill version, recorded through the span on which
 the activation was observed and following the pattern MLflow already
 uses to link prompts to traces. The link records that span, and the span
 is annotated with the skill's registry coordinates: workspace,
-organization, name, and version, plus the version's content digest when
-the instrumentation has it. Tool calls that use a skill's bundled files
-are annotated the same way. Each link records how it
-was produced (explicit instrumentation, in-process resolution,
-verification of installed content against its marker, or
-content-marker inference), so consumers of the linkage can weigh the
-evidence behind it.
+organization, name, and version. Tool calls that use a skill's bundled
+files are annotated the same way.
 
 Two terms recur below. A **harness** is a packaged agent application
 that skills are installed into and that runs them without code written
@@ -100,10 +95,9 @@ regression detection across skill versions.
 
 **Relationship to other RFCs.** Skill tracing builds on
 [RFC-0008: Skill Registry](https://github.com/mlflow/rfcs/blob/main/rfcs/0008-mvp-skill-registry/0008-mvp-skill-registry.md),
-which defines the `Skill` and `SkillVersion` entities, the
-`{workspace, organization, name, version}` coordinates, and the
-client-asserted content `digest` that this RFC records on links.
-The harness path identifies installed skills by the marker and digest
+which defines the `Skill` and `SkillVersion` entities and the
+`{workspace, organization, name, version}` coordinates. The harness
+path identifies installed skills by the marker and digest
 that `mlflow skills pull` gives their content, so this RFC specifies
 no installer, install record, or package manager integration; pulled
 content reaches a harness by whatever means the user chooses. Skill
@@ -164,14 +158,6 @@ did; nothing connects the two.
    quality difference to the skill rather than to everything else that
    changed. Retiring an unused skill means knowing it is unused.
 
-4. **Content identity and version identity diverge.** RFC-0008 re-mints
-   a version on every import, so the same unchanged skill content can
-   exist under many version numbers. Linking traces only to a specific
-   `name/version` pair fragments the history of what is, by content, one
-   skill. RFC-0008 already records a content `digest` on each version
-   for exactly this grouping purpose, and traces should be able to use
-   it.
-
 ### User journeys
 
 These journeys illustrate the end-to-end workflows that skill tracing
@@ -208,9 +194,8 @@ traces it produces to record which registered skill was active.
    the prompt registry's alias cache, so repeated links in a hot path
    do not query the registry on every call; a caller can shorten or
    disable the cache per call. Pinned versions need no resolution.
-   The method also accepts an `organization`; the examples here omit
-   it and use the empty default organization, as RFC-0008's examples
-   do.
+   The method also accepts `organization` and `workspace`; the examples
+   use the empty organization and current workspace.
 
    **Without the MLflow SDK:** a caller instrumenting with plain
    OpenTelemetry has no `link_skill` method and instead sets these
@@ -236,10 +221,9 @@ traces it produces to record which registered skill was active.
 
 #### Trace skills loaded by an agent framework
 
-A developer using an agent framework (LangGraph, the OpenAI Agents
-SDK, and similar) resolves a skill from the registry and hands it to
-the framework. The linkage should not require explicit calls in
-their code.
+A developer using an agent framework (e.g. LangGraph) resolves a skill from
+the registry and hands it to the framework. The linkage should not require
+explicit calls in their code.
 
 1. Resolve and pull the skill through MLflow, then hand it to the
    framework in whatever form the framework expects:
@@ -297,10 +281,8 @@ resolution step.
    appear on each trace, and annotated spans carry the coordinates.
 
 A skill that carries no marker, because it was installed from a
-source other than `mlflow skills pull`, is not linked; the autologger
-records the computed digest on the activation span so that traces
-can be matched to a version registered later, which is follow-on
-work. A skill whose content no longer matches its marker, because it
+source other than `mlflow skills pull`, is not linked. A skill whose
+content no longer matches its marker, because it
 was edited after installation, is not linked either. In both cases
 the agent runs normally and other autologging is unaffected. Because
 identity comes from the marker and the content, an installer that
@@ -318,13 +300,13 @@ host. The second is a best-effort fallback: `mlflow skills pull`
 appends a machine-readable marker carrying the coordinates to the
 pulled skill body, and the server recognizes the marker inside
 captured LLM input at ingestion, creating the link only when the
-marker's coordinates resolve in the registry and its digest matches
-the version's. Marker-derived links carry the content-marker
-provenance, the route covers only content that was pulled through
-MLflow, and it works only when the harness captures LLM content in
-its spans, which several harnesses leave off by default. Digest
-computation excludes the marker line. MLflow does not create
-additional spans on the harness's behalf.
+marker is well formed. The server preserves its coordinates without
+resolving the registry version. This route covers only content
+that was pulled through MLflow, and it works only when the harness
+captures LLM content in its spans, which several harnesses leave off by
+default.
+Digest verification removes the marker suffix before hashing. MLflow
+does not create additional spans on the harness's behalf.
 
 #### Measure adoption of a registered skill
 
@@ -346,14 +328,11 @@ versions are in play.
    page shows linked skills on each row.
 
 The filter follows the precedent of the existing `prompt` filter for
-prompt-to-trace links, and so does the storage behind it: a skill link
-is a lineage record associating the trace with the skill version,
-the same mechanism prompt links use, and the filter is an exact-match
-query over those records. Span attributes mark where activation
-happened but are not the query path. Links created at ingestion from
-attributes or content markers produce the same lineage record, so
-every provenance is reached by the one query. A skill in a named
-organization is qualified as in the registry's URI form,
+prompt-to-trace links, but reads the dedicated skill-link table. Span
+attributes mark where activation happened but are not the query path.
+Links created at ingestion from attributes or content markers produce
+the same records. A skill in a named organization is qualified as in
+the registry's URI form,
 `skill = '@acme/code-review/1'`. The name-only and
 organization-qualified forms are extensions this RFC proposes;
 the prompt filter accepts only the `name/version` form. Exact
@@ -389,13 +368,6 @@ affected version.
    ```
 4. Re-run the query after the migration window to confirm that traffic
    on the affected version has stopped.
-
-When the same content has been re-imported under several version
-numbers, the affected traces span all of those versions. RFC-0008
-indexes a skill's versions by content digest, so a registry lookup by
-digest yields every version of that skill that shares the content,
-and the trace query then covers those versions. Extending the
-grouping across skill names is follow-on work.
 
 The evidence is retrospective: it shows what has run, not what is
 installed and idle. A consumer that has the version installed but has
@@ -495,10 +467,6 @@ The benchmark journey above is the controlled complement.
 - **Filtering evaluation results by skill directly.** Evaluation
   results reach skill versions through their traces' links; a direct
   filter on evaluation results is not added.
-- **Server-side digest verification.** Digests remain client-asserted
-  as in RFC-0008; a verification job with a verified-digest flag is
-  registry-side follow-up work.
-
 # Detailed design
 
 This section is deliberately high level. It fixes the shapes that
@@ -509,32 +477,69 @@ to the implementation.
 ## Link model
 
 A skill link is a lineage record associating a trace with a skill
-version, stored and queried through the same entity-association
-mechanism as prompt links. A record carries:
+version. Prompt links store a composite `name/version` destination in
+the generic `entity_associations` table. Skills instead use a dedicated
+span-link table because each observation carries additional metadata.
+Trace queries use a correlated `EXISTS` against this table, so multiple
+observing spans still return each trace once. The SQL is illustrative;
+the Alembic migration emits the equivalent syntax for each supported
+database.
 
-- the trace id, and the id of the span on which the activation was
-  observed, when one is identifiable;
-- the skill version's identity: `workspace`, `organization`, `name`,
-  and `version`, with the association id in the URI form
-  `[@organization/]name/version`;
-- a `provenance` value: `explicit` (set by application or
-  OpenTelemetry instrumentation), `resolution` (recorded by a
-  framework autologger from the in-process mapping written by
-  `pull`), `digest` (recorded by an autologger that verified the
-  installed content's digest against the marker it carries), or
-  `content_marker` (inferred by the server from a marker in captured
-  LLM input).
+```sql
+CREATE TABLE span_skill_links (
+  trace_id VARCHAR(50) NOT NULL,
+  span_id VARCHAR(50) NOT NULL,
+  skill_workspace VARCHAR(63) NOT NULL,
+  skill_organization VARCHAR(64) NOT NULL DEFAULT '',
+  skill_name VARCHAR(128) NOT NULL,
+  skill_version INTEGER NOT NULL,
+  role VARCHAR(20) NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (
+    trace_id, span_id, skill_workspace, skill_organization,
+    skill_name, skill_version
+  ),
+  FOREIGN KEY (trace_id) REFERENCES trace_info(request_id) ON DELETE CASCADE
+);
 
-There is at most one record per trace and skill version. When more
-than one route produces the same link, the record keeps the more
-authoritative provenance; `content_marker` is the least
-authoritative, and the other three are treated as equal.
+CREATE INDEX ix_span_skill_links_skill
+  ON span_skill_links (
+    skill_workspace, skill_organization, skill_name,
+    skill_version, trace_id
+  );
+```
 
-Independently of the record, the span on which activation was
-observed is annotated with the attributes below, and tool spans that
-use a skill's bundled files are annotated with the same attributes
-plus `mlflow.skill.role = "usage"`. Annotation is for inspection in
-the trace view; it is not a query path.
+`span_skill_links` stores one row for each span where a skill was
+observed:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `role` | `activation` | The span activated the skill. |
+| `role` | `usage` | The span used a file bundled with the skill. |
+
+Storage behavior:
+
+- **Foreign keys:** only `trace_id` is constrained. Spans may be stored
+  outside the relational tracking store, and skill links must survive
+  registry deletion.
+- **Lifecycle:** skill moves and deletions do not rewrite links; their
+  coordinates remain historical facts.
+- **Access:** reading a link requires access to its trace. Resolving or
+  navigating to the referenced skill separately requires skill access.
+- **Indexes:** the primary key supports lookup by trace. The reverse
+  index supports name-only and exact-version trace queries.
+
+Span-link inserts are idempotent. The span is also annotated with the
+`mlflow.skill.*` attributes in the
+[SDK method and attribute contract](#sdk-method-and-attribute-contract)
+for inspection in the trace view.
+
+Links are materialized during span ingestion; there is no separate
+public linking endpoint. After the trace row exists, the server passes
+the links found in each ingestion batch to an internal
+`upsert_span_skill_links(trace_id, links)` tracking-store method. The
+method atomically upserts the span links. It requires the trace to
+exist, but not a relational span row or a resolvable registry version.
 
 ## SDK method and attribute contract
 
@@ -546,6 +551,7 @@ class Span:
         name: str,
         version: int | None = None,
         alias: str | None = None,
+        workspace: str | None = None,
         organization: str = "",
         cache_ttl_seconds: float | None = None,
     ) -> None: ...
@@ -556,10 +562,13 @@ through the registry and the concrete version is what the link
 records. Alias resolutions are cached per process with a short
 expiry, following the prompt registry's alias cache: the default TTL
 comes from `MLFLOW_ALIAS_SKILL_CACHE_TTL_SECONDS` (60 seconds), a
-per-call `cache_ttl_seconds` overrides it, and `0` bypasses the
-cache. The workspace is the caller's current workspace context. The
-method writes the annotation attributes on the span and the lineage
-record on the span's trace with provenance `explicit`.
+per-call `cache_ttl_seconds` overrides it, and `0` bypasses the cache.
+`workspace=None` uses the caller's current workspace; an explicit
+workspace permits cross-workspace links and scopes alias resolution.
+The method only adds the attributes below to the span. It makes no
+separate linking or export request; the attributes follow the existing
+span export flow, and ingestion materializes the corresponding trace
+and span links.
 
 Instrumentation that does not use the MLflow SDK sets the same
 attributes directly, and MLflow creates the lineage record from them
@@ -571,7 +580,6 @@ when it receives the span:
 | `mlflow.skill.version` | registered version (integer) |
 | `mlflow.skill.workspace` | workspace name |
 | `mlflow.skill.organization` | organization, empty string when none |
-| `mlflow.skill.digest` | content digest, when known |
 | `mlflow.skill.role` | `activation` (default) or `usage` |
 
 These names are a public contract. No OpenTelemetry semantic
@@ -580,49 +588,43 @@ can map it to these attributes without changing the contract.
 
 ## Queries
 
-The `skill` filter on `search_traces` matches lineage records by
-exact match, following the `prompt` filter:
+The `skill` filter on `search_traces` accepts only `=` and uses the
+form `[@organization/]name[/version]`. Omitting the version matches all
+versions of the skill. `skill.workspace` accepts only `=`, must
+accompany `skill`, and defaults to the caller's active workspace. Both
+predicates match the same link. Aliases are not accepted: aliases
+passed to `link_skill` are resolved when the link is created, and
+traces store the concrete version.
 
+- `skill = 'code-review'`: all versions of a skill;
 - `skill = 'code-review/1'`: one version;
-- `skill = '@acme/code-review/1'`: one version in a named
-  organization;
-- `skill = 'code-review'`: any version of the skill;
-- `skill.provenance = 'digest'`: qualifies by provenance, for
-  example to exclude `content_marker` links from an exposure count.
-
-Digest queries resolve through the registry: RFC-0008's digest index
-yields the versions sharing a digest, and the trace query covers
-those versions.
+- `skill = '@acme/code-review'`: all versions in a named organization;
+- `skill = '@acme/code-review/1'`: one version in a named organization;
+- `skill.workspace = 'shared' AND skill = 'code-review/1'`: a skill in
+  another workspace.
 
 ## Skill identification
 
 Autologgers identify an installed skill by its content, without
-contacting the registry. For each activation observed in a harness,
-or each `SKILL.md` read observed in a framework at a location not in
-the in-process mapping, the autologger hashes the skill directory
-with RFC-0008's canonical digest rule and checks the result against
-the content marker defined below:
+contacting the registry. On the first activation of a skill in each
+trace, the autologger hashes the skill directory with RFC-0008's
+canonical digest rule and checks the result against the content marker
+defined below:
 
 1. if the installed `SKILL.md` carries the marker and the marker's
    digest equals the computed digest, the marker's coordinates
    identify the version, and the autologger links and annotates;
-2. if the marker is absent, the content is not linked, and the
-   autologger sets `mlflow.skill.digest` on the activation span so
-   that the trace can be matched to a version registered later;
+2. if the marker is absent, the content is not linked;
 3. if the marker is present but its digest differs from the computed
    digest, the content was modified after it was pulled; the
    autologger logs a warning and treats the content as unmarked.
 
 Only content pulled through MLflow is linked on this path, so a
-harness run never depends on registry availability. Matching
-unmarked content to versions registered later, using the recorded
-digest, is follow-on work.
+harness run never depends on registry availability.
 
-Results are cached locally, keyed by skill directory, so an installed
-skill is hashed once rather than on every run; the cache is
-invalidated when the skill directory changes. No file is written by
-the user and no declaration is required; an autologger may keep its
-cache in a file it owns.
+The verification result is cached for the remainder of the trace. A
+new trace verifies the content again, so no file watcher or persistent
+cache is required.
 
 The harness integrations must implement the digest rule identically
 to the Python SDK; RFC-0008 defines the rule deterministically, and
@@ -630,58 +632,60 @@ shared test vectors guard the implementations.
 
 ## Content marker
 
-`mlflow skills pull` appends one line to the pulled `SKILL.md`, after
-a blank line, as the last line of the body:
+`mlflow skills pull` appends a fixed suffix to the pulled `SKILL.md`:
+two newline bytes, one marker line, and a final newline byte.
 
 ```
-<!-- mlflow-skill: {"workspace":"default","organization":"",
-"name":"code-review","version":3,"digest":"sha256:..."} -->
+<!-- mlflow-skill: {"schema_version":1,"workspace":"default","organization":"","name":"code-review","version":3,"digest":"<64 lowercase hex>"} -->
 ```
 
-The JSON carries the version's registry coordinates and content
-digest. The marker is an HTML comment, so it does not render, and the
-digest rule excludes it so the pulled content still verifies against
-the registered digest. At OpenTelemetry ingestion, the server scans
-captured LLM input (never output) for the marker and creates a
-lineage record with provenance `content_marker` only when the
-coordinates resolve in the registry and the digest matches the
-version's; duplicate matches within a trace produce one record. In
-testing against OpenHands and Goose, the marker survived byte-for-byte
-wherever the harness captured LLM content in its spans; whether
-content is captured at all, often an opt-in, is the limiting factor.
+`schema_version` versions the marker format; parsers accept `1` and
+ignore unsupported versions. The JSON carries the registry coordinates
+and digest computed by `pull`, in RFC-0008's raw, lowercase hexadecimal
+form. Before applying RFC-0008's digest algorithm, verification removes
+exactly one well-formed final marker suffix; malformed or non-final
+markers remain part of the content. At OpenTelemetry ingestion, the
+server scans captured LLM input (never output) for the marker and
+creates links from each well-formed marker without resolving its
+coordinates against the registry. Duplicate matches produce
+one link per observing span. In testing against OpenHands and Goose,
+the marker survived byte-for-byte wherever the harness captured LLM
+content in its spans; whether content is captured at all, often an
+opt-in, is the limiting factor.
 
 ## Autologger behavior
 
-**Harnesses with MLflow-provided tracing** (Claude Code, Codex, Qwen
-Code, OpenCode). The autologger recognizes activations by the
-harness's own signals where they exist (a dedicated skill tool call,
-a slash-command invocation) and otherwise by a tool call that reads a
-`SKILL.md`, identifies the skill by its marker as above, annotates
-the activation span, and writes the lineage record with provenance
-`digest`. Tool calls whose inputs reference paths under an identified
-skill's directory are annotated as usage. Unmarked or modified
-content produces a digest attribute and no link, and the registry is
-never contacted; the run is never affected.
+The MVP integrations are LangGraph, Claude Code, and Codex. Local
+detectors treat an explicit skill event or a structured tool read of a
+skill root's `SKILL.md` as activation, and structured tool access to
+another path under that root, such as executing
+`<skill-root>/scripts/check.py`, as usage. They do not inspect
+arbitrary text or model output.
 
-**Agent frameworks with MLflow autologgers.** `mlflow.genai.pull`
-accepts a skill URI (`skills:/name@alias` or `skills:/name/version`)
-as its first argument, so the call's shape names the entity, in
-addition to the keyword form RFC-0008 specifies, which is retained
-because it is already being implemented. Either form records, in
-process, the mapping from each pulled skill's location to its
-coordinates and digest. The framework autologger consults that
-mapping when it observes an activation (a skill-loading tool call, or
-a read of a pulled `SKILL.md`), annotates the span, and writes the
-record with provenance `resolution`; for a `SKILL.md` read at a
-location not in the mapping it falls back to identification by
-marker as above. Frameworks that MLflow traces only by receiving their
-OpenTelemetry output are handled as receivers below.
+**Claude Code.** The autologger recognizes dedicated skill tool calls,
+slash-command invocations, and reads of `SKILL.md`. It identifies the
+skill by verifying its marker and digest. Tool calls whose inputs
+reference paths under the skill directory are usage. Unmarked or
+modified content produces no link.
 
-**OpenTelemetry receivers** (Gemini CLI, Goose, OpenHands, Google
-ADK). At ingestion, a received span carrying the attribute contract
-produces a lineage record with provenance `explicit`. As a fallback,
-the server recognizes the content marker as defined above. This
-route works only when the harness captures LLM content in its spans.
+**LangGraph.** `mlflow.genai.pull` accepts a skill URI
+(`skills:/name@alias` or `skills:/name/version`) and records the
+canonical absolute skill root, coordinates, and digest in a
+thread-safe process-local map. The map identifies candidates; the
+first activation in each trace is verified as above. Path matching uses
+the most specific mapped root, and copied or moved content falls back
+to its marker.
+
+**OpenTelemetry receivers (Codex in the MVP).** A span from any
+OpenTelemetry producer creates links when it carries workspace, name,
+and integer version attributes; organization defaults to empty, role
+to `activation`. Incomplete or malformed attributes are ignored with a
+warning and do not reject the trace.
+As a fallback, the server scans captured LLM input only, accepts each
+well-formed marker without a registry lookup, creates separate links
+for distinct markers, and ignores duplicates. Codex validates this
+generic receiver path in the MVP; its marker fallback is best-effort
+because content capture is opt-in.
 
 ## UI
 
@@ -706,15 +710,14 @@ UI specification.
 
 - **Harness linking covers only content pulled through MLflow.** A
   skill installed from another source carries no marker and is not
-  linked; its digest is recorded for later matching, which this RFC
-  does not deliver. The digest rule must be implemented identically
-  in every harness integration.
+  linked. The digest rule must be implemented identically in every
+  harness integration.
 - **The marker mutates pulled content.** Appending a marker to
   `SKILL.md` changes the file on disk and requires the digest rule to
-  exclude that line. It is also visible to the model, and the
-  server-side fallback works only when the harness includes LLM
-  message content in its telemetry, which is a separate setting from
-  tracing itself and is off by default in the OpenTelemetry GenAI
+  exclude the fixed marker suffix. It is also visible to the model,
+  and the server-side fallback works only when the harness includes
+  LLM message content in its telemetry, which is a separate setting
+  from tracing itself and is off by default in the OpenTelemetry GenAI
   conventions. In practice this limits little: users who send traces
   to MLflow to understand agent behavior generally enable content
   capture as well, since prompts and responses are most of what they
@@ -767,32 +770,11 @@ declared record can drift from the content it describes. Identifying
 installed content by its marker and digest needs no declaration and
 cannot drift.
 
-## Registry lookup by digest for unmarked content
-
-Resolving content that carries no marker by looking its digest up in
-the registry, first under the harness-local skill name and then
-under any name, was considered and rejected for this RFC. It would
-extend linking to skills installed from any source, but it makes a
-harness run depend on registry availability, it requires a registry
-lookup by digest across skill names that RFC-0008 does not provide,
-and when identical content is registered under several versions or
-names it must choose by rule rather than by fact. Recording the
-digest on the span preserves the option: content registered later
-can be matched to earlier traces as follow-on work.
-
 # Adoption strategy
 
-New feature, not a breaking change. Existing traces are unaffected;
-existing framework autologgers gain skill linking without user
-changes once a skill is resolved through `mlflow.genai.pull`, and
-harness users gain it by pulling skills through MLflow and enabling
-tracing. This RFC delivers `Span.link_skill`, the attribute contract,
-lineage records and the `skill` filter, the content marker written by
-`pull` and identification of installed skills by that marker, skill
-recognition in the Claude Code, Codex, Qwen Code, and OpenCode
-tracing integrations and in framework autologgers, attribute and
-marker recognition at OpenTelemetry ingestion, and the UI content
-above. RFC-0010 reuses the link model for non-skill plugin members.
-Digest-based trace grouping across skill names, and matching of
-unmarked content to versions registered later, are deferred to
-follow-on work.
+New feature, not a breaking change. Existing traces are unaffected.
+This RFC delivers `Span.link_skill`, the attribute contract, lineage
+records and the `skill` filter, the content marker written by `pull`,
+and automatic recognition in LangGraph, Claude Code, and Codex. OpenCode
+is the first follow-up integration; other harnesses and frameworks are
+deferred. RFC-0010 reuses the link model for non-skill plugin members.
