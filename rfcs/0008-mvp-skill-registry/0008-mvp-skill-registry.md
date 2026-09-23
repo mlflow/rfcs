@@ -5,9 +5,9 @@
 | mlflow_issue | https://github.com/mlflow/mlflow/issues/22833 |
 | rfc_pr       | https://github.com/mlflow/rfcs/pull/26 |
 
-| Author(s)              | [Bill Murdock](https://github.com/jwm4) (Red Hat) |
+| Author(s)              | [Bill Murdock](https://github.com/jwm4) (Red Hat), [Matthew Prahl](https://github.com/mprahl) (Red Hat) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-08-11 |
+| **Date Last Modified** | 2026-09-23 |
 | **AI Assistant(s)**    | Claude Code, Codex |
 
 **Table of contents**
@@ -21,6 +21,7 @@
 - [Detailed design](#detailed-design)
   - [Entities and data model](#entities-and-data-model)
   - [Status and lifecycle](#status-and-lifecycle)
+  - [Repository skill import](#repository-skill-import)
   - [Plugin import](#plugin-import)
   - [Pull semantics](#pull-semantics)
   - [Workspace scoping](#workspace-scoping)
@@ -985,6 +986,49 @@ here in favor of predictable latest resolution.
 > the user is registering a known-good version from an existing
 > source. Users who need a review gate before activation can
 > explicitly set `status="draft"` at registration time.
+
+### Repository skill import
+
+`mlflow skills import` is a client-side bulk operation for
+registering standalone skills from a Git repository without creating an agent
+plugin. The repository source is the only required option:
+
+```bash
+mlflow skills import --source https://github.com/acme/skills.git
+```
+
+The equivalent SDK function is
+`mlflow.genai.import_skills(source="https://github.com/acme/skills.git")`.
+
+- `--source` identifies the Git repository, which the client fetches using the
+  caller's local Git credentials. The server never fetches the repository.
+- `--ref` optionally selects the Git branch, tag, or commit to inspect; by
+  default, the repository's default branch is used.
+- `--subpath` optionally sets the discovery root within the repository. The
+  client recursively discovers `SKILL.md` entry points beneath it.
+- `--skill-name` is repeatable and restricts the import to skills whose
+  declared `SKILL.md` name is in the allowlist. The SDK equivalent is
+  `skill_names`. Omitting it imports every discovered skill.
+- `--organization` optionally selects the target registry organization and
+  defaults to the empty organization.
+
+Duplicate discovered names or an allowlisted name that is not found cause
+validation to fail rather than silently changing the requested scope. The
+client validates every selected skill and computes its content digest before
+sending a prepared batch to `POST /skills/bulk-register`. The endpoint invokes
+the store's `bulk_register_skills` operation, which registers the entire batch
+in one database transaction.
+
+Each selected directory is registered as an ordinary, independently
+addressable skill. Its version retains the repository URL and ref, with
+`subpath` set to that skill's directory. A new name creates a skill and its
+first version. An exact source, ref, subpath, and digest match returns the
+existing version, making retries idempotent; otherwise, a skill previously
+imported from the same repository path gets a new version.
+
+This operation is distinct from `mlflow agent-plugins import`, which imports a
+package, creates an agent plugin version, and registers discovered skills as
+its members.
 
 ### Plugin import
 
