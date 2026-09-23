@@ -1206,6 +1206,20 @@ class SkillRegistryMixin:
     ) -> SkillVersion:
         raise NotImplementedError(self.__class__.__name__)
 
+    def bulk_register_skills(
+        self,
+        skill_definitions: list[dict[str, Any]],
+        organization: str = "",
+        created_by: str | None = None,
+    ) -> list[SkillVersion]:
+        """Register client-prepared skill definitions in one database
+        transaction. An entry whose name, source, ref, subpath, and digest
+        match an existing standalone skill version returns that version
+        without creating another one. Any other failure rolls back the whole
+        batch.
+        """
+        raise NotImplementedError(self.__class__.__name__)
+
     def get_skill_version(
         self, name: str, version: int,
         organization: str = "",
@@ -1625,6 +1639,19 @@ class IntrospectedSkill:
     path: str
 
 
+def import_skills(
+    *,
+    source: GitSource | str,
+    organization: str = "",
+    skill_names: list[str] | None = None,
+) -> list[SkillVersion]:
+    """Fetch a Git repository and recursively discover skills beneath the
+    GitSource subpath, or the repository root when no subpath is set. If
+    skill_names is provided, select only skills with those declared names.
+    Validate all selected skills, compute their digests, and submit the prepared
+    definitions to the transactional, idempotent bulk-registration endpoint."""
+
+
 @dataclass
 class PluginIntrospectionResult:
     detected_format: str
@@ -1739,6 +1766,15 @@ class MlflowClient:
         digest: str | None = None,
         status: str = "active",
     ) -> SkillVersion: ...
+
+    def bulk_register_skills(
+        self,
+        *,
+        skill_definitions: list[dict[str, Any]],
+        organization: str = "",
+    ) -> list[SkillVersion]:
+        """Post client-prepared skill definitions to the transactional,
+        idempotent bulk-registration endpoint."""
 
     def get_skill_version(
         self, *, name: str, version: int, organization: str = ""
@@ -2054,6 +2090,7 @@ All paths relative to the logical skills router prefix.
 | `POST` | `/` | Create a skill |
 | `GET` | `/` | Search skills |
 | `POST` | `/register` | Register a skill version (name required at this endpoint; the SDK/CLI fills it from SKILL.md during local inspection so human callers omit it, but a raw REST caller that omits it is rejected; auto-creates parent) |
+| `POST` | `/bulk-register` | Atomically and idempotently register a client-prepared batch of standalone skills discovered from one repository |
 | `GET` | `/@{organization}/{name}` | Get skill by organization and name |
 | `PATCH` | `/@{organization}/{name}` | Update skill fields |
 | `DELETE` | `/@{organization}/{name}` | Hard-delete skill (cascades, subject to references) |
@@ -2509,6 +2546,7 @@ flag also accepted; for example, `mlflow skills get skills:/code-review` and
 | `mlflow skills register oci` | `register_skill(source=OCISource(...))` | Register from an OCI image |
 | `mlflow skills register zip` | `register_skill(source=ZipSource(...))` | Register from a ZIP archive |
 | `mlflow skills register` | `register_skill(source="./local-path")` | Register from a local directory (uploaded to MLflow artifact storage) |
+| `mlflow skills import` | `import_skills()` | Discover and atomically register standalone skills from a Git repository |
 | `mlflow skills get` | `get_skill()` | Get skill metadata |
 | `mlflow skills update` | `update_skill()` | Update skill presentation metadata (description, icons) |
 | `mlflow skills search` | `search_skills()` | Search skills |
