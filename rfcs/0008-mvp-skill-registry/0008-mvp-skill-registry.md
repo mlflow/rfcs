@@ -1286,7 +1286,8 @@ Registry (RFC-0004).
 The Skills page lives under the GenAI workflow in the MLflow sidebar,
 alongside Experiments, Prompts, MCP Servers, and AI Gateway. It
 provides list and detail views for skills and agent plugins. The list view
-supports structured filtering by status, organization, tags, source type, and,
+supports structured filtering by status, organization, tags, source type
+(resolved from the latest non-deleted version on parent searches), and,
 for agent plugins, membership (by member name). A separate free-text search
 input covers user-visible discovery metadata: Skill name and description; and
 Agent Plugin

@@ -2208,7 +2208,8 @@ version later resolves as latest.
 
 **Skills:** the `search_text` field covers name and description. Structured
 examples include `name LIKE '%review%'`, `description LIKE '%security%'`,
-`organization = 'acme'`, `status = 'active'`, and `tags.team = 'platform'`.
+`organization = 'acme'`, `status = 'active'`, `source_type = 'git'`, and
+`tags.team = 'platform'`.
 
 **Agent plugins:** the `search_text` field covers name, mutable parent
 description, organization, and the latest-resolved manifest's description,
@@ -2220,12 +2221,13 @@ only the latest-resolved one. This makes it the discovery path for "which
 plugins depend on this skill," including plugins pinned to an older version, now
 that memberships are not a stored field on the skill.
 
-On parent search, a `status` filter matches the parent's derived status,
-resolved from the same latest-resolved version that drives `latest_version`
-and the entity's read-only `status`, since parent tables have no status
-column of their own. A parent with no non-`deleted` version has a `None`
-derived status and is excluded by any `status` equality filter. To filter on
-the status of a specific version, use version search.
+On parent search, `status` and `source_type` filters match values derived from
+the latest-resolved non-`deleted` version: `status` matches the same derived
+status that drives the entity's read-only `status`, and `source_type` matches
+that version's stored source type. Parent tables do not duplicate either field.
+A parent with no non-`deleted` version has `None` for those derived values and
+is excluded by equality filters on them. To filter on the status or source type
+of specific versions, use version search.
 
 **Versions (all entity types):** `status = 'active'`,
 `organization = 'acme'`, `source_type = 'git'`,
