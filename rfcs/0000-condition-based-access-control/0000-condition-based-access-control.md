@@ -195,6 +195,14 @@ workspace. A condition with a parent scope applies only when the validator resol
 exact direct parent to that type and ID. Conditions do not inherit across resource types: a
 workspace/type-scoped `run` condition does not apply to traces or logged models.
 
+**An unresolved parent must fail closed.** A parent-scoped condition is selected by matching the
+target's resolved parent, so a validator that mutates a child type but cannot supply that parent
+would match no scoped condition at all -- the restriction would silently stop applying, with
+nothing observable to distinguish it from no restriction being configured. A mutating operation on
+a child type whose parent cannot be resolved must therefore be refused, not treated as unscoped.
+A parentless type (`experiment`, `registered_model`, `prompt`, `mcp_server`) supplying no parent is
+the ordinary case and is unaffected.
+
 Each non-null condition is a single filter in MLflow's existing search filter grammar: a set of
 comparison clauses AND-ed together, for example `tags.lifecycle = 'dev'` or
 `tag_key != 'lifecycle' AND alias != 'champion'`. A value being set, or a resource being
@@ -217,9 +225,20 @@ role's objects. Their request and response shapes:
 ```
 add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
     value_condition?, target_condition?) -> MutationConditions
-    # Creates one object. The parent fields are both omitted/null for workspace/type scope or
+    # Creates ONE object. The parent fields are both omitted/null for workspace/type scope or
     # both set for exact direct-parent scope. Rejects an unsupported parent relationship, an
     # invalid filter, both filters null, or a role/type that already has 100 objects.
+    #
+    # Every object added for a (role, resource_type) that applies to a target must pass: the
+    # objects are conjunctive, not alternatives. Adding one can only narrow what the role may
+    # do, never widen it. This is worth surfacing in any authoring UI, because a list of
+    # objects reads like a set of alternatives and most permission systems treat a list that
+    # way -- two objects saying "env = dev" and "owner = me" permit only resources that are
+    # both, which is the most common way for an admin to lock themselves out.
+    #
+    # The caller does not choose the slot; the server allocates a free one. The slot's UNIQUE
+    # constraint is what makes the 100-object bound race-safe, so a concurrent add that loses
+    # the chosen slot is retried against another rather than overshooting the bound.
 
 update(id, parent_resource_type?, parent_resource_id?, value_condition?, target_condition?)
     -> MutationConditions
@@ -260,6 +279,21 @@ evaluate.
 - **At most 100 condition objects per `(role, resource_type)`.** This bound includes both
   workspace/type-scoped and parent-scoped objects.
 - **At most 5 clauses per filter** (value and target each).
+- **Reserved `mlflow.*` tag keys cannot be named in either namespace.** A condition may not use
+  `mlflow.`-prefixed key as a `tag_key` value, nor as a `tags.<key>` identifier. Two reasons, and
+  they point the same way. MLflow writes these itself (`mlflow.runName`, `mlflow.source.type`), so
+  a value condition naming one would block MLflow's own bookkeeping. And because no value
+  condition can gate them, they remain freely settable -- so a target condition reading one
+  restricts nothing in practice: the holder sets the tag to whatever passes, and
+  `tags.mlflow.runName != 'secret'` is defeated by renaming the run. A rule that cannot be
+  enforced should not be storable, because the admin would believe a restriction is in force.
+  User-owned keys that merely contain the string (`mlflow_stage`, `team.mlflow.note`) are
+  unaffected; the test is on the prefix.
+- **Ordering comparators are rejected.** `=`, `!=`, `LIKE`, `ILIKE`, `IN` and `NOT IN` are
+  allowed. `>`, `<`, `>=` and `<=` are not: tag and alias values are strings, so an ordering
+  comparison would be lexicographic and would mislead an admin into thinking they had expressed a
+  numeric or temporal range. `!=` and `NOT IN` are what supply exclusion, which is why no separate
+  deny form is needed.
 - **No `OR` within a filter.** This preserves reuse of MLflow's AND-only parser and matcher;
   `IN` and `NOT IN` express same-field alternatives. General OR would require a separate
   parser/evaluator and special absent-field semantics for value conditions.
@@ -305,14 +339,16 @@ parent scope is supported only for the listed child-to-parent relationships.
 
 | Resource type | Direct parent for scoped conditions | Target fields | Value-setting operations |
 |---|---|---|---|
-| `experiment` | none | `tags.*` | set-tag, create. Other mutations carry no value fields. |
-| `registered_model` | none | `tags.*`, `aliases.*` | set-tag, set-alias, create. Other mutations carry no value fields. |
-| `prompt` | none | `tags.*`, `aliases.*` | set-tag, set-alias, create. Other mutations carry no value fields. |
-| `run` | `experiment` | `tags.*` | set-tag, create. Other mutations carry no value fields. |
-| `trace` | `experiment` | `tags.*` | set-tag. Other mutations carry no value fields. |
-| `logged_model` | `experiment` | `tags.*` | set-tags (batch), create. Other mutations carry no value fields. |
-| `registered_model_version` | `registered_model` | `tags.*` | set-tag, create. Other mutations carry no value fields. |
-| `prompt_version` | `prompt` | `tags.*` | set-tag, create. Other mutations carry no value fields. |
+| `experiment` | none | `tags.*` | set-tag, delete-tag, create. Other mutations carry no value fields. |
+| `registered_model` | none | `tags.*`, `aliases.*` | set-tag, delete-tag, set-alias, delete-alias, create. Other mutations carry no value fields. |
+| `prompt` | none | `tags.*`, `aliases.*` | set-tag, delete-tag, set-alias, delete-alias, create. Other mutations carry no value fields. |
+| `run` | `experiment` | `tags.*` | set-tag, delete-tag, create. Other mutations carry no value fields. |
+| `trace` | `experiment` | `tags.*` | set-tag, delete-tag. Other mutations carry no value fields. |
+| `logged_model` | `experiment` | `tags.*` | set-tags (batch), delete-tag, create. Other mutations carry no value fields. |
+| `registered_model_version` | `registered_model` | `tags.*` | set-tag, delete-tag, create. Other mutations carry no value fields. |
+| `prompt_version` | `prompt` | `tags.*` | set-tag, delete-tag, create. Other mutations carry no value fields. |
+| `mcp_server` | none | `tags.*`, `aliases.*` | set-tag, delete-tag, set-alias. Other mutations carry no value fields. |
+| `mcp_server_version` | `mcp_server` | `tags.*` | set-tag, delete-tag. Aliases are stored on the server, so an alias condition is keyed on `mcp_server`, never on the version. |
 
 Notes:
 - A target condition never restricts create because no target state exists yet. A value condition
@@ -322,10 +358,18 @@ Notes:
 - Assessment create, update, and delete are authorized against the trace. A trace target
   condition can therefore gate assessment mutations, for example preventing an assessment from
   being added to a trace tagged `finalized=true`.
-- Target conditions inspect the pre-mutation target state. If a target currently matches
-  `tags.lifecycle = 'dev'`, deleting that tag can be authorized; subsequent mutations no longer
-  match the condition. A value condition protects a governed key only for operations that expose
-  that key as a request value.
+- **A tag deletion exposes the tag key as a request value.** Delete-tag is a value-setting
+  operation for this purpose: the key being removed is matched against `tag_key` (with `tag_value`
+  absent, so a `tag_value` clause is vacuous). Without this, a value condition such as
+  `tag_key != 'lifecycle'` would block *setting* the governed tag while permitting its *deletion*,
+  which is the same mutation in the direction that matters.
+- Target conditions inspect the pre-mutation target state, so a delete is judged against the tag
+  still being present. Deleting a tag a condition depends on does not escape the condition: on the
+  target side an **absent** tag fails every comparator, so a target that no longer carries
+  `tags.lifecycle` satisfies neither `tags.lifecycle = 'dev'` nor `tags.lifecycle != 'prod'`.
+  Removing the governing tag therefore *loses* access rather than becoming unrestricted. This
+  surprises admins -- `tags.lifecycle != 'prod'` denies an untagged resource -- but it is the
+  fail-closed reading, and it is what prevents a two-step bypass.
 
 ## Adaptability to Pluggable Auth (RFC 8)
 
