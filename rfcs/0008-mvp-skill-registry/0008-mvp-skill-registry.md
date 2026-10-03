@@ -1018,6 +1018,9 @@ sending a prepared batch to `POST /skills/bulk-register`. The endpoint invokes
 the store's `bulk_register_skills` operation, which registers the entire batch
 in one database transaction.
 
+Skills nested inside another skill are rejected, including when name filtering
+would exclude one of them.
+
 Each selected directory is registered as an ordinary, independently
 addressable skill. Its version retains the repository URL and ref, with
 `subpath` set to that skill's directory. A new name creates a skill and its

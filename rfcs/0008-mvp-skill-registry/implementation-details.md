@@ -1128,6 +1128,10 @@ not accepted in REST request bodies or public `mlflow.genai` or
 `MlflowClient` methods. A REST handler obtains the authenticated principal
 and passes it to the store through internal parameters.
 
+Store audit parameters are internal inputs supplied by server handlers.
+Skill and Agent Plugin REST stores retain them for interface compatibility
+but do not serialize them. The remote server determines audit identity.
+
 On creation, the store initializes both fields to the authenticated
 principal. When a version-creation operation auto-creates its parent, the
 same principal is applied to both the parent and the new version. If the
@@ -1549,6 +1553,11 @@ nothing to the registry.)
 
 ### High-level workflow functions (`mlflow.genai`)
 
+High-level registration and bulk import require each skill to have a root
+`SKILL.md` file. Nested `SKILL.md` files and directories named `SKILL.md` are
+rejected. Bulk import checks all discovered skill roots before name filtering,
+within the requested discovery subpath or repository root.
+
 ```python
 from dataclasses import dataclass
 
@@ -1559,7 +1568,7 @@ def register_skill(
     *,
     name: str | None = None,
     organization: str = "",
-    source: GitSource | OCISource | ZipSource | str | None = None,
+    source: GitSource | OCISource | ZipSource | str,
     status: str = "active",
 ) -> SkillVersion:
     """Register a skill version. The server assigns the next
@@ -1573,7 +1582,9 @@ def register_skill(
     (register_mcp_server). If name is omitted, the client
     extracts it from the skill's SKILL.md entry point during local
     inspection and submits it; the server never fetches the source
-    to infer content-derived fields. The client also computes the
+    to infer content-derived fields. An explicit name overrides the manifest
+    name for registry identity without modifying the content. Manifest
+    validation and digest computation still apply. The client also computes the
     content digest from SKILL.md and the files under subpath during
     that same inspection and submits it whether or not name was
     supplied. The server
@@ -1587,6 +1598,9 @@ def register_skill(
     when the client uploads a local path; MlflowSource is a response-side
     value only, and passing one here is rejected, since the artifact
     path is server-chosen.
+    Source is required and cannot be None. Local uploads carry packaged
+    content instead of a REST source value. Local input must be a directory;
+    the SDK inspects, hashes, and packages it as a gzip-tar archive.
     If source is a local path (no :// scheme), the client submits the
     packaged content with the registration request and the server stores
     it and creates the version in one atomic operation (no separate
@@ -1644,12 +1658,16 @@ def import_skills(
     source: GitSource | str,
     organization: str = "",
     skill_names: list[str] | None = None,
+    status: str = "active",
 ) -> list[SkillVersion]:
     """Fetch a Git repository and recursively discover skills beneath the
     GitSource subpath, or the repository root when no subpath is set. If
     skill_names is provided, select only skills with those declared names.
     Validate all selected skills, compute their digests, and submit the prepared
-    definitions to the transactional, idempotent bulk-registration endpoint."""
+    definitions to the transactional, idempotent bulk-registration endpoint.
+    Status accepts active or draft and applies to newly created versions.
+    It is sent in each skill definition. Reused versions retain their
+    existing status."""
 
 
 @dataclass
@@ -1765,7 +1783,11 @@ class MlflowClient:
         source: GitSource | OCISource | ZipSource | str | None = None,
         digest: str | None = None,
         status: str = "active",
-    ) -> SkillVersion: ...
+    ) -> SkillVersion:
+        """Local input must be a prepared gzip-tar archive. The client validates
+        and uploads it without inspecting the manifest or computing a digest.
+        The optional digest describes the unpacked content tree and is
+        forwarded unchanged."""
 
     def bulk_register_skills(
         self,
