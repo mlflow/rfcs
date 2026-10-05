@@ -140,6 +140,9 @@ request may set. Neither requires moving resources or per-resource admin work.
   read a resource, this RFC does **not** hide it. Reads stay as today, and mutation conditions
   are evaluated only during **create/mutation** authorization. Read conditions and search or
   list prefiltering need a queryable scope plus predicate pushdown into the store query.
+- **Cross-workspace conditions.** Conditions inherit exactly one workspace through their role. A
+  condition that applies across every workspace would require a cross-workspace role or a
+  separate global-policy binding, neither of which exists in this design.
 - **Parent-attribute predicates.** A parent scope selects a child by its exact direct-parent
   type and ID. It does not read mutable attributes from the parent, so "lock all runs whose
   parent experiment is tagged `lifecycle=prod`" is not expressible in the initial
@@ -236,9 +239,9 @@ add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
     # way -- two objects saying "env = dev" and "owner = me" permit only resources that are
     # both, which is the most common way for an admin to lock themselves out.
     #
-    # The caller does not choose the slot; the server allocates a free one. The slot's UNIQUE
-    # constraint is what makes the 100-object bound race-safe, so a concurrent add that loses
-    # the chosen slot is retried against another rather than overshooting the bound.
+    # The caller does not choose the slot. The backend allocates an unused slot from 1 through
+    # 100; the slot UNIQUE constraint handles a concurrent allocation collision, which is
+    # retried. The slot is implementation metadata and has no policy ordering meaning.
 
 update(id, parent_resource_type?, parent_resource_id?, value_condition?, target_condition?)
     -> MutationConditions
@@ -277,7 +280,8 @@ evaluate.
 - **Contradictory conditions fail closed.** If applicable conditions require
   `tags.lifecycle = 'dev'` and `tags.lifecycle = 'prod'`, the user can mutate neither.
 - **At most 100 condition objects per `(role, resource_type)`.** This bound includes both
-  workspace/type-scoped and parent-scoped objects.
+  workspace/type-scoped and parent-scoped objects. Roles are workspace-scoped, so the bound
+  never spans workspaces; it is not an aggregate quota across every role in a workspace.
 - **At most 5 clauses per filter** (value and target each).
 - **Reserved `mlflow.*` tag keys cannot be named in either namespace.** A condition may not use
   `mlflow.`-prefixed key as a `tag_key` value, nor as a `tags.<key>` identifier. Two reasons, and
@@ -447,8 +451,11 @@ system.
 ## Database schema changes
 
 The default backend stores one row per condition object. Workspace is inherited from the role,
-not duplicated in this table. The lookup starts with roles held by the user in the resolved
-workspace, then matches target type and either no parent scope or the exact resolved parent.
+not duplicated in this table. For authorization, the backend joins user-role assignments to
+roles constrained to the resolved workspace, then queries only conditions on those role IDs that
+match the target type and either no parent scope or the exact resolved parent. A condition
+workspace column would duplicate role-owned state and would not remove the role-assignment join
+needed to exclude conditions on roles the user does not hold.
 
 ```sql
 CREATE TABLE mutation_conditions (
@@ -461,7 +468,6 @@ CREATE TABLE mutation_conditions (
     value_condition TEXT,
     target_condition TEXT,
 
-    CHECK (condition_slot BETWEEN 1 AND 100),
     CHECK (
         (parent_resource_type IS NULL AND parent_resource_id IS NULL)
         OR
@@ -480,12 +486,12 @@ CREATE INDEX idx_mutation_conditions_lookup
     );
 ```
 
-The slot constraint provides a race-safe 100-condition bound without a count-then-insert race.
-The lookup index retrieves only conditions for the current user's workspace roles, target type,
-and scope; no query loads conditions from other users or workspaces. Filters are validated on
-add or update and stored as authored strings. The default backend caches their parsed clauses for
-request-path evaluation, while `list` returns the stored strings directly. The table is additive,
-so deployments with no rows retain current default-allow behavior.
+The backend allocates slots 1 through 100 and retries when a concurrent insert collides on the
+unique constraint. The lookup index retrieves only conditions for the current user's workspace
+roles, target type, and scope; no query loads conditions from other users or workspaces. Filters
+are validated on add or update and stored as authored strings. The default backend caches their
+parsed clauses for request-path evaluation, while `list` returns the stored strings directly.
+The table is additive, so deployments with no rows retain current default-allow behavior.
 
 # Drawbacks
 
