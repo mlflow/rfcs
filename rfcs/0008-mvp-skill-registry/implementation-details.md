@@ -1176,6 +1176,8 @@ class SkillRegistryMixin:
         max_results: int = SEARCH_MAX_RESULTS_DEFAULT,
         order_by: list[str] | None = None,
         page_token: str | None = None,
+        include_skill_identities: list[tuple[str, str]] | None = None,
+        exclude_skill_identities: list[tuple[str, str]] | None = None,
     ) -> PagedList[Skill]:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1615,6 +1617,7 @@ def search_skills(
     max_results: int = 100,
     order_by: list[str] | None = None,
     page_token: str | None = None,
+    include_skill_identities: list[str] | None = None,
 ) -> PagedList[Skill]: ...
 
 
@@ -1769,6 +1772,7 @@ class MlflowClient:
         max_results: int = 100,
         order_by: list[str] | None = None,
         page_token: str | None = None,
+        include_skill_identities: list[str] | None = None,
     ) -> PagedList[Skill]: ...
 
     def update_skill(
@@ -2065,9 +2069,10 @@ plugin version atomically and returns both in an `ImportRegisterResponse` (the
 packaged plugin version and the newly created member skill versions), so the
 client populates its result without additional reads.
 
-When `source` is a local path, the registration request carries the
-packaged content, so `POST /register` and `POST .../versions` accept a
-`multipart/form-data` body with two parts:
+When a Skill's `source` is a local path, the registration request carries the
+packaged content. `POST /{name}/versions` and
+`POST /@{organization}/{name}/versions` accept a `multipart/form-data` body
+with two parts:
 
 - a `metadata` part: `application/json` carrying the ordinary
   `CreateSkillVersionRequest` fields (`name`, `organization`, `digest`,
@@ -2114,12 +2119,11 @@ All paths relative to the logical skills router prefix.
 |---|---|---|
 | `POST` | `/` | Create a skill |
 | `GET` | `/` | Search skills |
-| `POST` | `/register` | Register a skill version (name required at this endpoint; the SDK/CLI fills it from SKILL.md during local inspection so human callers omit it, but a raw REST caller that omits it is rejected; auto-creates parent) |
 | `POST` | `/bulk-register` | Atomically and idempotently register a client-prepared batch of standalone skills discovered from one repository |
 | `GET` | `/@{organization}/{name}` | Get skill by organization and name |
 | `PATCH` | `/@{organization}/{name}` | Update skill fields |
 | `DELETE` | `/@{organization}/{name}` | Hard-delete skill (cascades, subject to references) |
-| `POST` | `/@{organization}/{name}/versions` | Create a skill version |
+| `POST` | `/@{organization}/{name}/versions` | Register a skill version from a remote pointer or uploaded content; auto-creates the parent when authorized |
 | `GET` | `/@{organization}/{name}/versions` | Search versions |
 | `GET` | `/@{organization}/{name}/versions/{version}` | Get a specific version |
 | `PATCH` | `/@{organization}/{name}/versions/{version}` | Update version status |
@@ -2146,6 +2150,14 @@ organization and name" is both `GET /@{organization}/{name}` and
 `GET /code-review/versions/1` addresses a skill with no organization, and
 `GET /@acme/code-review/versions/1` addresses the same-named skill in
 organization `acme`.
+
+Skill registration uses these named version routes; there is no separate
+`POST /skills/register` endpoint. The SDK/CLI can still infer the name from
+`SKILL.md` during local inspection before constructing the URL. The path
+identity is authoritative: if the JSON body or multipart metadata explicitly
+supplies `name` or `organization`, it must match the path. Omitted identity
+fields inherit the path values. Authorization checks the path identity before
+reading uploaded content; the handler validates the complete payload.
 
 This mirrors the URI format, which uses the same `@organization` marker and
 likewise omits it when empty. The `@` marker is what keeps the paths
@@ -2236,6 +2248,24 @@ examples include `name LIKE '%review%'`, `description LIKE '%security%'`,
 `organization = 'acme'`, `status = 'active'`, `source_type = 'git'`, and
 `tags.team = 'platform'`.
 
+Skill search also accepts a public `include_skill_identities` selector of
+qualified names. REST callers repeat the query parameter, for example
+`?include_skill_identities=reviewer&include_skill_identities=@acme/reviewer`.
+Omitting it leaves the selection unrestricted; a single empty value
+(`?include_skill_identities=`) selects no Skills. Empty values mixed with named
+identities, or repeated empty values, are invalid. Python callers use
+`list[str] | None`, with `None` unrestricted and `[]` selecting none.
+
+The API intersects this selector with the caller's current READ scope and
+passes the effective include list plus internal exclusions to the store.
+The store applies both before pagination. Internal identity lists contain
+`(organization, name)` pairs; the exclusion list is not a public query parameter.
+Skill search tokens bind to workspace, filter expression, and ordering, but not
+to identity lists or grants. Every page reapplies current authorization.
+Pagination uses best-effort offsets: changing data, permissions, or the selector
+between pages can skip or repeat entries, but does not permit returning a Skill
+excluded by the current authorization scope.
+
 **Agent plugins:** the `search_text` field covers name, mutable parent
 description, organization, and the latest-resolved manifest's description,
 keywords, and author name. Structured filters are the same as Skills, plus
@@ -2267,10 +2297,11 @@ remains canonical.
 
 Version-creation requests include immutable creation payloads and mutable
 initial status; later update requests contain only mutable fields. Resource
-identifiers normally come from path parameters. The Skill and Agent Plugin
-`POST /register` endpoints accept identity inputs in the body so they can create
-or reuse the parent and create a version in one operation. Agent Plugin identity
-is extracted from or checked against `plugin_json`.
+identifiers normally come from path parameters. Skill registration uses the
+named version routes, which can create or reuse the parent and create a version
+in one operation. The Agent Plugin `POST /register` endpoint accepts identity
+inputs in the body; its identity is extracted from or checked against
+`plugin_json`.
 
 ```python
 from typing import Any
@@ -2296,8 +2327,8 @@ class CreateSkillVersionRequest(BaseModel):
     # the gzip-tar archive (see the REST section); the client leaves `source`
     # null to route into the upload flow, and the server sets the stored
     # version's `source` to the artifact path where it wrote the content.
-    name: str | None = None  # structurally nullable only because this model is shared with POST /@{organization}/{name}/versions (where name comes from the parent path and any body name is ignored); POST /register validates it as required (the SDK/CLI fills it from SKILL.md during local inspection, so a raw REST caller that omits it is rejected)
-    organization: str = ""  # for POST /register only; ignored for versioned paths
+    name: str | None = None  # omitted: use the path; explicitly supplied: must match the path
+    organization: str = ""  # omitted: use the path; explicitly supplied: must match the path
     source_type: str | None = None  # optional explicit type for an external source (git/oci/zip only; mlflow is flow-derived and rejected here); validated against `source`, with inference as the fallback when omitted (see Field inference)
     source: str | None = None
     ref: str | None = None

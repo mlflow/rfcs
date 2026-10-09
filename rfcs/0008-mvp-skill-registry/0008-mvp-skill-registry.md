@@ -1277,11 +1277,30 @@ independently of the plugin (see below).
 | Permission | Operations |
 |---|---|
 | `READ` | Search entities (including finding agent plugins by member), get versions, resolve aliases, list tags |
-| `EDIT` | Create entities, create versions, set tags, update presentation metadata (description, icons), status transitions (activate, deprecate), set aliases. Mapped to `can_update` in MLflow's permission framework. |
-| `MANAGE` | Delete aliases, delete tags, soft-delete versions, hard-delete entities, manage permissions. Mapped to `can_delete` in MLflow's permission framework. |
+| `EDIT` | Create entities, create versions, set tags, delete parent Skill tags, update presentation metadata (description, icons), status transitions (activate, deprecate), set aliases. Mapped to `can_update` in MLflow's permission framework. |
+| `MANAGE` | Delete aliases and tags (including Skill version tags), soft-delete versions, hard-delete entities, manage permissions. Mapped to `can_delete` in MLflow's permission framework. |
 
-This follows the same pattern as the model registry and MCP Server
-Registry (RFC-0004).
+The Skill parent-tag and version-tag deletion levels follow the corresponding
+model registry operations. This update does not change AgentPlugin permissions.
+
+- **Skill authorization uses the qualified identity.** Skill names can repeat
+  across organizations, so grants and search filtering identify a skill by
+  `(organization, name)`. Search applies the caller's readable-skill filter
+  before pagination, intersected with any public qualified-identity selector.
+  Each page checks current permissions; permission changes do not invalidate
+  page tokens. See [pagination and filtering](implementation-details.md#pagination-and-filtering)
+  for selector encoding and best-effort offset behavior.
+  Reading MLflow-managed skill artifacts requires READ on
+  the owning Skill; malformed paths within the skill artifact namespace cannot
+  fall back to broader workspace or default artifact access.
+- **Registration checks the parent operation.** Creating a new Skill requires
+  workspace creation permission. Adding a version to an existing Skill
+  requires EDIT on that Skill. If the parent appears or disappears between
+  authorization and the registration transaction, the request fails with a
+  conflict so the caller can retry against the current parent state.
+- **Skill tag and deletion permissions.** EDIT permits deleting a parent Skill
+  tag, while deleting a Skill version tag requires MANAGE. Soft-deleting a
+  version requires MANAGE whether requested through DELETE or a status update.
 - **Creator gets MANAGE.** When a user creates a standalone skill or an
   agent plugin, they automatically receive MANAGE permission, following
   the MLflow model registry pattern. Importing a packaged plugin creates
