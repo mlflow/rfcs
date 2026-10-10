@@ -8,7 +8,7 @@ rfc_pr:
 
 | Author(s)              | [2sumtech](https://github.com/2sumtech) |
 | :--------------------- | :-------------------------------------- |
-| **Date Last Modified** | 2026-10-02                              |
+| **Date Last Modified** | 2026-10-09                              |
 
 <!-- markdownlint-disable MD025 -->
 
@@ -26,7 +26,7 @@ This RFC adds a `rate_limits` list to gateway endpoints. Each entry counts reque
 at one of two scopes:
 
 - **`SERVICE`**: one counter shared by every caller of the endpoint. This bounds the total load the endpoint can put
-  on its provider.
+  on its provider. It protects the provider, not fairness: it does not divide that load among callers.
 - **`USER_DEFAULT`**: one counter per caller, each with the same allowance. This stops a single caller from using up
   the endpoint's capacity.
 
@@ -79,6 +79,8 @@ Content-Type: application/json
 
 If instead the endpoint as a whole had already admitted 600 requests that minute, the message names the `SERVICE`
 limit. Every caller is rejected until the window rolls over, including callers who are under their own allowance.
+In this example that takes only 10 callers each sending their full 60 requests. See
+[Sizing `SERVICE` and `USER_DEFAULT` together](#sizing-service-and-user_default-together).
 
 ## Motivation
 
@@ -90,6 +92,9 @@ do not give:
    errors for all ten. A shared request cap on the endpoint keeps total traffic under a number the operator picks.
 2. **Callers are isolated from each other.** A runaway loop in one notebook should fail fast for that notebook, not
    use up the endpoint for everyone else.
+
+The first guarantee comes from `SERVICE`, the second from `USER_DEFAULT`. `SERVICE` alone does not give the second:
+the shared counter does not care which caller fills it.
 
 Budget policies (`mlflow/gateway/budget.py`, `mlflow/gateway/budget_tracker/`) do not cover either case. They are
 measured in dollars, and cost is recorded only after the provider responds (`make_budget_on_complete`). A burst of
@@ -126,15 +131,17 @@ The `USER_DEFAULT` scope in this RFC reproduces the legacy behavior. The `SERVIC
 ### Out of scope
 
 1. **Token-based limits.** Token counts are known only after the provider responds, so a token limit cannot reject
-   the request that crosses it. The `tokens` field is reserved in the schema (see below) so this can be added later
-   without a new shape.
+   the request that crosses it. The schema has no `tokens` field; one can be added later as an optional field without
+   changing the existing ones.
 2. **Per-principal overrides, groups, and service principals.** Databricks lets an admin give a named user, group, or
-   service principal its own limit. OSS MLflow has users (when auth is on) but no groups or service principals. Named
-   per-user overrides are a natural follow-up and are listed under open questions.
+   service principal its own limit. OSS MLflow has no groups or service principals, and this version is scoped to
+   per-endpoint and per-caller limits.
 3. **Concurrency limits** (maximum in-flight requests). A long streaming request counts once, however long it runs.
 4. **Fairness across regions or across separate Redis instances.** One Redis is one counting domain.
 5. **UI.** The endpoint editor can add a rate limit section later; this RFC defines the API and enforcement.
 6. **The legacy gateway.** It keeps its `slowapi` implementation.
+7. **Changing the budget 429 format.** The budget rejection should move to the same structured `detail` used here,
+   but that changes what clients see, so it is done in a separate PR (see [Rejection response](#rejection-response)).
 
 ## Detailed design
 
@@ -162,8 +169,6 @@ message GatewayRateLimit {
   optional RateLimitRenewalPeriod renewal_period = 2;
   // Maximum number of requests per window. 0 rejects all requests.
   optional int64 requests = 3;
-  // Reserved for token-based limits. Must be unset in this version.
-  optional int64 tokens = 4;
 }
 
 message GatewayRateLimitConfig {
@@ -187,7 +192,6 @@ Validation on create and update:
 | `key` is `SERVICE` or `USER_DEFAULT` | The only scopes OSS can resolve today |
 | `renewal_period` is `MINUTE` or `HOUR` | Both are fixed windows that are cheap to count; longer periods are what budgets are for |
 | `requests` is set and `>= 0` | `0` is a deliberate "block everything" setting, matching Databricks |
-| `tokens` is unset | Reserved; rejected with a message that says token limits are not supported yet |
 | At most one entry per `(key, renewal_period)` | Two entries for the same counter would be ambiguous |
 
 Because of the last rule there are at most four entries per endpoint.
@@ -207,9 +211,9 @@ This RFC follows the newer shape because that is the API the issue asks us to st
 | --- | --- | --- |
 | `key` = service scope | `SERVICE` | Same meaning |
 | `key` = default user scope | `USER_DEFAULT` | Same meaning; "user" is resolved as described below |
-| `key` = user / group / service principal, with `principal` | not supported | No groups or service principals in OSS; named-user overrides deferred |
+| `key` = user / group / service principal, with `principal` | not supported | No groups or service principals in OSS; this version is per-endpoint and per-caller only |
 | `requests` | `requests` | Same meaning |
-| `tokens` | reserved | Rejected for now |
+| `tokens` | not supported | No field in this version; see Out of scope |
 | `renewal_period` minute / hour | `MINUTE` / `HOUR` | Enum values drop the long prefix to match MLflow's proto style (`BudgetTargetScope`, `GatewayModelLinkageType`) |
 
 For the older shape, `endpoint` maps to `SERVICE`, `user` maps to `USER_DEFAULT`, and `calls` maps to `requests`.
@@ -222,7 +226,8 @@ For the older shape, `endpoint` maps to `SERVICE`, `user` maps to `USER_DEFAULT`
    already sets `request.state.username`, and `_get_request_username` in `mlflow/server/gateway_api.py` already reads
    it to enforce `USER`-scoped budget policies. Rate limiting uses the same value.
 2. **Client IP address** (`request.client.host`), when auth is disabled. This is what the legacy gateway did through
-   `slowapi.util.get_remote_address`, so it gives parity.
+   `slowapi.util.get_remote_address`, so it gives parity. Many OSS deployments run without auth, so `USER_DEFAULT`
+   is accepted in that mode instead of being rejected; rejecting it would make per-caller limits unusable there.
 
 The identity is prefixed with its kind (`user:` or `ip:`) so a username can never collide with an address.
 
@@ -286,6 +291,23 @@ Steps 1 to 3 happen atomically: under one lock in process, and in one Lua script
 incrementing is what keeps rejected requests from being counted. With a plain `INCR`-then-compare approach, a caller
 rejected by the `SERVICE` cap would still use up their own `USER_DEFAULT` allowance, and a client that keeps retrying
 would push its own counter further and further past the limit.
+
+### Sizing `SERVICE` and `USER_DEFAULT` together
+
+The `SERVICE` cap protects the provider, not fairness between callers. It bounds the endpoint's total, but it does
+not divide that total among callers, so a few fast callers can use up the shared counter and leave everyone else
+with 429s until the window resets, even callers who are under their own `USER_DEFAULT` allowance.
+
+This happens whenever `USER_DEFAULT` × active callers > `SERVICE`. In the basic example, 10 callers at 60 per minute
+fill the 600 per minute cap. If an operator wants every caller to always get its full allowance, the limits should
+satisfy:
+
+```text
+USER_DEFAULT <= SERVICE / expected callers
+```
+
+Setting `USER_DEFAULT` higher than that is a valid choice. It lets a busy caller use capacity that others leave idle,
+at the cost of strict isolation. The feature docs must state this rule and the formula.
 
 ### Window type
 
@@ -355,10 +377,12 @@ The caller identity is hashed (SHA-256, truncated) in the key. This keeps keys s
 out of plain view in Redis. One script call per request is one Redis round trip, the same cost the budget check already
 pays.
 
-**When Redis is unavailable.** The proposal is to fail open: admit the request, log at warning level with rate
+**When Redis is unavailable.** The default is to fail open: admit the request, log at warning level with rate
 limiting so the log is not flooded, and count the failure. Rejecting all gateway traffic because the limiter's cache is
-down would make an optional protection the cause of an outage. This is listed as an open question because some
-operators will want the opposite.
+down would make an optional protection the cause of an outage. Operators who prefer the opposite can set
+`MLFLOW_GATEWAY_RATE_LIMIT_FAIL_CLOSED=true`. The tracker then rejects requests to rate-limited endpoints with HTTP 503
+(`TEMPORARILY_UNAVAILABLE`, which `mlflow/exceptions.py` already maps to 503) while Redis cannot be reached. Endpoints
+without `rate_limits` never call the tracker, so they are not affected either way.
 
 ### Rejection response
 
@@ -369,11 +393,22 @@ changes:
   at least 1.
 - `detail` is the structured `{"error_code", "message"}` dictionary that `translate_http_exception`
   (`mlflow/gateway/utils.py`) already produces for `MlflowException`. The error code is `RESOURCE_EXHAUSTED`, which
-  `mlflow/exceptions.py` already maps to 429. The budget path currently returns a plain string `detail`. Using the
-  structured form here lets clients tell a rate limit apart from other 429s without parsing message text.
+  `mlflow/exceptions.py` already maps to 429. Using the structured form lets clients tell a rate limit apart from
+  other 429s without parsing message text.
 
 The message names the endpoint, the scope, the limit, and the period. It does not include the caller's IP address or
 username.
+
+`Retry-After` is the only rate limit header, and it is sent only on 429. Admitted responses carry no remaining-quota
+headers.
+
+The budget path currently returns a plain string `detail`. It should use the same structured form, since
+`translate_http_exception` already does this for other gateway errors. Because clients that read `detail` as a string
+would break, that change is a separate PR with a changelog note, and it keeps the existing text in `message`:
+
+```json
+{"detail": {"error_code": "RESOURCE_EXHAUSTED", "message": "Budget limit exceeded. Limit: $100.00 USD per 1 day. ..."}}
+```
 
 Unlike `check_budget_limit`, rate limit rejections **do not create an error trace**. `_create_budget_error_trace`
 makes sense for budgets, which trip rarely. A rate limiter can reject thousands of requests per minute during exactly
@@ -492,21 +527,4 @@ Suggested implementation order, each step a separate PR:
 
 # Open questions
 
-1. **Fail open or fail closed when Redis is down?** This RFC proposes fail open. An environment variable could let
-   operators choose fail closed.
-2. **Should `USER_DEFAULT` require auth?** Falling back to the client IP gives legacy parity but weak identity. The
-   other option is to reject `USER_DEFAULT` entries when auth is off. That is safer but breaks the legacy migration
-   path. This RFC proposes the IP fallback plus clear docs.
-3. **A trusted caller header.** Some deployments put an authenticating proxy in front of MLflow with auth turned off
-   inside MLflow, and the proxy passes the user in a header. A setting naming that header would give real per-user
-   limits there. It is left out of the first version because, unless the operator controls every path to the server,
-   any client can set the header. Is there demand for it?
-4. **Named per-user overrides.** Databricks allows a limit for a specific user, through `principal`. OSS has usernames
-   when auth is on, so a per-user key with `principal` could be supported. Is that wanted in the first version, or
-   later? Note that the proto enum value `USER` is already taken by `BudgetTargetScope`, so that key would need a
-   different name in the proto (for example `USER_OVERRIDE`) even if the JSON form stays close to Databricks.
-5. **Rate limit response headers.** Should admitted responses carry remaining-quota headers (for example
-   `X-RateLimit-Remaining`)? That would need one more return value from the tracker. This RFC sends only
-   `Retry-After`, and only on 429.
-6. **Budget error format.** Should the budget 429 switch to the same structured `detail` for consistency? That would
-   be a small behavior change for clients that parse the current string.
+None. The questions raised in the first draft were resolved in review and are reflected in the sections above.
