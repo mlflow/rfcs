@@ -11,23 +11,23 @@ state, and can set any tag or alias on it. There is no way to express "this user
 dev models but not production ones" or "only the platform team may set the `@champion`
 alias."
 
-This RFC proposes **mutation conditions**: up to 100 role-owned condition objects per
-`(role, resource_type)`. Each object optionally carries a value condition and a target
-condition and is scoped to the role's workspace and target resource type. With no parent
-scope, it applies to every target of that type in the workspace. With an exact direct-parent
-type and ID, it applies only to matching children of that parent. Conditions gate
-**create/mutation** operations, never reads:
+This RFC proposes **conditions**: up to 100 role-owned condition objects per
+`(role, resource_type)`. Each object optionally carries a value condition and a target condition
+and is scoped to the role's workspace and target resource type. With no parent scope, it applies
+to every target of that type in the workspace. With an exact direct-parent type and ID, it
+applies only to matching children of that parent. Conditions gate **create/mutation** operations,
+never reads:
 
-- A **value mutation condition** constrains *what values* a role may set, meaning the tag
-  or alias in the request.
-- A **target mutation condition** constrains *which existing resources* a role may mutate,
-  by their current tags or aliases.
+- A **value condition** constrains *what values* a role may set, meaning the tag or alias in the
+  request.
+- A **target condition** constrains *which existing resources* a role may mutate, by their
+  current tags or aliases.
 
-Each condition is an AND-ed filter in MLflow's existing filter grammar. A mutation condition
-only ever *further-restricts* an operation the role's base grant already allows, and never
-confers access. The guiding principle is that **grants add and conditions subtract**: base
-grants combine across roles to decide what a role can do, and every applicable condition
-combines across roles to restrict it. When a resource's tags change (for example when it is
+Each condition is an AND-ed filter in MLflow's existing filter grammar. A condition only ever
+*further-restricts* an operation the role's base grant already allows, and never confers access.
+The guiding principle is that **grants add and conditions subtract**: base grants combine across
+roles to decide what a role can do, and every applicable condition combines across roles to
+restrict it. When a resource's tags change (for example when it is
 promoted to production), access adjusts automatically without admin intervention, and the
 resource never moves, so lineage is preserved.
 
@@ -48,13 +48,13 @@ client.add_role_permission(platform_role.id, "registered_model", "*", "EDIT")
 # One call adds both conditions for (ds_role, registered_model):
 #  - target condition: may mutate only resources currently tagged lifecycle=dev
 #  - value condition:  may not set the governing lifecycle tag, nor the champion alias
-client.add_mutation_condition(
+client.add_condition(
     role_id=ds_role.id,
     resource_type="registered_model",
     target_condition="tags.lifecycle = 'dev'",
     value_condition="tag_key != 'lifecycle' AND alias != 'champion'",
 )
-# Platform role: no mutation conditions, so it is unconstrained and may promote and edit prod.
+# Platform role: no conditions, so it is unconstrained and may promote and edit prod.
 ```
 
 **Lifecycle:**
@@ -67,7 +67,7 @@ sequenceDiagram
     participant Platform as Platform Engineer
 
     Note over Admin,MLflow: Setup - floor READ, write via grants, conditions on DS role
-    Admin->>MLflow: roles, base EDIT, DS mutation conditions
+    Admin->>MLflow: roles, base EDIT, DS conditions
 
     Note over DS,MLflow: Development phase - lifecycle is dev
     DS->>MLflow: UpdateRegisteredModel fraud-model
@@ -130,16 +130,40 @@ alias operations.
   This protects the target condition in use case 1: without it, a dev user could simply change
   the governing tag to escape the lock.
 
-Mutation conditions solve these by making a *write operation* dynamic. The **target
-condition** follows the resource's tags, and the **value condition** constrains the values a
-request may set. Neither requires moving resources or per-resource admin work.
+Conditions solve these by making a *write operation* dynamic. The **target condition** follows
+the resource's tags, and the **value condition** constrains the values a request may set.
+Neither requires moving resources or per-resource admin work.
 
 ## Out of scope
 
 - **Read-scoping / hiding resources on read.** If a user already has workspace access and could
-  read a resource, this RFC does **not** hide it. Reads stay as today, and mutation conditions
-  are evaluated only during **create/mutation** authorization. Read conditions and search or
-  list prefiltering need a queryable scope plus predicate pushdown into the store query.
+  read a resource, this RFC does **not** hide it. Reads stay as today, and conditions are
+  evaluated only during **create/mutation** authorization.
+
+  This is the same constraint that holds sub-resource grants at wildcard grain in the merged
+  sub-resource-permissions RFC: a wildcard check is one boolean per resource type, whereas a
+  per-resource predicate has to be applied to every row of an unbounded result set. Enforcing a
+  condition on read therefore needs the authorized predicate pushed into the store query before
+  it runs, which is tracked in
+  [mlflow/mlflow#24964](https://github.com/mlflow/mlflow/issues/24964) and has no merged
+  implementation. Pushdown is also not uniformly available: the condition vocabulary is tags and
+  aliases, and neither is a searchable key for the registry types
+  (`VALID_SEARCH_KEYS_FOR_REGISTERED_MODELS` is `{"name"}`), so read conditions would hold on
+  runs and traces and silently not on registered models, versions, or prompts -- and a restriction
+  that holds on a point route but not in search is worse than no restriction at all. The
+  remaining alternative, post-response filtering, costs a page scan plus a re-fetch loop to
+  refill `max_results` on every request.
+
+  The schema does not presuppose this exclusion. The table and object are named for conditions
+  generally rather than for mutations, and a read condition would reuse `target_condition`
+  unchanged: a read sets no values, so `value_condition` has no referent on a read, and "applies
+  to reads" reduces to requiring `value_condition` to be null. Adding read support is therefore
+  additive -- an action selector plus the pushdown mechanism above -- rather than a reshape.
+  One
+  semantic question is deliberately left open. A target condition **fails on absence**: a
+  resource lacking the tag does not satisfy the clause. That is the strict direction for a
+  mutation, but applied to a listing it would hide every untagged resource, so whether read
+  conditions keep that rule or need an explicit absence policy is not decided here.
 - **Cross-workspace conditions.** Conditions inherit exactly one workspace through their role. A
   condition that applies across every workspace would require a cross-workspace role or a
   separate global-policy binding, neither of which exists in this design.
@@ -164,14 +188,13 @@ request may set. Neither requires moving resources or per-resource admin work.
 
 ## API changes
 
-### Mutation conditions and their fields
+### Conditions and their fields
 
-A role may have up to 100 mutation-condition objects for each target resource type. Each
-object has a stable ID, optional value and target filters, and an optional exact direct-parent
-scope:
+A role may have up to 100 condition objects for each target resource type. Each object has a
+stable ID, optional value and target filters, and an optional exact direct-parent scope:
 
 ```
-MutationConditions {
+Condition {
     id:                   string    # stable id, assigned on add; addresses update/remove
     role_id:              int       # the role the conditions apply to
     resource_type:        string    # authorization target, e.g. "registered_model_version"
@@ -187,8 +210,9 @@ MutationConditions {
     value_condition:      string | null
 
     # Gates WHICH EXISTING RESOURCES may be mutated. A filter over tags.<key> and
-    # aliases.<name>, read from the target's current state. It is vacuous on create and never
-    # applies to reads. null leaves target resources unconstrained.
+    # aliases.<name>, read from the target's current state. It is vacuous on create. Reads are
+    # out of scope in this RFC; if read conditions are added later, this is the field they
+    # reuse. null leaves target resources unconstrained.
     target_condition:     string | null
 }
 ```
@@ -221,13 +245,13 @@ condition has no workspace column of its own.
 ### Admin Apis
 
 Four operations manage conditions, mirroring the existing `add`/`update`/`remove`/`list`
-role-permission API. `add` creates a `MutationConditions` object and returns it with an
-assigned `id`; `update` and `remove` address an existing object by that `id`; `list` returns a
-role's objects. Their request and response shapes:
+role-permission API. `add` creates a `Condition` object and returns it with an assigned `id`;
+`update` and `remove` address an existing object by that `id`; `list` returns a role's objects.
+Their request and response shapes:
 
 ```
 add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
-    value_condition?, target_condition?) -> MutationConditions
+    value_condition?, target_condition?) -> Condition
     # Creates ONE object. The parent fields are both omitted/null for workspace/type scope or
     # both set for exact direct-parent scope. Rejects an unsupported parent relationship, an
     # invalid filter, both filters null, or a role/type that already has 100 objects.
@@ -244,7 +268,7 @@ add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
     # retried. The slot is implementation metadata and has no policy ordering meaning.
 
 update(id, parent_resource_type?, parent_resource_id?, value_condition?, target_condition?)
-    -> MutationConditions
+    -> Condition
     # Partial update by id:
     #   - an omitted field is unchanged;
     #   - a filter string replaces that filter and null clears it;
@@ -252,9 +276,9 @@ update(id, parent_resource_type?, parent_resource_id?, value_condition?, target_
     #   - when both filters are null after the update, the object is removed.
 
 remove(id) -> {}
-    # Deletes one MutationConditions object.
+    # Deletes one Condition object.
 
-list(role_id) -> { mutation_conditions: MutationConditions[] }
+list(role_id) -> { conditions: Condition[] }
     # Returns every condition object on the role, including its scope and stored filters.
 ```
 
@@ -430,8 +454,7 @@ sequenceDiagram
 
 ## MLflow UI
 
-Mutation conditions surface as part of a role's configuration rather than as a separate policy
-system.
+Conditions surface as part of a role's configuration rather than as a separate policy system.
 
 - **Display on roles.** A role detail view lists all of its condition objects alongside grants,
   grouped by target resource type and then by workspace/type scope or exact parent scope. It
@@ -458,7 +481,7 @@ workspace column would duplicate role-owned state and would not remove the role-
 needed to exclude conditions on roles the user does not hold.
 
 ```sql
-CREATE TABLE mutation_conditions (
+CREATE TABLE conditions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
     resource_type VARCHAR(255) NOT NULL,
@@ -477,8 +500,8 @@ CREATE TABLE mutation_conditions (
         UNIQUE (role_id, resource_type, condition_slot)
 );
 
-CREATE INDEX idx_mutation_conditions_lookup
-    ON mutation_conditions (
+CREATE INDEX idx_conditions_lookup
+    ON conditions (
         role_id,
         resource_type,
         parent_resource_type,
@@ -492,6 +515,12 @@ roles, target type, and scope; no query loads conditions from other users or wor
 are validated on add or update and stored as authored strings. The default backend caches their
 parsed clauses for request-path evaluation, while `list` returns the stored strings directly.
 The table is additive, so deployments with no rows retain current default-allow behavior.
+
+The table is named `conditions` rather than `mutation_conditions`, and no column names the
+action: every column (`value_condition`, `target_condition`, `condition_slot`, `resource_type`,
+the scope columns) is already action-neutral. Read conditions are out of scope in this RFC, but
+nothing here presupposes that, so adding them later needs an additive action selector rather
+than a table rename or a data migration. See *Out of scope*.
 
 # Drawbacks
 
@@ -512,7 +541,8 @@ The table is additive, so deployments with no rows retain current default-allow 
 - **No restriction on reads.** Conditions gate create and mutation only. They cannot restrict
   reads in the current design, so a user who holds read access to a resource sees all of its
   fields regardless of any condition. Hiding a field or resource requires the base grant, not a
-  condition.
+  condition. The blocker is search-filter pushdown rather than the data model, and the schema is
+  named and shaped so read support can be added additively; see *Out of scope*.
 
 # Alternatives
 
@@ -538,8 +568,7 @@ than cosmetic:
 Keying the condition on `(role, resource_type)` with optional direct-parent scope, independent
 of level, removes the ambiguity and covers create. This contrasts cleanly with the merged
 sub-resource-permissions RFC's `NONE`, which is a grant because it is a level (absolute-deny),
-whereas mutation conditions are not levels and instead layer over whatever level the grants
-conferred.
+whereas conditions are not levels and instead layer over whatever level the grants conferred.
 
 ### B. Single operation-keyed condition object
 
@@ -566,8 +595,8 @@ structured value map remains a possible future authoring convenience over the sa
 A separate authorization engine after RBAC.
 
 **Rejected because** it means two systems to reason about and is over-engineered for MLflow's
-scale. Mutation conditions keep the restriction co-located with the role and reuse the existing
-filter grammar.
+scale. Conditions keep the restriction co-located with the role and reuse the existing filter
+grammar.
 
 ### E. Workspace isolation / resource groups / per-ID grants
 
@@ -582,17 +611,17 @@ action, and are co-located with the role.
 
 # Adoption strategy
 
-**This is not a breaking change.** Deployments with no mutation conditions behave exactly as
-today. Every operation is default-allow at its base level.
+**This is not a breaking change.** Deployments with no conditions behave exactly as today. Every
+operation is default-allow at its base level.
 
 **Adoption path:**
 
 1. Upgrade, with no behavior change.
 2. Keep restricted roles' base floor at READ, and hand out write via base grants deliberately.
 3. Tag resources appropriately, for example `lifecycle=prod`.
-4. Add mutation conditions on restricted roles:
+4. Add conditions on restricted roles:
    ```python
-   client.add_mutation_condition(
+   client.add_condition(
        role_id=ds_role.id, resource_type="registered_model",
        target_condition="tags.lifecycle = 'dev'",
        value_condition="tag_key != 'lifecycle'",
@@ -602,4 +631,4 @@ today. Every operation is default-allow at its base level.
 6. Verify access.
 
 **Reverting.** Remove the conditions. There is no destructive rollback, and a deployment with
-no mutation conditions behaves as today.
+no conditions behaves as today.
