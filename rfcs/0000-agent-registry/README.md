@@ -28,8 +28,8 @@ traces. Teams could compare candidates, promote a version through an alias, and 
 production regressions using the same record.
 
 MLflow's built-in AI Assistant or an external AI agent using MLflow's APIs could use this context as
-well. If latency rises after an upgrade, it could inspect a changed MCP server entry and slow tool
-calls, then cite the traces and evaluations supporting its diagnosis.
+well. If latency rises after an upgrade, it could compare the versions' source and dependencies with
+slow calls in traces, then cite the evidence supporting its diagnosis.
 
 Today, MLflow captures traces and evaluations but organizes GenAI work primarily under experiments,
 even for production applications. "Experiment" suggests a temporary development activity. An
@@ -49,6 +49,65 @@ authoritative while MLflow resolves its agent records.
 ### Out of scope
 
 - Hosting agents, proxying invocations, or managing runtime health and scaling.
+
+## User journeys
+
+Tracing and evaluation still work as they do today. A registered version can connect those results
+to recorded source and declared AI assets; trace links show which assets a request actually used
+when that information is available.
+
+### Start tracing an agent
+
+1. Create an agent in the UI. It gets a persistent identity before any version or endpoint is
+   registered.
+2. Select it with `mlflow.set_agent(...)` and run the instrumented application.
+3. Open the agent's **Traces** page. When available, versioned traces also link to recorded source
+   (such as a Git commit) and declared assets.
+
+### Test an agent update
+
+1. Select version 1 and run `mlflow.genai.evaluate`. Its run appears under the agent with version 1
+   recorded.
+2. Edit the agent code, select the agent without a version, and evaluate the draft. The draft run
+   stays under the same agent; it does not claim to be version 2.
+3. Compare the runs on the agent's **Evaluation runs** page. Open their traces to see which prompts
+   and other assets were actually used, when linked, alongside version 1's source and dependencies.
+4. Register version 2 with the updated source and dependencies once the draft is ready.
+5. Optionally, associate the draft evaluation run with version 2 so it appears as evidence for that
+   version, labeled as an evaluation performed before registration.
+
+For a production prompt A/B test, register the candidate as a new agent version with its prompt
+dependency pinned. The application splits traffic between the baseline and candidate versions;
+MLflow groups evaluations and traces by agent version so users can compare quality, latency, and
+cost, with links to the prompt version actually used when available.
+
+### Investigate a production cost increase
+
+1. Notice a cost spike on the agent's **Usage** page and ask MLflow's AI Assistant or a coding agent
+   to investigate.
+2. It notices a recent agent version bump and compares the versions' recorded source and declared
+   assets. It checks affected traces to see which assets were used and which calls drove costs.
+3. It suggests a likely cause, such as a newly added skill increasing token use, and links to
+   supporting traces so the owner can verify it.
+
+### Find an agent to reuse
+
+1. A user searches the UI for a capability, or a running agent calls `search_agents` through the
+   MLflow MCP server, SDK, or REST API when it needs another agent.
+2. MLflow returns accessible versions with advertised capabilities and access endpoints. The user
+   can inspect ownership, source, assets, and evaluation evidence; the running agent selects a match
+   from the returned metadata.
+3. The user integrates the chosen endpoint, or the running agent retrieves details with `get_agent`
+   and invokes the endpoint during the request.
+
+### Separate development and production activity
+
+1. An administrator defines `dev` and `prod` environments for the workspace. Developers can write
+   dev traces and evaluation runs but only read prod ones; the production deployment can write prod.
+2. Developers and deployments supply an environment when logging traces or evaluations. Activity
+   without one remains unassigned under the agent's base permissions.
+3. On the agent overview, users filter by version and environment to compare activity without
+   splitting the agent's identity or version history.
 
 ## Detailed design
 
@@ -75,7 +134,8 @@ evaluations, and usage, with these changes:
 
 - Add **Agent versions**, **Tools**, **Skills**, **Agent Plugins**, **MCP Servers**, **Models**,
   **Related agents**, and **Endpoints**. "Related agents" distinguishes declared subagents and agent
-  dependencies from agents observed in traces, including those selected through registry discovery.
+  dependencies from outbound agent calls observed in traces, including agents found through registry
+  discovery.
 - Skills and agent plugins link to registered versions in MLflow's
   [Skill Registry](../0008-mvp-skill-registry/0008-mvp-skill-registry.md). MCP servers and prompts
   similarly link to their MLflow registries; declared agent dependencies resolve through the
@@ -85,6 +145,9 @@ evaluations, and usage, with these changes:
 - The **Tools** page shows declared tools and tools observed in traces, with links to registered MCP
   servers when known.
 
+The agent overview retains the GenAI experiment overview and adds first-class **Version** and
+**Environment** filters. The environment filter includes unassigned activity.
+
 An agent version snapshots its composition and source. Users can compare versions, see their
 evaluation results and production traces, and identify which prompt, tool, skill, model, or subagent
 changed. Harness-based agents can also identify the harness and the configuration source that
@@ -93,7 +156,8 @@ following the registered model and prompt pattern.
 
 The proposed approach supports both explicit aliases such as `staging` and `production` and a
 computed `latest` reference. Aliases allow deliberate promotion and rollback while newer versions
-remain available for evaluation.
+remain available for evaluation. `latest` can be selected as an alias, but advances when a newer
+version becomes active; it does not mean that version is deployed to production.
 
 Users and other agents should be able to find agents to reuse and see which versions are approved
 for use.
@@ -102,9 +166,9 @@ Traces, evaluation runs, judges, and datasets can be associated with an agent in
 experiment. Each belongs to exactly one container. Relevant SDK and REST APIs accept the agent
 association; autologging, trace ingestion, and trace search support it for traces.
 
-An `AgentRef` pairs an agent ID with an optional `version` matching `AgentVersion.version` under
-that agent. Search APIs accept lists of references. Agent-level APIs such as dataset creation use a
-reference without a version.
+An `AgentRef` pairs an agent ID with an optional `version` or `alias`, but not both. A version must
+match an `AgentVersion` under that agent; an alias resolves to one. Search APIs accept lists of
+references. Agent-level APIs such as dataset creation use a reference without either selector.
 
 Illustrative API changes, with final names TBD:
 
@@ -112,7 +176,10 @@ Illustrative API changes, with final names TBD:
 from mlflow.entities import AgentRef
 
 mlflow.set_experiment(experiment_id="123")  # Existing workflow
-mlflow.set_agent(agent=AgentRef(id="agent-456", version="2"))  # New workflow
+mlflow.set_agent(agent=AgentRef(id="agent-456"))  # Unversioned development
+# Alternatively, select an alias or a specific registered version:
+mlflow.set_agent(agent=AgentRef(id="agent-456", alias="production"))
+mlflow.set_agent(agent=AgentRef(id="agent-456", version="2"), environment="prod")
 
 mlflow.search_traces(experiment_ids=["123"])
 mlflow.search_traces(agents=[AgentRef(id="agent-456", version="2")])
@@ -122,12 +189,29 @@ mlflow.genai.create_dataset(name="support-eval", agent=AgentRef(id="agent-456"))
 ```
 
 Explicit experiment and agent arguments are mutually exclusive. Selecting an active agent replaces
-the active experiment destination, and vice versa. Agent version is optional; traces without a known
-version remain visible at the agent level.
+the active experiment destination, and vice versa. With no selector, traces remain at the agent
+level unless instrumentation can identify a registered version from the running agent. For an alias,
+record the alias and its resolved version on each trace so later alias changes do not rewrite trace
+history. The optional `environment` argument applies to traces and evaluation runs logged under the
+active agent, not to the agent or its version.
+
+A release pipeline can register a version with its source commit and/or image digest and declared
+assets, then pass the resulting version ID to the deployment. This is a recommended practice, not a
+requirement; manual registration and sync also work. We should provide example GitHub Actions and
+GitLab CI/CD workflows for this pattern.
+
+Deployments can select an agent without calling `set_agent` by setting `MLFLOW_AGENT_ID` and,
+optionally, `MLFLOW_AGENT_VERSION` or `MLFLOW_AGENT_ALIAS`. The version and alias variables are
+mutually exclusive. An explicit `set_agent` or `set_experiment` call takes precedence; without one,
+agent and experiment environment selectors cannot both be set.
 
 OTel exporters use `x-mlflow-agent-id` in place of `x-mlflow-experiment-id`, with an optional
-`x-mlflow-agent-version`. When present, the version must resolve under the supplied agent ID.
-Supplying both experiment and agent headers is rejected.
+`x-mlflow-agent-version` or `x-mlflow-agent-alias`. The two selectors are mutually exclusive and
+must resolve under the supplied agent ID. An optional `x-mlflow-agent-environment` assigns all
+traces in the export request to a workspace environment. It requires an agent ID and write access to
+that agent/environment; without it, the traces remain unassigned. MLflow instrumentation can
+populate the header from `MLFLOW_AGENT_ENVIRONMENT`. Supplying both experiment and agent headers is
+rejected.
 
 #### Agent discovery
 
@@ -149,15 +233,30 @@ versions, and open the traces behind those results. From a trace, they can retur
 version and its registered prompts, models, tools, skills, and plugins. This connects production
 behavior to the assets that changed between versions.
 
-Evaluation runs for different versions of an agent remain in the same agent container, preserving
-the existing run comparison workflow. Each run records the version evaluated, when known, so users
-can filter and compare results across versions.
+Evaluation runs stay under the agent for comparison, including unversioned drafts. Each run records
+the selected version, if any. Users may later link a draft run to a registered version as
+pre-registration evidence without changing its original version or trace links. This user-provided
+link does not verify provenance; show any captured source or asset conflicts.
 
 An agent version's registered assets and external model references describe its declared
 composition; they do not establish which resources a trace used. The agent view reuses
 trace-to-asset links from the relevant registries when available, and separately shows tools and
 agent calls observed in traces with their provenance. Traces without a known version remain visible
 at the agent level; missing asset-level observations do not imply non-use.
+
+#### Environments and permissions
+
+Environments are defined at the workspace level so names such as `dev` and `prod` are consistent
+across agents. Each trace and evaluation run has at most one environment, set at creation or left
+unassigned. Environments do not apply to agents or agent versions: a version can be evaluated in
+`dev` and later deployed in `prod` without creating another version. Traces and runs from each stage
+keep their own environment.
+
+Environment ACLs can apply across a workspace or to one agent. For example, a workspace rule can let
+developers write `dev` traces and evaluation runs for every agent but only read `prod` ones;
+agent-specific rules can override it. Unassigned traces and runs use agent permissions.
+
+An authorized user can later assign or move a trace or evaluation run to another environment.
 
 #### Registry backend
 
@@ -174,7 +273,8 @@ remain follow-up design work.
 Provide **Convert to agent** in the experiment UI and an equivalent API. Conversion creates or
 selects a record through the configured registry backend, preserves existing traces, runs,
 evaluations, and resource references, and presents them under the agent. Permissions follow the
-configured backend's rules.
+configured backend's rules. If dev and prod experiments are converted into environments of one
+agent, preserve their separate access rules so dev users do not gain write access to prod activity.
 
 The GenAI experiment UI currently shows Logged Models as **Agent versions**, but these are not
 registry `AgentVersion` records. If an experiment has any Logged Models, the UI warns and the API
@@ -366,7 +466,10 @@ offered to the model from tools actually called. Observed tools may be incomplet
 request-specific; they do not silently change a registered version's composition.
 
 A2A autologging can later identify calls to another agent, resolve the endpoint/card to a registered
-agent, and link the calling span to that entity and any available downstream trace.
+agent, and link the calling span to that entity and any available downstream trace. The **Related
+agents** page lists agents called by the current agent. Selecting one filters the current agent's
+traces to those containing a call to the selected agent. Within a trace, users can filter to the
+corresponding outbound call spans.
 
 ### Syncing
 
@@ -426,8 +529,9 @@ The work can be organized into three phases without committing to release bounda
 
 1. **Agent container:** Establish agent records and access checks through the configured registry
    backend. Make agents an alternative to experiments across GenAI APIs, autologging, trace
-   ingestion, search, and the UI. Support conversion of eligible experiments and compatibility for
-   existing clients.
+   ingestion, search, and the UI. Add workspace environments, trace and evaluation permissions, and
+   environment filters. Support conversion of eligible experiments and compatibility for existing
+   clients.
 2. **Versions, discovery, and syncing:** Add versions, aliases, linked assets, harness and
    configuration metadata, endpoints, and governance. Add version-level trace and evaluation
    comparison. Expose discovery through SDK, REST, and the built-in MCP server, with a companion
