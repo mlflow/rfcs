@@ -149,11 +149,12 @@ with mlflow.start_span("brave_web_search", span_type=SpanType.TOOL) as span:
     result = call_brave_web_search()
 ```
 
-When the version is unknown, omit it to record the server without claiming a specific version:
+When the version is unknown, omit it to record the server without claiming a specific version. The tool name is optional because server discovery and other MCP operations, such as resource or prompt requests, do not invoke a tool:
 
 ```python
-with mlflow.start_span("agent") as span:
-    span.link_mcp_server(MCPServerRef(name="io.github.anthropic/brave-search"))
+with mlflow.start_span("list_resources") as span:
+    span.link_mcp_server(MCPServerRef(name="io.acme/knowledge-base"))
+    resources = list_mcp_resources()
 ```
 
 When using an approved direct endpoint discovered through the registry, pass its access binding instead of copying its server coordinates:
@@ -976,31 +977,6 @@ Because the router exposes both a static workspace-level `GET /bindings` route a
 
 Latest resolution is expressed through the alias route, not through a special `/versions/latest` endpoint. Callers that want the system-defined latest pointer should use `GET /{name}/aliases/latest` or create/update bindings with `server_alias="latest"`.
 
-`TraceInfo` gains a structured `linked_mcp_servers: list[TraceMCPServerLink]` field projected from the span-link table. `get_trace_info`, `get_trace`, `search_traces`, and batch trace responses return it; batch reads load links together to avoid one query per trace. Each link has `workspace`, `name`, and optional `version`. A name-only link has `version=None` in Python and omits that field in protobuf JSON. No MCP-specific trace route or JSON trace tag is added.
-
-For example, an abridged trace-info response could contain:
-
-```json
-{
-  "trace": {
-    "trace_info": {
-      "trace_id": "tr-abc123",
-      "linked_mcp_servers": [
-        {
-          "workspace": "default",
-          "name": "io.github.anthropic/brave-search",
-          "version": "1.0.0"
-        },
-        {
-          "workspace": "default",
-          "name": "io.acme/weather"
-        }
-      ]
-    }
-  }
-}
-```
-
 #### Request and response models
 
 Request models contain only the mutable fields — resource identifiers come from path parameters:
@@ -1358,7 +1334,7 @@ The detail view shows the server's metadata, versions list, aliases, direct acce
 
 **Environment variables**: The version detail page can also surface the `packages[].environmentVariables[]` from `server_json`, including `isRequired` and `isSecret` flags. This helps users understand what configuration a server needs before they can use it.
 
-The trace detail view has an **MCP Servers** tab. Versioned links navigate to the version page; name-only links show “version unknown” and navigate to the server page. Missing registry entries show a “not found in registry” indicator.
+The trace detail view has an **MCP Servers** tab populated from the spans already loaded for that trace. It links to matching registry entries when available.
 
 As a possible future UI integration, the registry detail view could expose a `Deploy` action that publishes a governed MCP server to MLflow MCP Gateway by creating or updating a gateway-owned deployment record against the same underlying version and alias model, so users experience registry and gateway as one workflow rather than two separate products.
 
@@ -1368,7 +1344,7 @@ An MCP server link identifies `{workspace, name}` and, when known, a concrete ve
 
 #### Span contract and SDK
 
-Like [skill tracing (RFC 0009)](../0009-skill-tracing/0009-skill-tracing.md#sdk-method-and-attribute-contract), the span is the only public write path. `Span.link_mcp_server` annotates the current span with server identity and an optional invoked tool name; it makes no separate linking request.
+Like [skill tracing (RFC 0009)](../0009-skill-tracing/0009-skill-tracing.md#sdk-method-and-attribute-contract), the span is the only public write path. `Span.link_mcp_server` annotates the current span with server identity and an optional invoked tool name; it makes no separate linking request. The tool name is omitted for discovery, resource, prompt, and other server operations that do not invoke a tool. Callers should supply it for tool-call spans; inferring it from a parent span would be ambiguous when that span contains several tool calls.
 
 ```python
 from dataclasses import dataclass
@@ -1422,11 +1398,11 @@ An MCP server can declare its governed name and optional version once at startup
 
 [FastMCP clients carry the active OpenTelemetry `traceparent` in MCP request `_meta`](https://gofastmcp.com/servers/telemetry). The server extracts its trace ID and parent span ID, so its tool span becomes a child of the client span. When both sides export to the same MLflow tracking server, experiment, and workspace, MLflow stores them under one trace; the server span's registry attributes create the link on the agent trace. Without propagated context, the server span starts a separate trace. Client-side linking remains available for clients that do not propagate context.
 
-#### Autologging feasibility
+#### First autologging integration: LangChain MCPAdapter
 
 A framework autologger can match an MCP connection's URL and transport to one approved access binding in the active workspace, accounting for equivalent transport spellings. At tool discovery, it resolves that binding and associates each returned tool object with the governed server name and optional version. When a tool runs in a traced application, the integration annotates its tool-call span with those coordinates and the tool name. Discovery may happen before a trace starts, so provenance must follow the tool object into execution; merely looking up a binding or loading tools does not link a later trace. Unmatched or ambiguous connections remain unlinked.
 
-For example, a LangGraph application can use [LangChain's `MCPAdapter`](https://docs.langchain.com/oss/python/langchain/mcp) with a registered access endpoint:
+The first framework integration in scope is [LangChain's `MCPAdapter`](https://docs.langchain.com/oss/python/langchain/mcp), used by LangGraph applications. It provides a concrete example for community contributors and coding agents to follow when adding support for other MCP clients. A LangGraph application can use it with a registered access endpoint:
 
 ```python
 import mlflow
@@ -1448,15 +1424,15 @@ For URL targets, MLflow autologging can:
 2. Monkey-patch `MCPAdapter.list_tools()` to call the original method and add the matched registry identity to each returned tool under an MLflow-specific metadata key.
 3. Read that [tool metadata in the tool-start callback](https://github.com/langchain-ai/langchain/blob/master/libs/core/langchain_core/tools/base.py) and annotate the corresponding MLflow span.
 
-The monkey-patches must be active before discovery and version-gated while `langchain.mcp` is beta. Multi-server targets or prebuilt clients remain unlinked when a tool cannot be matched to an endpoint unambiguously.
+The monkey-patches must be active before discovery and version-gated while `langchain.mcp` is beta. Multi-server targets or prebuilt clients remain unlinked when a tool cannot be matched to an endpoint unambiguously. The first integration includes an end-to-end example showing a registered binding, discovered tool, annotated tool-call span, and trace search result. A community issue will track other client and framework integrations, using this implementation as the reference.
 
 ### Impact on existing MLflow components
 
 | Component | Impact | Description |
 |---|---|---|
 | Database schema | **New tables** | Six registry tables and one span-link table via Alembic |
-| Tracking server | **Extends existing** | New registry router; span ingestion materializes links, and the `TraceInfo` entity and response schema expose them on trace reads |
-| Python client | **Extends existing** | New MCP server functions in `mlflow.genai`, `Span.link_mcp_server()`, and `TraceInfo.linked_mcp_servers` |
+| Tracking server | **Extends existing** | New registry router; span ingestion materializes links for trace search |
+| Python client | **Extends existing** | New MCP server functions in `mlflow.genai` and `Span.link_mcp_server()` |
 | CLI | **New command group** | `mlflow mcp-servers` subcommands. No changes to existing CLI |
 | Model registry | **None** | No changes to existing model registry |
 | Other registries | **None** | No changes to existing registries (model registry, etc.) |
@@ -1508,8 +1484,7 @@ Phase 3 covers deploy-to-gateway UX/API, centralized MLflow-authenticated access
 **Phase 4: Trace linking**
 
 - `Span.link_mcp_server` and the OTel attribute contract
-- Span-link storage and ingestion, `TraceInfo.linked_mcp_servers`, and trace search
+- Span-link storage and ingestion, and trace search
 - MCP Servers tab on traces and gateway trace provenance using governed server identity
 - Server-side FastMCP instrumentation for traces with propagated context
-- Framework autologging can follow the span contract; the first integration's timing remains open
-
+- LangChain `MCPAdapter` autologging as the first framework integration; other integrations tracked in a community issue
