@@ -577,6 +577,7 @@ class Skill:
     tags: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, int] = field(default_factory=dict)  # read-only; populated from skill_aliases table, e.g. {"production": 2}
     latest_version: int | None = None  # read-only, shared latest-resolution rule
+    source_type: SkillSourceType | None = None  # read-only, derived from parent-resolved version
     created_by: str | None = None
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
@@ -587,12 +588,13 @@ class Skill:
 |---|---|---|
 | `name` | `str` | Human-readable name, unique within `(workspace, organization)` |
 | `organization` | `str` | Scopes ownership (e.g., team or publisher); defaults to `""` (empty string) |
-| `description` | `str` | Optional human-readable description of the skill |
+| `description` | `str \| None` | Optional human-readable description of the skill |
 | `icons` | `list[RegistryIcon] \| None` | Mutable MLflow-managed presentation metadata; returned exactly as stored (null when never set). No payload fallback exists: the Agent Skills format defines no icon field, so the UI shows its default glyph when unset |
 | `status` | `SkillStatus \| None` | Read-only; derived from the parent-resolved version: highest active version number if present, otherwise highest non-deleted non-active version number. `None` when the skill has no non-`deleted` version |
 | `aliases` | `dict[str, int]` | Stable version pointers (e.g., `{"production": 2}`); read-only, populated from `skill_aliases` table |
 | `latest_version` | `int \| None` | Read-only; highest version number among `active` versions if one exists, otherwise highest non-`deleted` non-`active` version. `None` when the skill has no non-`deleted` version |
-| `workspace` | `str` | Visibility boundary |
+| `source_type` | `SkillSourceType \| None` | Read-only; derived from the parent-resolved version. `None` when the skill has no non-`deleted` version |
+| `workspace` | `str \| None` | Visibility boundary |
 
 ### SkillVersion entity
 
@@ -625,11 +627,17 @@ class ZipSource:
 
 
 @dataclass
+class MlflowSource:
+    artifact_path: str
+    subpath: str | None = None
+
+
+@dataclass
 class SkillVersion:
     name: str
     version: int
     organization: str = ""
-    source: GitSource | OCISource | ZipSource | MlflowSource | None = None  # MlflowSource is server-populated, never client-constructed
+    source: GitSource | OCISource | ZipSource | MlflowSource | str | None = None  # MlflowSource is server-populated, never client-constructed
     source_type: SkillSourceType | None = None
     digest: str | None = None
     status: SkillStatus = SkillStatus.ACTIVE
@@ -648,7 +656,7 @@ class SkillVersion:
 | `name` | `str` | Skill name (part of composite key with workspace and organization) |
 | `version` | `int` | Server-assigned monotonic integer. Each new version receives the next integer |
 | `organization` | `str` | Organization scope, from parent Skill |
-| `source` | `GitSource \| OCISource \| ZipSource \| MlflowSource \| None` | Typed source descriptor. External content (git, OCI, zip) uses the client-constructible classes; `mlflow` content uses `MlflowSource`, which the server populates on responses and a client never constructs (see Typed source classes). For `source_type="mlflow"`, `MlflowSource.path` is a server-set artifact path: for a standalone MLflow-stored skill it is the unique path where the server stored the uploaded content (and `subpath` is null), and for a skill created by importing an MLflow-stored packaged plugin it is the package's artifact base path (a self-contained internal `mlflow-artifacts:` pointer captured at import time), with `subpath` locating the skill within that tree. A skill created by importing a packaged plugin more generally carries a source derived from the package: the package's `source_type` and `source` with a `subpath` locating the skill within the package. Because an imported member's pointer is stored on the skill version itself, its content resolves without reference to any membership row. The REST API represents this as flat `source_type`, `source`, `ref`, `subpath` fields; the SDK wraps and unwraps the typed classes uniformly, so `source.subpath` is available for every source type |
+| `source` | `GitSource \| OCISource \| ZipSource \| MlflowSource \| str \| None` | Typed source descriptor, with a raw string fallback when no source type is available. External content (git, OCI, zip) uses the client-constructible classes; `mlflow` content uses `MlflowSource`, which the server populates on responses and a client never constructs (see Typed source classes). For `source_type="mlflow"`, `MlflowSource.artifact_path` is a server-set artifact path: for a standalone MLflow-stored skill it is the unique path where the server stored the uploaded content (and `subpath` is null), and for a skill created by importing an MLflow-stored packaged plugin it is the package's artifact base path (a self-contained internal `mlflow-artifacts:` pointer captured at import time), with `subpath` locating the skill within that tree. A skill created by importing a packaged plugin more generally carries a source derived from the package: the package's `source_type` and `source` with a `subpath` locating the skill within the package. Because an imported member's pointer is stored on the skill version itself, its content resolves without reference to any membership row. The REST API represents this as flat `source_type`, `source`, `ref`, `subpath` fields; the SDK wraps and unwraps the typed classes uniformly, so `source.subpath` is available for every source type |
 | `source_type` | `SkillSourceType \| None` | Server-set discriminator (`git`, `oci`, `zip`, `mlflow`), populated on responses. On create, a client that knows the type of an external pointer (CLI subcommand, SDK typed class) submits it and the server validates it against the source value; without an explicit type the server infers it (see the field-inference rules below). `mlflow` is flow-derived and never client-supplied. Together with `source` it determines how content is stored and how `pull` routes |
 | `digest` | `str \| None` | Content hash of the resolved skill content (the same notion as a dataset `digest`). Submitted when the creation client inspects the content; client-asserted and not server-verified. It identifies a version by content within a skill name. Stored, returned on get, and indexed so callers can group versions by content (clean diffs between agent plugin versions, and traces before and after a change linking to the same content); it does not drive import, which always creates a new member version (see Content digest) |
 | `status` | `SkillStatus` | Per-version lifecycle: `draft`, `active`, `deprecated`, `deleted` |
@@ -674,7 +682,7 @@ only the fields relevant to that type:
 | `GitSource` | `url`, `ref`, `subpath` | Git repository. `url` is the clone URL, passed to git as given: any URL the caller's git can clone is valid, and a `.git` suffix is not required (the suffix matters only to the inference fallback, never to fetching). Provider web URLs (e.g., a GitHub `/tree/...` page) are not clone URLs; supply the clone URL and put the branch and directory in `ref` and `subpath`. `ref` is the branch, tag, or commit (optional; defaults to the repository's default branch). `subpath` is the path within the repo (optional). |
 | `OCISource` | `image`, `subpath` | OCI image. `image` is the image reference, optionally supplied with the `oci://` scheme (e.g., `oci://ghcr.io/acme/plugin:v1`). The scheme is a hint only, used to infer `source_type` when no explicit type accompanies the request and validated against it when one does: the persisted `source` is the bare reference (`ghcr.io/acme/plugin:v1`). `subpath` is the path within the image (optional). |
 | `ZipSource` | `url`, `subpath` | ZIP archive. `url` is the archive URL. `subpath` is the path within the archive (optional). |
-| `MlflowSource` | `path`, `subpath` | Content in MLflow artifact storage. Read-side only: the server populates it on responses, and a client never constructs one for registration, because the artifact `path` is server-chosen (the upload flow assigns it; see Client-side upload flow) and a client-supplied `mlflow` source is rejected (see Field inference). For a standalone upload, `path` is the unique path where the server stored the content and `subpath` is null, since the whole stored tree is the skill. For a skill imported from an MLflow-stored package, `path` is the artifact base of the package tree and `subpath` locates the skill within it. |
+| `MlflowSource` | `artifact_path`, `subpath` | Content in MLflow artifact storage. Read-side only: the server populates it on responses, and a client never constructs one for registration, because the artifact `artifact_path` is server-chosen (the upload flow assigns it; see Client-side upload flow) and a client-supplied `mlflow` source is rejected (see Field inference). For a standalone upload, `artifact_path` is the unique path where the server stored the content and `subpath` is null, since the whole stored tree is the skill. For a skill imported from an MLflow-stored package, `artifact_path` is the artifact base of the package tree and `subpath` locates the skill within it. |
 
 `MlflowSource` exists so that `source.subpath` means the same thing for every
 source type. Without it, a member imported from an MLflow-stored package would
@@ -693,7 +701,7 @@ submitted, sets it from the creation flow for content it stores itself
 and returns it in responses. The SDK surfaces `source_type` as a field on
 the version and uses it to reconstruct the typed class from the flat
 fields for every source type: an external class for `git`/`oci`/`zip`,
-and `MlflowSource` (with `path` set to the server-stored upload path for a
+and `MlflowSource` (with `artifact_path` set to the server-stored upload path for a
 standalone skill or the package artifact base for an imported member, plus
 the persisted `subpath`) for `mlflow`.
 
@@ -751,11 +759,10 @@ before a re-import and one recorded after as exercising the same content. The
 registry exposes the field and indexes it so these comparisons are cheap; it does
 not itself build any diff or trace-linking feature on top of the field, and this
 RFC does not commit to one. When a version's digest is absent, it
-simply does not participate in digest grouping. Pull always computes the fetched
-content's digest. It fails when that value differs from a recorded digest; when
-the version has no digest, the computed value is available to the pull workflow
-but is not written back to the registry. Agent plugin pull applies the same
-behavior per member (see Pull semantics).
+simply does not participate in digest grouping. Pull computes the fetched
+content's digest only when the version has a recorded digest, and fails on a
+mismatch. Otherwise, digest computation and verification are skipped. Agent plugin
+pull applies the same behavior per member (see Pull semantics).
 
 **MLflow artifact storage (`source_type="mlflow"`).** In addition to
 external source pointers, the registry supports storing skill content
@@ -2335,16 +2342,23 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class SkillIconRequestPayload(BaseModel):
+    src: str
+    sizes: list[str] | None = None
+    mimeType: str | None = None
+    theme: str | None = None
+
+
 class CreateSkillRequest(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
-    icons: list[RegistryIcon] | None = None
+    icons: list[SkillIconRequestPayload] | None = None
 
 
 class UpdateSkillRequest(BaseModel):
     description: str | None = None
-    icons: list[RegistryIcon] | None = None
+    icons: list[SkillIconRequestPayload] | None = None
 
 
 class CreateSkillVersionRequest(BaseModel):
@@ -2379,19 +2393,19 @@ class BulkRegisterSkillRequest(BaseModel):
 
 class BulkRegisterSkillsRequest(BaseModel):
     organization: str = ""
-    skills: list[BulkRegisterSkillRequest] = Field(min_length=1)
+    skills: list[BulkRegisterSkillRequest] = Field(min_length=1, max_length=500)
 
 
 class CreateAgentPluginRequest(BaseModel):
     name: str
     organization: str = ""
     description: str | None = None
-    icons: list[RegistryIcon] | None = None
+    icons: list[SkillIconRequestPayload] | None = None
 
 
 class UpdateAgentPluginRequest(BaseModel):
     description: str | None = None
-    icons: list[RegistryIcon] | None = None
+    icons: list[SkillIconRequestPayload] | None = None
 
 
 class PluginJSONPayload(BaseModel):
@@ -2483,10 +2497,18 @@ class SetTagRequest(BaseModel):
     value: str
 
 
+class SkillIconResponsePayload(BaseModel):
+    src: str
+    sizes: list[str] | None = None
+    mimeType: str | None = None
+    theme: str | None = None
+
+
 class SkillVersionResponse(BaseModel):
     name: str
     version: int
     organization: str = ""
+    workspace: str | None = None
     source_type: str | None = None
     source: str | None = None
     ref: str | None = None
@@ -2501,11 +2523,17 @@ class SkillVersionResponse(BaseModel):
     last_updated_timestamp: int | None = None
 
 
+class SearchSkillVersionsResponse(BaseModel):
+    skill_versions: list[SkillVersionResponse]
+    next_page_token: str | None = None
+
+
 class SkillResponse(BaseModel):
     name: str
     organization: str = ""
+    workspace: str | None = None
     description: str | None = None
-    icons: list[RegistryIcon] | None = None
+    icons: list[SkillIconResponsePayload] | None = None
     status: str | None = None
     latest_version: int | None = None
     source_type: str | None = None
@@ -2515,6 +2543,11 @@ class SkillResponse(BaseModel):
     last_updated_by: str | None = None
     creation_timestamp: int | None = None
     last_updated_timestamp: int | None = None
+
+
+class SearchSkillsResponse(BaseModel):
+    skills: list[SkillResponse]
+    next_page_token: str | None = None
 
 
 class BulkRegisterSkillsResponse(BaseModel):
