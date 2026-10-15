@@ -26,8 +26,10 @@ never reads:
 Each condition is an AND-ed filter in MLflow's existing filter grammar. A condition only ever
 *further-restricts* an operation the role's base grant already allows, and never confers access.
 The guiding principle is that **grants add and conditions subtract**: base grants combine across
-roles to decide what a role can do, and every applicable condition combines across roles to
-restrict it. When a resource's tags change (for example when it is
+roles to decide what a role can do, and the applicable conditions -- pooled across every role the
+user holds -- then restrict it. Conditions are **alternatives**: the clauses inside one condition
+are AND-ed, and the conditions themselves are OR-ed, so an operation is permitted when it
+satisfies at least one of them. When a resource's tags change (for example when it is
 promoted to production), access adjusts automatically without admin intervention, and the
 resource never moves, so lineage is preserved.
 
@@ -108,7 +110,8 @@ another workspace, which is not trivial. Moving a resource breaks lineage becaus
 cross-workspace references. A sub-resource such as a run, trace, or logged model resolves its
 workspace through its parent experiment, so moving it changes its parent experiment and
 severs the experimental history that parent records.
-- **Target condition:** `(ds-role, registered_model, target_condition="tags.lifecycle='dev'")`
+- **Target filter:** `target_condition="tags.lifecycle='dev'"` on the DS role's
+  `registered_model` condition.
 - **Result:** DS may mutate a resource only while it is tagged `lifecycle=dev`. When the tag
   flips to `prod`, the target condition stops matching and write access evaporates
   automatically, with no admin action and no move. Read stays, so prod remains visible.
@@ -117,18 +120,24 @@ severs the experimental history that parent records.
 production-ready-indicating aliases (for example `champion` or `production`) on a registered
 model. Today, anyone with EDIT can set any alias. A deployment script that pulls models by
 such an alias would pick up any model a DS promoted, even with no review.
-- **Value condition (DS):** `(ds-role, registered_model, value_condition="alias NOT IN ('champion', 'production')")`
-- **Result:** DS may set any alias except the protected ones. The platform role has no value
-  condition, so it may. This gates the value being set.
+- **Value filter (DS):** `value_condition="alias NOT IN ('champion', 'production')"`
+- **Result:** DS may set any alias except the protected ones. The platform role carries no
+  condition at all, so it is unconstrained and may. This gates the value being set.
 
 **3. Restricting mutation inputs.** A data scientist needs EDIT to update descriptions and
 set benign tags, but should not be able to set operationally significant tag keys (for
 example `lifecycle` or `approved`). Today, EDIT grants unrestricted access to all tag and
 alias operations.
-- **Value condition:** `(ds-role, registered_model, value_condition="tag_key != 'lifecycle'")`
+- **Value filter:** `value_condition="tag_key != 'lifecycle'"`
 - **Result:** all tag writes are allowed except the protected key, at both create and update.
-  This protects the target condition in use case 1: without it, a dev user could simply change
+  This protects the target filter in use case 1: without it, a dev user could simply change
   the governing tag to escape the lock.
+
+These three filters belong to **one** condition object on `(ds-role, registered_model)`, as in
+*Basic example* -- not three. Conditions are alternatives, and an absent filter is a wildcard for
+its half, so authoring them as three objects would turn use cases 2 and 3 into alternatives whose
+target half matches every resource, defeating use case 1's restriction entirely. Each alternative
+has to be self-contained; see *Drawbacks*.
 
 Conditions solve these by making a *write operation* dynamic. The **target condition** follows
 the resource's tags, and the **value condition** constrains the values a request may set.
@@ -250,12 +259,15 @@ the ordinary case and is unaffected.
 Each non-null condition is a single filter in MLflow's existing search filter grammar: a set of
 comparison clauses AND-ed together, for example `tags.lifecycle = 'dev'` or
 `tag_key != 'lifecycle' AND alias != 'champion'`. A value being set, or a resource being
-mutated, is permitted when it matches every clause. There is no separate allow and deny form:
-`!=` and `NOT IN` express exclusion within one filter.
+mutated, satisfies that condition when it matches every clause. `!=` and `NOT IN` express
+exclusion *within* one condition; because conditions are alternatives, that exclusion is not
+absolute and can be bypassed by a sibling condition that permits the same request. There is no
+separate deny form in this RFC; see *Drawbacks* and *Alternatives C*.
 
 The optional parent scope filters which condition objects are applicable before they combine.
-Every applicable condition object across every role held by the user must pass. Thus, conditions
-scoped to different parents do not conflict for a single child, while unscoped conditions apply
+At least one applicable condition object must be satisfied, and applicable objects are pooled
+across every role the user holds. Conditions scoped to different parents therefore do not
+conflict for a single child, while unscoped conditions apply
 to every parent. Like grants, conditions are scoped to a workspace through the role; the
 condition has no workspace column of its own.
 
@@ -273,12 +285,13 @@ add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
     # both set for exact direct-parent scope. Rejects an unsupported parent relationship, an
     # invalid filter, both filters null, or a role/type that already has 100 objects.
     #
-    # Every object added for a (role, resource_type) that applies to a target must pass: the
-    # objects are conjunctive, not alternatives. Adding one can only narrow what the role may
-    # do, never widen it. This is worth surfacing in any authoring UI, because a list of
-    # objects reads like a set of alternatives and most permission systems treat a list that
-    # way -- two objects saying "env = dev" and "owner = me" permit only resources that are
-    # both, which is the most common way for an admin to lock themselves out.
+    # Every object added for a (role, resource_type) is an ALTERNATIVE: a request satisfying any
+    # one of them is permitted. Adding an object can only widen what the role may do, never
+    # narrow it. This is worth surfacing in any authoring UI, because each object has to stand on
+    # its own -- a restriction written into one object and omitted from another is not enforced
+    # whenever the second one matches, and an object with a null target filter matches every
+    # resource, which is the likeliest way for an admin to defeat a restriction they already
+    # authored.
     #
     # The caller does not choose the slot. The backend allocates an unused slot from 1 through
     # 100; the slot UNIQUE constraint handles a concurrent allocation collision, which is
@@ -305,21 +318,31 @@ evaluate.
 
 ### Limits and restrictions
 
-- **Conditions combine with AND.** For an operation, base RBAC, every applicable value
-  condition, and every applicable target condition must pass; any one failing denies it.
-  An absent or vacuous condition contributes nothing and passes.
+- **Conditions combine with OR.** For an operation, base RBAC must pass **and** at least one
+  applicable condition must be satisfied, where a condition is satisfied when both its value
+  filter and its target filter pass. An object with both filters null is rejected at add, so no
+  stored condition is unconditionally true. A role carrying no conditions contributes nothing to
+  the disjunction, so it does not exempt the user from conditions carried by their other roles.
+- **An absent filter is a wildcard for its half.** Within one condition, a null target filter
+  matches every resource and a null value filter permits every value. Under OR that makes a
+  half-specified condition an alternative that matches broadly, so each condition should be
+  written to stand alone. See *Drawbacks*.
 - **Scope selects before combination.** A parent-scoped condition is considered only for a child
   whose resolved direct parent matches its scope. An unscoped condition applies to every parent
   of the target type in the role's workspace.
 - **Grants add, conditions subtract across roles.** A user's capability is the union of what
-  their roles grant, exactly as today, but every applicable condition from every held role must
-  match. A restriction in one role cannot be lifted by a permissive or absent condition in
-  another, independent of that role's grant level.
-- **Non-monotonic across roles.** Adding a role that carries a condition can reduce what a user
-  may do. This is inherent to a restriction and matches the absolute-deny behavior of the merged
-  sub-resource-permissions RFC's `NONE` level.
-- **Contradictory conditions fail closed.** If applicable conditions require
-  `tags.lifecycle = 'dev'` and `tags.lifecycle = 'prod'`, the user can mutate neither.
+  their roles grant, exactly as today, and the conditions applicable to that capability are
+  pooled across every role they hold. An *absent* condition cannot lift a restriction, because a
+  role with no conditions contributes no alternative. A *permissive* condition can, including one
+  carried by a different role and administered by a different person.
+- **Non-monotonic in both directions.** Adding a role that carries a condition can reduce what a
+  user may do, because a user with no applicable condition is unconstrained while a user with one
+  is held to it. Adding a role whose condition is more permissive can *increase* what they may
+  do, because it supplies another alternative. Neither direction follows from the grant level.
+- **Conditions that disagree widen rather than conflict.** If applicable conditions require
+  `tags.lifecycle = 'dev'` and `tags.lifecycle = 'prod'`, the user may mutate either, because
+  each is an alternative. This is the opposite of AND combination, which would have permitted
+  neither.
 - **At most 100 condition objects per `(role, resource_type)`.** This bound includes both
   workspace/type-scoped and parent-scoped objects. Roles are workspace-scoped, so the bound
   never spans workspaces; it is not an aggregate quota across every role in a workspace.
@@ -337,11 +360,12 @@ evaluate.
 - **Ordering comparators are rejected.** `=`, `!=`, `LIKE`, `ILIKE`, `IN` and `NOT IN` are
   allowed. `>`, `<`, `>=` and `<=` are not: tag and alias values are strings, so an ordering
   comparison would be lexicographic and would mislead an admin into thinking they had expressed a
-  numeric or temporal range. `!=` and `NOT IN` are what supply exclusion, which is why no separate
-  deny form is needed.
-- **No `OR` within a filter.** This preserves reuse of MLflow's AND-only parser and matcher;
-  `IN` and `NOT IN` express same-field alternatives. General OR would require a separate
-  parser/evaluator and special absent-field semantics for value conditions.
+  numeric or temporal range. `!=` and `NOT IN` supply exclusion within a condition.
+- **No `OR` operator inside a filter string.** Disjunction is expressed by authoring multiple
+  condition objects rather than by an `OR` inside one filter. This preserves reuse of MLflow's
+  AND-only parser and matcher, and `IN`/`NOT IN` already cover same-field alternatives within a
+  clause. In-filter OR would require a separate parser and evaluator and its own absent-field
+  semantics for value conditions.
 
 ## Changes to the auth call path
 
@@ -418,13 +442,14 @@ Notes:
 - **A container delete is authorized against its children.** Deleting an experiment deletes its
   runs, traces, and logged models, so conditions on those child types must be checked before the
   delete is allowed; otherwise deleting the parent bypasses every condition on its children. The
-  check asks only whether *any* child fails, an existence question rather than a selection one, so
-  it never has to return the children themselves. It is nonetheless unbounded in child count, in
-  the same way the delete it authorizes already is: `delete_experiment` loads every run of the
-  experiment and marks each one individually. Validation is therefore chunked with an early exit
-  on the first failing child, and the UI should indicate that a delete is being validated,
-  because on a large experiment the authorization is user-visibly slow for the same reason the
-  delete itself is.
+  check asks only whether any child satisfies *no* applicable condition, an existence question
+  rather than a selection one, so it never has to return the children themselves. It is
+  nonetheless unbounded in child count, in the same way the delete it authorizes already is:
+  `delete_experiment` loads every run of the experiment and marks each one individually.
+  Validation is therefore chunked over children, with an early exit on the first child that
+  satisfies no condition, and the UI should indicate that a delete is being validated, because on
+  a large experiment the authorization is user-visibly slow for the same reason the delete itself
+  is.
 
 ## Adaptability to Pluggable Auth (RFC 8)
 
@@ -551,13 +576,23 @@ column rather than a table rename or a data migration. See *Out of scope*.
 
 # Drawbacks
 
-- **Non-monotonic across roles.** Because conditions combine with AND, adding a role that
-  carries a condition can *reduce* what a user may do, and a permissive role cannot lift a
-  restriction imposed by another. Contradictory conditions on the same type across two of a
-  user's roles fail closed, leaving no mutation that satisfies both. This is intentional and
-  matches the merged `NONE` and is the safe direction for a restriction, but a restriction lives
-  on every role that carries it and accumulates, which can surprise admins who expect roles to
-  only add access.
+- **A restriction is only as strong as the most permissive alternative.** Because conditions are
+  OR-ed, a condition silent about a field cannot restrict that field, and any applicable sibling
+  whose target overlaps supplies an escape. A value filter `tag_key != 'lifecycle'` is defeated
+  by any applicable sibling that does not also exclude `lifecycle` -- including one carried by a
+  different role, administered by a different person. The sharpest form is a half-specified
+  condition: a null target filter matches every resource, so a value-only condition is an
+  alternative that defeats every target restriction authored elsewhere. Create is the worst case,
+  since a target filter is vacuous on create and therefore *every* applicable condition overlaps
+  by construction, leaving the most permissive value filter to decide. Expressing a restriction
+  that always applies means repeating it in every alternative, and nothing in the data model
+  enforces that it was. This is the same shape as an IAM policy set with no `Deny` statement and
+  no permission boundary; see *Alternatives C*.
+- **Non-monotonic in both directions.** Adding a role that carries a condition can reduce what a
+  user may do, because a user with no applicable condition is unconstrained. Adding a role with a
+  more permissive condition can increase it, because that supplies another alternative. Admins
+  who expect roles to only add access are surprised by the first; admins who expect conditions to
+  only subtract are surprised by the second.
 - **No system-enforced global invariant.** A user with no condition on a type is unconstrained
   there. Restricting a user requires placing a condition on a role they hold, so a guaranteed
   "nobody may ever set X" rule is a built-in hard check in the handler rather than a condition.
@@ -613,10 +648,16 @@ surface; operation-level detail is kept internal in the field and parent mapping
 Give each condition both an allow filter and a deny filter, or encode the value condition as an
 allow/deny map of key to permitted values.
 
-**Rejected because** `!=` and `NOT IN` already express exclusion within a single condition, and
-cross-role AND already provides absolute restriction, so a separate deny channel adds a second
-combining rule with no added power. A single condition is simpler to author and explain. A
-structured value map remains a possible future authoring convenience over the same evaluation.
+**Deferred rather than rejected.** The original rejection rested on cross-role AND supplying
+absolute restriction, which made `!=` and `NOT IN` within one condition sufficient and left a
+deny channel adding a second combining rule with no added power. With conditions combining by OR
+that premise no longer holds: exclusion inside one alternative is not absolute, so there is at
+present no way to express a restriction a sibling condition cannot lift. A deny filter is the
+mechanism that would restore it, and it is the direct analogue of an IAM `Deny` statement or a
+permission boundary -- which is what makes an IAM restriction hold even though `Allow` statements
+combine by union. It is left out of this RFC to keep a single combining rule in the initial
+implementation, and the resulting gap is recorded under *Drawbacks*. A structured value map
+remains a possible future authoring convenience over the same evaluation.
 
 ### D. Separate policy layer (admission-controller style)
 
