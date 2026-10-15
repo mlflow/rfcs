@@ -594,18 +594,20 @@ column, a table rename, or a data migration. See *Out of scope*.
 # Drawbacks
 
 - **A restriction is only as strong as the most permissive alternative of its type.** Because
-  same-type conditions are OR-ed, a condition silent about a field cannot restrict that field,
-  and any applicable sibling of the same type supplies an escape -- including one carried by a
-  different role and administered by a different person. Request-side absence makes this sharp
-  for VALUE conditions: a request that sets no alias satisfies an alias filter vacuously, so
-  `alias NOT IN ('champion')` and `tag_key != 'lifecycle'` authored as two VALUE conditions
-  annihilate each other, each lifted by the other's silence, and neither protection survives a
-  request that trips only one of them. TARGET conditions have the same exposure on create, where
-  they are vacuous. Expressing a restriction that always holds therefore means repeating every
-  clause of it in every alternative of that type -- in practice, keeping one condition per type
-  and AND-ing its clauses -- and nothing in the data model enforces that it was done. This is
-  the same shape as an IAM policy set with no `Deny` statement and no permission boundary; see
-  *Alternatives C*.
+  same-type conditions are OR-ed, whichever condition has all its clauses fulfilled authorizes
+  the whole request, even if it says nothing about the field being restricted. Two VALUE
+  conditions `alias NOT IN ('champion')` and `tag_key != 'lifecycle'` do not combine: a request
+  setting `alias=champion` alongside `team=ml` fulfils the tag condition on its own merits, so
+  the alias clause fails and the write is still permitted. This needs no absent field, though
+  absence widens it -- a request setting no alias at all satisfies the alias filter vacuously, so
+  the two conditions also annihilate each other on single-field writes. TARGET conditions have
+  the same exposure on create, where they are vacuous. A restriction therefore holds only if
+  *every* applicable condition of that type is restrictive about the field -- in practice,
+  keeping one condition per type and AND-ing its clauses -- and nothing in the data model
+  enforces that it was done. The sibling may also be carried by a different role, administered by
+  a different person. This is the same shape as an IAM policy set with no `Deny` statement and no
+  permission boundary, with the added difference that an IAM condition key absent from a request
+  makes its operator fail rather than pass; see *Alternatives C*.
 - **Non-monotonic in both directions.** Adding a role that carries a condition can reduce what a
   user may do, because a user with no applicable condition is unconstrained. Adding a role with a
   more permissive condition can increase it, because that supplies another alternative. Admins
