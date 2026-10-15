@@ -47,14 +47,22 @@ platform_role = client.create_role(name="platform-eng",   workspace="ml-team")
 client.add_role_permission(ds_role.id,       "registered_model", "*", "EDIT")
 client.add_role_permission(platform_role.id, "registered_model", "*", "EDIT")
 
-# One call adds both conditions for (ds_role, registered_model):
-#  - target condition: may mutate only resources currently tagged lifecycle=dev
-#  - value condition:  may not set the governing lifecycle tag, nor the champion alias
+# Two conditions for (ds_role, registered_model), one of each type. The types AND, so both hold.
+#  - TARGET: may mutate only resources currently tagged lifecycle=dev
 client.add_condition(
     role_id=ds_role.id,
     resource_type="registered_model",
-    target_condition="tags.lifecycle = 'dev'",
-    value_condition="tag_key != 'lifecycle' AND alias != 'champion'",
+    type="TARGET",
+    filter="tags.lifecycle = 'dev'",
+)
+#  - VALUE: may not set the governing lifecycle tag, nor the champion alias. Both restrictions
+#    belong in ONE value condition: a second one would be an alternative, and anything it
+#    permits is permitted no matter what this one forbids.
+client.add_condition(
+    role_id=ds_role.id,
+    resource_type="registered_model",
+    type="VALUE",
+    filter="tag_key != 'lifecycle' AND alias != 'champion'",
 )
 # Platform role: no conditions, so it is unconstrained and may promote and edit prod.
 ```
@@ -110,8 +118,8 @@ another workspace, which is not trivial. Moving a resource breaks lineage becaus
 cross-workspace references. A sub-resource such as a run, trace, or logged model resolves its
 workspace through its parent experiment, so moving it changes its parent experiment and
 severs the experimental history that parent records.
-- **Target filter:** `target_condition="tags.lifecycle='dev'"` on the DS role's
-  `registered_model` condition.
+- **Target condition:** `type="TARGET", filter="tags.lifecycle='dev'"` on the DS role's
+  `registered_model`.
 - **Result:** DS may mutate a resource only while it is tagged `lifecycle=dev`. When the tag
   flips to `prod`, the target condition stops matching and write access evaporates
   automatically, with no admin action and no move. Read stays, so prod remains visible.
@@ -120,7 +128,7 @@ severs the experimental history that parent records.
 production-ready-indicating aliases (for example `champion` or `production`) on a registered
 model. Today, anyone with EDIT can set any alias. A deployment script that pulls models by
 such an alias would pick up any model a DS promoted, even with no review.
-- **Value filter (DS):** `value_condition="alias NOT IN ('champion', 'production')"`
+- **Value clause (DS):** `alias NOT IN ('champion', 'production')`
 - **Result:** DS may set any alias except the protected ones. The platform role carries no
   condition at all, so it is unconstrained and may. This gates the value being set.
 
@@ -128,16 +136,17 @@ such an alias would pick up any model a DS promoted, even with no review.
 set benign tags, but should not be able to set operationally significant tag keys (for
 example `lifecycle` or `approved`). Today, EDIT grants unrestricted access to all tag and
 alias operations.
-- **Value filter:** `value_condition="tag_key != 'lifecycle'"`
+- **Value clause:** `tag_key != 'lifecycle'`
 - **Result:** all tag writes are allowed except the protected key, at both create and update.
-  This protects the target filter in use case 1: without it, a dev user could simply change
+  This protects the target condition in use case 1: without it, a dev user could simply change
   the governing tag to escape the lock.
 
-These three filters belong to **one** condition object on `(ds-role, registered_model)`, as in
-*Basic example* -- not three. Conditions are alternatives, and an absent filter is a wildcard for
-its half, so authoring them as three objects would turn use cases 2 and 3 into alternatives whose
-target half matches every resource, defeating use case 1's restriction entirely. Each alternative
-has to be self-contained; see *Drawbacks*.
+These become **two** condition objects on `(ds-role, registered_model)`, as in *Basic example*:
+use case 1 is the TARGET condition, and use cases 2 and 3 are two clauses of a single VALUE
+condition. The types AND, so both hold. Authoring 2 and 3 as separate VALUE conditions would
+instead make them alternatives, and because a request that sets no alias satisfies an alias
+filter vacuously, each would be lifted by the other's silence and neither protection would
+survive. See *Drawbacks*.
 
 Conditions solve these by making a *write operation* dynamic. The **target condition** follows
 the resource's tags, and the **value condition** constrains the values a request may set.
@@ -168,17 +177,17 @@ Neither requires moving resources or per-resource admin work.
 
   The schema does not presuppose this exclusion. The table and object are named for conditions
   generally rather than for mutations, and search support would arrive as a **third condition
-  field** beside the two defined here: `value_condition` gates what a request may set,
-  `target_condition` gates which existing resources may be mutated, and a future
-  `search_condition` would gate which resources a listing returns. That is one additive nullable
-  column -- no row carries a mode, and no existing row changes meaning.
+  type** beside the two defined here: `VALUE` gates what a request may set, `TARGET` gates which
+  existing resources may be mutated, and a future `SEARCH` would gate which resources a listing
+  returns. That is one additional enum value -- no new column, and no existing row changes
+  meaning.
 
-  A separate field rather than a flag on the existing ones is what keeps this additive, for two
+  A separate type rather than a flag on the existing ones is what keeps this additive, for two
   reasons. **Validation differs:** a search condition may use only what search can push down, so
   it has to reject alias clauses and the comparators a given type's parser does not accept, while
-  `target_condition` keeps the full vocabulary. Its value budget differs too, since a listing
-  combines every applicable condition into one predicate where a mutation evaluates them
-  independently. **The absence rule may differ:** a target condition **fails on absence**, since
+  `TARGET` keeps the full vocabulary. Its value budget differs too, since a listing combines every
+  applicable condition into one predicate where a mutation evaluates them independently. **The
+  absence rule may differ:** a target condition **fails on absence**, since
   a resource lacking the tag does not satisfy the clause, which is the strict direction for a
   mutation but would hide every untagged resource from a listing. Whether a search condition
   keeps that rule or needs an explicit absence policy is not decided here, and a distinct field
@@ -216,8 +225,8 @@ Neither requires moving resources or per-resource admin work.
 
 ### Conditions and their fields
 
-A role may have up to 100 condition objects for each target resource type. Each object has a
-stable ID, optional value and target filters, and an optional exact direct-parent scope:
+A role may have up to 100 condition objects of each type for each target resource type. Each
+object carries a stable ID, a type, one filter, and an optional exact direct-parent scope:
 
 ```
 Condition {
@@ -225,21 +234,23 @@ Condition {
     role_id:              int       # the role the conditions apply to
     resource_type:        string    # authorization target, e.g. "registered_model_version"
 
+    # What the filter governs. VALUE gates the values a request may set; TARGET gates which
+    # existing resources may be mutated. The two types answer different questions and so combine
+    # with AND, while conditions sharing a type are alternatives and combine with OR. Search is
+    # out of scope in this RFC; if search conditions are added later they arrive as a third
+    # value on this field rather than as a new column.
+    type:                 enum      # VALUE | TARGET
+
     # Optional direct-parent selector. Both fields are null for workspace/type scope; both are
     # set for parent scope. The pair must be a supported direct-parent relationship for the
     # target type, e.g. registered_model_version under registered_model/fraud-model.
     parent_resource_type: string | null
     parent_resource_id:   string | null
 
-    # Gates WHAT VALUES may be set. A filter over tag_key, tag_value, and alias. It applies to
-    # create as well as mutation. null leaves request values unconstrained.
-    value_condition:      string | null
-
-    # Gates WHICH EXISTING RESOURCES may be mutated. A filter over tags.<key> and
-    # aliases.<name>, read from the target's current state. It is vacuous on create. Search is
-    # out of scope in this RFC; if search conditions are added later they arrive as a third
-    # field, not by reusing this one. null leaves target resources unconstrained.
-    target_condition:     string | null
+    # The filter, never null. For VALUE it reads the request and ranges over tag_key, tag_value
+    # and alias, and it applies to create as well as mutation. For TARGET it reads the target's
+    # current state and ranges over tags.<key> and aliases.<name>, and it is vacuous on create.
+    filter:               string
 }
 ```
 
@@ -279,31 +290,33 @@ role-permission API. `add` creates a `Condition` object and returns it with an a
 Their request and response shapes:
 
 ```
-add(role_id, resource_type, parent_resource_type?, parent_resource_id?,
-    value_condition?, target_condition?) -> Condition
-    # Creates ONE object. The parent fields are both omitted/null for workspace/type scope or
-    # both set for exact direct-parent scope. Rejects an unsupported parent relationship, an
-    # invalid filter, both filters null, or a role/type that already has 100 objects.
+add(role_id, resource_type, type, filter, parent_resource_type?, parent_resource_id?)
+    -> Condition
+    # Creates ONE object of ONE type. The parent fields are both omitted/null for workspace/type
+    # scope or both set for exact direct-parent scope. Rejects an unsupported parent
+    # relationship, a missing type or filter, an invalid filter, or a
+    # (role, resource_type, type) that already holds 100 objects.
     #
-    # Every object added for a (role, resource_type) is an ALTERNATIVE: a request satisfying any
-    # one of them is permitted. Adding an object can only widen what the role may do, never
-    # narrow it. This is worth surfacing in any authoring UI, because each object has to stand on
-    # its own -- a restriction written into one object and omitted from another is not enforced
-    # whenever the second one matches, and an object with a null target filter matches every
-    # resource, which is the likeliest way for an admin to defeat a restriction they already
-    # authored.
+    # Every object sharing a (role, resource_type, type) is an ALTERNATIVE: a request satisfying
+    # any one of them passes that type. Adding an object can only widen what the role may do,
+    # never narrow it. Prefer ONE condition per type, with its clauses AND-ed inside the filter.
+    # This is worth surfacing in any authoring UI, because a second condition of the same type
+    # is the likeliest way for an admin to defeat a restriction they already authored -- a field
+    # the new condition does not name is a field it permits.
     #
     # The caller does not choose the slot. The backend allocates an unused slot from 1 through
     # 100; the slot UNIQUE constraint handles a concurrent allocation collision, which is
     # retried. The slot is implementation metadata and has no policy ordering meaning.
 
-update(id, parent_resource_type?, parent_resource_id?, value_condition?, target_condition?)
+update(id, filter?, parent_resource_type?, parent_resource_id?)
     -> Condition
     # Partial update by id:
     #   - an omitted field is unchanged;
-    #   - a filter string replaces that filter and null clears it;
+    #   - a filter string replaces the filter; it cannot be cleared, because a condition with no
+    #     filter has no meaning -- use remove instead;
     #   - the parent pair is replaced together by an exact pair or two nulls;
-    #   - when both filters are null after the update, the object is removed.
+    #   - type is immutable. Each type's filter draws on its own namespace, so re-typing a
+    #     condition would almost always invalidate its filter. Remove and re-add instead.
 
 remove(id) -> {}
     # Deletes one Condition object.
@@ -318,15 +331,17 @@ evaluate.
 
 ### Limits and restrictions
 
-- **Conditions combine with OR.** For an operation, base RBAC must pass **and** at least one
-  applicable condition must be satisfied, where a condition is satisfied when both its value
-  filter and its target filter pass. An object with both filters null is rejected at add, so no
-  stored condition is unconditionally true. A role carrying no conditions contributes nothing to
-  the disjunction, so it does not exempt the user from conditions carried by their other roles.
-- **An absent filter is a wildcard for its half.** Within one condition, a null target filter
-  matches every resource and a null value filter permits every value. Under OR that makes a
-  half-specified condition an alternative that matches broadly, so each condition should be
-  written to stand alone. See *Drawbacks*.
+- **Same-type conditions OR, the types AND.** For an operation, base RBAC must pass, at least
+  one applicable VALUE condition must pass, and at least one applicable TARGET condition must
+  pass. Conditions sharing a type are alternatives. The two types answer different questions, so
+  they combine with AND: OR-ing across them would permit a forbidden value on a permitted
+  resource, or a permitted value on a forbidden resource.
+- **A type with no applicable condition is unconstrained.** A user holding no applicable VALUE
+  condition may set any value, and likewise for TARGET. Absence is not a restriction, so a role
+  carrying no conditions contributes nothing to either disjunction and does not exempt the user
+  from conditions carried by their other roles.
+- **Applicable conditions pool across roles.** Each type's disjunction is taken over every
+  applicable condition of that type from every role the user holds.
 - **Scope selects before combination.** A parent-scoped condition is considered only for a child
   whose resolved direct parent matches its scope. An unscoped condition applies to every parent
   of the target type in the role's workspace.
@@ -343,10 +358,10 @@ evaluate.
   `tags.lifecycle = 'dev'` and `tags.lifecycle = 'prod'`, the user may mutate either, because
   each is an alternative. This is the opposite of AND combination, which would have permitted
   neither.
-- **At most 100 condition objects per `(role, resource_type)`.** This bound includes both
+- **At most 100 condition objects per `(role, resource_type, type)`.** This bound includes both
   workspace/type-scoped and parent-scoped objects. Roles are workspace-scoped, so the bound
   never spans workspaces; it is not an aggregate quota across every role in a workspace.
-- **At most 5 clauses per filter** (value and target each).
+- **At most 5 clauses per filter.**
 - **Reserved `mlflow.*` tag keys cannot be named in either namespace.** A condition may not use
   `mlflow.`-prefixed key as a `tag_key` value, nor as a `tags.<key>` identifier. Two reasons, and
   they point the same way. MLflow writes these itself (`mlflow.runName`, `mlflow.source.type`), so
@@ -538,10 +553,10 @@ CREATE TABLE conditions (
     role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
     resource_type VARCHAR(255) NOT NULL,
     condition_slot SMALLINT NOT NULL,
+    condition_type VARCHAR(16) NOT NULL,
     parent_resource_type VARCHAR(255),
     parent_resource_id VARCHAR(255),
-    value_condition TEXT,
-    target_condition TEXT,
+    filter TEXT NOT NULL,
 
     CHECK (
         (parent_resource_type IS NULL AND parent_resource_id IS NULL)
@@ -549,13 +564,14 @@ CREATE TABLE conditions (
         (parent_resource_type IS NOT NULL AND parent_resource_id IS NOT NULL)
     ),
     CONSTRAINT unique_role_type_slot
-        UNIQUE (role_id, resource_type, condition_slot)
+        UNIQUE (role_id, resource_type, condition_type, condition_slot)
 );
 
 CREATE INDEX idx_conditions_lookup
     ON conditions (
         role_id,
         resource_type,
+        condition_type,
         parent_resource_type,
         parent_resource_id
     );
@@ -569,25 +585,27 @@ parsed clauses for request-path evaluation, while `list` returns the stored stri
 The table is additive, so deployments with no rows retain current default-allow behavior.
 
 The table is named `conditions` rather than `mutation_conditions`, and no column names the
-action: every column (`value_condition`, `target_condition`, `condition_slot`, `resource_type`,
-the scope columns) is already action-neutral. Search conditions are out of scope in this RFC, but
-nothing here presupposes that: adding them later is one additive nullable `search_condition`
-column rather than a table rename or a data migration. See *Out of scope*.
+action: every column (`condition_type`, `filter`, `condition_slot`, `resource_type`,
+the scope columns) is already action-neutral -- `VALUE` and `TARGET` name what a filter reads,
+not which operation it gates. Search conditions are out of scope in this RFC, but nothing here
+presupposes that: adding them later is one additional `condition_type` value rather than a new
+column, a table rename, or a data migration. See *Out of scope*.
 
 # Drawbacks
 
-- **A restriction is only as strong as the most permissive alternative.** Because conditions are
-  OR-ed, a condition silent about a field cannot restrict that field, and any applicable sibling
-  whose target overlaps supplies an escape. A value filter `tag_key != 'lifecycle'` is defeated
-  by any applicable sibling that does not also exclude `lifecycle` -- including one carried by a
-  different role, administered by a different person. The sharpest form is a half-specified
-  condition: a null target filter matches every resource, so a value-only condition is an
-  alternative that defeats every target restriction authored elsewhere. Create is the worst case,
-  since a target filter is vacuous on create and therefore *every* applicable condition overlaps
-  by construction, leaving the most permissive value filter to decide. Expressing a restriction
-  that always applies means repeating it in every alternative, and nothing in the data model
-  enforces that it was. This is the same shape as an IAM policy set with no `Deny` statement and
-  no permission boundary; see *Alternatives C*.
+- **A restriction is only as strong as the most permissive alternative of its type.** Because
+  same-type conditions are OR-ed, a condition silent about a field cannot restrict that field,
+  and any applicable sibling of the same type supplies an escape -- including one carried by a
+  different role and administered by a different person. Request-side absence makes this sharp
+  for VALUE conditions: a request that sets no alias satisfies an alias filter vacuously, so
+  `alias NOT IN ('champion')` and `tag_key != 'lifecycle'` authored as two VALUE conditions
+  annihilate each other, each lifted by the other's silence, and neither protection survives a
+  request that trips only one of them. TARGET conditions have the same exposure on create, where
+  they are vacuous. Expressing a restriction that always holds therefore means repeating every
+  clause of it in every alternative of that type -- in practice, keeping one condition per type
+  and AND-ing its clauses -- and nothing in the data model enforces that it was done. This is
+  the same shape as an IAM policy set with no `Deny` statement and no permission boundary; see
+  *Alternatives C*.
 - **Non-monotonic in both directions.** Adding a role that carries a condition can reduce what a
   user may do, because a user with no applicable condition is unconstrained. Adding a role with a
   more permissive condition can increase it, because that supplies another alternative. Admins
@@ -604,7 +622,7 @@ column rather than a table rename or a data migration. See *Out of scope*.
   reads in the current design, so a user who holds read access to a resource sees all of its
   fields regardless of any condition. Hiding a field or resource requires the base grant, not a
   condition. The blocker is search-filter pushdown rather than the data model, and search support
-  would arrive as a third `search_condition` field without reshaping what is here; see *Out of
+  would arrive as a third condition type without reshaping what is here; see *Out of
   scope*.
 
 # Alternatives
@@ -692,8 +710,11 @@ operation is default-allow at its base level.
    ```python
    client.add_condition(
        role_id=ds_role.id, resource_type="registered_model",
-       target_condition="tags.lifecycle = 'dev'",
-       value_condition="tag_key != 'lifecycle'",
+       type="TARGET", filter="tags.lifecycle = 'dev'",
+   )
+   client.add_condition(
+       role_id=ds_role.id, resource_type="registered_model",
+       type="VALUE", filter="tag_key != 'lifecycle'",
    )
    ```
 5. Leave the promoting role without a value condition on the governing tag.
