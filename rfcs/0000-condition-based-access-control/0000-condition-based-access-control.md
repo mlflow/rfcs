@@ -147,23 +147,40 @@ Neither requires moving resources or per-resource admin work.
   it runs, which is tracked in
   [mlflow/mlflow#24964](https://github.com/mlflow/mlflow/issues/24964) and has no merged
   implementation. Pushdown is also not uniformly available: the condition vocabulary is tags and
-  aliases, and neither is a searchable key for the registry types
-  (`VALID_SEARCH_KEYS_FOR_REGISTERED_MODELS` is `{"name"}`), so read conditions would hold on
-  runs and traces and silently not on registered models, versions, or prompts -- and a restriction
-  that holds on a point route but not in search is worse than no restriction at all. The
-  remaining alternative, post-response filtering, costs a page scan plus a re-fetch loop to
-  refill `max_results` on every request.
+  aliases, and no search parser accepts an alias key at all, while tag `IN`/`NOT IN` is accepted
+  only for traces. A vocabulary wider than search can express means some conditions would hold on
+  mutation and silently not in a listing, and a restriction that holds on one route but not
+  another is worse than no restriction at all. The remaining alternative, post-response
+  filtering, degrades in proportion to how well the restriction works: the refill loop shrinks
+  its shortfall by the authorized fraction on each pass, so filling one 100-row page costs
+  roughly 6 store queries when half the rows are visible and roughly 460 when one percent are. A
+  condition that narrows a role to a small slice -- the intended use -- is the worst case for
+  filtering after the fact.
 
   The schema does not presuppose this exclusion. The table and object are named for conditions
-  generally rather than for mutations, and a read condition would reuse `target_condition`
-  unchanged: a read sets no values, so `value_condition` has no referent on a read, and "applies
-  to reads" reduces to requiring `value_condition` to be null. Adding read support is therefore
-  additive -- an action selector plus the pushdown mechanism above -- rather than a reshape.
-  One
-  semantic question is deliberately left open. A target condition **fails on absence**: a
-  resource lacking the tag does not satisfy the clause. That is the strict direction for a
-  mutation, but applied to a listing it would hide every untagged resource, so whether read
-  conditions keep that rule or need an explicit absence policy is not decided here.
+  generally rather than for mutations, and search support would arrive as a **third condition
+  field** beside the two defined here: `value_condition` gates what a request may set,
+  `target_condition` gates which existing resources may be mutated, and a future
+  `search_condition` would gate which resources a listing returns. That is one additive nullable
+  column -- no row carries a mode, and no existing row changes meaning.
+
+  A separate field rather than a flag on the existing ones is what keeps this additive, for two
+  reasons. **Validation differs:** a search condition may use only what search can push down, so
+  it has to reject alias clauses and the comparators a given type's parser does not accept, while
+  `target_condition` keeps the full vocabulary. Its value budget differs too, since a listing
+  combines every applicable condition into one predicate where a mutation evaluates them
+  independently. **The absence rule may differ:** a target condition **fails on absence**, since
+  a resource lacking the tag does not satisfy the clause, which is the strict direction for a
+  mutation but would hide every untagged resource from a listing. Whether a search condition
+  keeps that rule or needs an explicit absence policy is not decided here, and a distinct field
+  lets that be answered without disturbing mutations.
+
+  A search condition would subtract from the read grant exactly as the other two subtract from
+  write grants, so it could never reveal a resource the base grant does not already permit. It
+  would govern listings specifically and not point reads: a resource hidden from a search stays
+  readable by a caller who already knows its ID. That makes it discovery hygiene rather than
+  confidentiality, and the boundary has to be stated when the field is specified rather than left
+  for an admin to infer from the name.
 - **Cross-workspace conditions.** Conditions inherit exactly one workspace through their role. A
   condition that applies across every workspace would require a cross-workspace role or a
   separate global-policy binding, neither of which exists in this design.
@@ -210,9 +227,9 @@ Condition {
     value_condition:      string | null
 
     # Gates WHICH EXISTING RESOURCES may be mutated. A filter over tags.<key> and
-    # aliases.<name>, read from the target's current state. It is vacuous on create. Reads are
-    # out of scope in this RFC; if read conditions are added later, this is the field they
-    # reuse. null leaves target resources unconstrained.
+    # aliases.<name>, read from the target's current state. It is vacuous on create. Search is
+    # out of scope in this RFC; if search conditions are added later they arrive as a third
+    # field, not by reusing this one. null leaves target resources unconstrained.
     target_condition:     string | null
 }
 ```
@@ -398,6 +415,16 @@ Notes:
   Removing the governing tag therefore *loses* access rather than becoming unrestricted. This
   surprises admins -- `tags.lifecycle != 'prod'` denies an untagged resource -- but it is the
   fail-closed reading, and it is what prevents a two-step bypass.
+- **A container delete is authorized against its children.** Deleting an experiment deletes its
+  runs, traces, and logged models, so conditions on those child types must be checked before the
+  delete is allowed; otherwise deleting the parent bypasses every condition on its children. The
+  check asks only whether *any* child fails, an existence question rather than a selection one, so
+  it never has to return the children themselves. It is nonetheless unbounded in child count, in
+  the same way the delete it authorizes already is: `delete_experiment` loads every run of the
+  experiment and marks each one individually. Validation is therefore chunked with an early exit
+  on the first failing child, and the UI should indicate that a delete is being validated,
+  because on a large experiment the authorization is user-visibly slow for the same reason the
+  delete itself is.
 
 ## Adaptability to Pluggable Auth (RFC 8)
 
@@ -518,9 +545,9 @@ The table is additive, so deployments with no rows retain current default-allow 
 
 The table is named `conditions` rather than `mutation_conditions`, and no column names the
 action: every column (`value_condition`, `target_condition`, `condition_slot`, `resource_type`,
-the scope columns) is already action-neutral. Read conditions are out of scope in this RFC, but
-nothing here presupposes that, so adding them later needs an additive action selector rather
-than a table rename or a data migration. See *Out of scope*.
+the scope columns) is already action-neutral. Search conditions are out of scope in this RFC, but
+nothing here presupposes that: adding them later is one additive nullable `search_condition`
+column rather than a table rename or a data migration. See *Out of scope*.
 
 # Drawbacks
 
@@ -541,8 +568,9 @@ than a table rename or a data migration. See *Out of scope*.
 - **No restriction on reads.** Conditions gate create and mutation only. They cannot restrict
   reads in the current design, so a user who holds read access to a resource sees all of its
   fields regardless of any condition. Hiding a field or resource requires the base grant, not a
-  condition. The blocker is search-filter pushdown rather than the data model, and the schema is
-  named and shaped so read support can be added additively; see *Out of scope*.
+  condition. The blocker is search-filter pushdown rather than the data model, and search support
+  would arrive as a third `search_condition` field without reshaping what is here; see *Out of
+  scope*.
 
 # Alternatives
 
