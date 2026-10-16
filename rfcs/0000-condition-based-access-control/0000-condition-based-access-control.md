@@ -431,6 +431,38 @@ The value condition is read from the operation itself, so it applies uniformly t
 gate), layering on top of whatever grant authorized the operation independent of permission
 level.
 
+### The set a target condition is evaluated over
+
+A target condition is evaluated over the resources an operation affects, which is not always the
+resource the request names. `TransitionModelVersionStage` with `archive_existing_versions` moves
+every other version already in the target stage to `Archived`, and a cascade delete or restore
+reaches every child of its container. Those resources are mutated by a request that never
+mentions them, so a route that can trigger one declares the extra population and the gate judges
+it alongside the named resource. Without that declaration the stages API would be a way around
+any target condition on versions: the restriction would hold for the version transitioned and be
+bypassed for every version archived.
+
+The population is declared, never enumerated. A cascade context names the PARENT and a child
+type, and the gate asks the store a single question: does this parent hold a child that fails?
+That query is reached only once the gate knows a condition for that tier exists, so a cascade on
+a server with no conditions costs what it did before. The archive cascade is narrowed further
+to the stage the archive actually reaches, because judging every version of the model would
+refuse a transition into a stage holding nothing objectionable.
+
+Two consequences are worth stating plainly rather than leaving to be discovered:
+
+- **This is a property of condition evaluation, and the base grant check is not extended to
+  match.** The requirement these routes already issued is unchanged. A deployment relying on
+  grants alone therefore has exactly the exposure it has today: the archive is authorized by the
+  caller's permission on the version type, not by a per-resource check of everything the archive
+  reaches. Conditions are evaluated over a wider set than grants are, and that asymmetry is
+  deliberate -- widening the grant check would change existing authorization outcomes on servers
+  that have no conditions at all.
+- **A route that can cascade but does not declare it is unrestricted for conditions too.** The
+  declaration is per route, so coverage comes from having enumerated the cascading operations
+  rather than from anything the framework derives. The operations wired for the initial launch
+  are listed in the next section.
+
 ## Subset of resource types and their fields for initial launch
 
 The condition framework is resource-type generic, but the initial release wires only the types
@@ -698,7 +730,8 @@ capability as well remains reachable without disturbing any of this -- see *Out 
 
 **Cases extending the grant does not reach.** Each case below is enforced by this design and
 covered by the end-to-end suite. The claim is not that a grant field would be an inelegant way
-to express them, but that there is no grant field that reaches them at all. Each case shows the
+to express them, but that the grant's vocabulary -- a level over a resource pattern -- does not
+reach them, and that each repair converges on the condition object. Each case shows the
 two object shapes side by side -- a `grant` carrying a hypothetical `condition=` clause, against
 this design's separate `condition` object -- and then the flow the first shape gets wrong. The
 clause-carrying `grant` is **not** proposed API; it stands for the capability-keyed shape and is
@@ -848,72 +881,7 @@ flowchart TD
 Adding a `resource_type` field to the clause so it can name `experiment` alone is the condition
 object, arrived at from the other direction.
 
-**4. A call that mutates resources it never names.** Transitioning a version with
-`archive_existing_versions=True` moves every other version already in the target stage to
-`Archived`.
-
-```python
-# HYPOTHETICAL -- the clause is evaluated for the resource the request names.
-grant("registered_model_version", "*", "EDIT", condition="tags.lifecycle = 'dev'")
-```
-
-```python
-# This design -- a TARGET condition is defined over the resources the call affects.
-condition("registered_model_version", type="TARGET", filter="tags.lifecycle = 'dev'")
-```
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Gate as Auth gate
-    participant Registry
-
-    Note over Client,Registry: fraud-model - version 1 tagged prod in Staging, version 2 tagged dev
-
-    Note over Client,Registry: HYPOTHETICAL - judge the resource the request names
-    Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
-    Note over Gate: the request designates version 2, so that is what the gate is asked about
-    Gate->>Gate: evaluate the clause for version 2, which is tagged dev and passes
-    Gate-->>Registry: ALLOWED
-    Registry->>Registry: move version 2 into Staging
-    Registry->>Registry: archive version 1 as a side effect
-    Note over Gate,Registry: the pattern would have matched version 1, but nothing ever asked
-
-    Note over Client,Registry: THIS DESIGN - the route declares the cascade it will trigger
-    Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
-    Note over Gate: archive flag set, so add a cascade context narrowed to the target stage
-    Gate->>Registry: does this model hold a version in that stage which fails
-    Registry-->>Gate: yes, version 1 is tagged prod
-    Gate-->>Client: 403 Forbidden
-```
-
-**The wildcard does not help here, and it is worth being precise about why.** A resource pattern
-answers a filtering question -- the gate is asking about resource R, does this grant apply to R?
-It is a predicate on a resource already in hand, not a way to discover further resources to ask
-about. The request designates version 2, so version 2 is what the gate is asked about; version 1
-is archived inside the store after authorization has already returned. A `*` pattern would have
-matched version 1, but nothing ever asks. Widening the pattern cannot change that, because the
-pattern is not what determines the set being judged.
-
-What determines it is the route, which has to declare the cascade: when
-`archive_existing_versions` is set, the gate adds a context narrowed to the stage the archive
-actually reaches. The children are never enumerated -- the context names the parent and the gate
-asks the store whether that parent holds a child that fails, in one query.
-
-In fairness, that declaration could in principle be attached to a grant-carried clause too, so
-this case is not proof that no grant field could ever reach it. What it shows is narrower and
-still decisive: the grant's own vocabulary -- a level over a pattern -- does not reach it, the
-work has to be done per route either way, and a clause on the grant would additionally inherit
-the fold described in case 1, where any unconditioned `EDIT` grant re-opens the archive.
-
-| Same transition under this design | Outcome |
-|---|---|
-| while version 1 is tagged `lifecycle=prod` | 403 |
-| once every version the archive reaches passes | 200 |
-| when the failing version sits outside the stage the archive reaches | 200 |
-| without `archive_existing_versions`, which names only one version | 200 |
-
-**5. A restriction finer than any permission level.** "May not set the `champion` alias, but may
+**4. A restriction finer than any permission level.** "May not set the `champion` alias, but may
 set tags freely."
 
 ```python
