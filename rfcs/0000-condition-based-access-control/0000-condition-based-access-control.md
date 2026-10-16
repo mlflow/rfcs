@@ -417,11 +417,11 @@ flowchart TD
     BASE_CHECK -->|Yes| MUTATING{Create or mutation on a supported type}
     MUTATING -->|No| HANDLER[200 OK - handler executes]
     MUTATING -->|Yes| LOADC[Load conditions for workspace roles target type and parent]
-    LOADC --> VALUE[Value check - request set-values vs all value conditions]
-    VALUE --> VOK{All value conditions match}
+    LOADC --> VALUE[Value check - request set-values vs the VALUE conditions]
+    VALUE --> VOK{Any VALUE alternative satisfied - none present counts as satisfied}
     VOK -->|No| DENYV[403 - value not permitted]
-    VOK -->|Yes| TARGET[Target check - current tags vs all target conditions]
-    TARGET --> TOK{All target conditions match}
+    VOK -->|Yes| TARGET[Target check - affected resources vs the TARGET conditions]
+    TARGET --> TOK{Any TARGET alternative satisfied - none present counts as satisfied}
     TOK -->|Yes| HANDLER
     TOK -->|No| DENYT[403 - resource state not permitted]
 ```
@@ -698,47 +698,65 @@ capability as well remains reachable without disturbing any of this -- see *Out 
 
 **Cases extending the grant does not reach.** Each case below is enforced by this design and
 covered by the end-to-end suite. The claim is not that a grant field would be an inelegant way
-to express them, but that there is no grant field that reaches them at all. The first block in
-each pair uses a hypothetical `condition=` argument on `add_role_permission` to stand for the
-capability-keyed shape; it is **not** proposed API, and it is shown failing.
+to express them, but that there is no grant field that reaches them at all. Each case shows the
+two object shapes side by side -- a `grant` carrying a hypothetical `condition=` clause, against
+this design's separate `condition` object -- and then the flow the first shape gets wrong. The
+clause-carrying `grant` is **not** proposed API; it stands for the capability-keyed shape and is
+shown failing.
 
 **1. A restriction that has to survive the other roles its holder has.** "The data-science role
 may mutate only `dev` models, whatever else the user holds."
 
-```python
-# HYPOTHETICAL capability-keyed shape -- the restriction does not hold.
-client.add_role_permission(
-    ds_role.id, "registered_model", "*", "EDIT", condition="tags.lifecycle = 'dev'"
-)
-# Any other role the same user holds, authored by a different admin, with no clause:
-client.add_role_permission(oncall_role.id, "registered_model", "*", "EDIT")
+This is the one case where the role is the subject, so the objects are shown per role.
 
-# UpdateRegisteredModel on a model tagged lifecycle=prod
-#   ds_role grant     -> clause fails, grant does not apply
-#   oncall_role grant -> no clause, applies everywhere -> EDIT
-#   max fold over applicable grants -> EDIT -> ALLOWED
-# The restriction is gone, and nothing about ds_role changed. To hold, it would have to be
-# duplicated onto every grant that could authorize the write, including grants on roles this
-# admin does not own.
+```python
+# HYPOTHETICAL capability-keyed shape -- not proposed API.
+# ds_role
+grant("registered_model", "*", "EDIT", condition="tags.lifecycle = 'dev'")
+# oncall_role -- authored by a different admin, carrying no clause
+grant("registered_model", "*", "EDIT")
 ```
 
 ```python
-# This design -- the restriction holds.
-client.add_role_permission(ds_role.id,     "registered_model", "*", "EDIT")
-client.add_role_permission(oncall_role.id, "registered_model", "*", "EDIT")
-client.add_condition(
-    role_id=ds_role.id,
-    resource_type="registered_model",
-    type="TARGET",
-    filter="tags.lifecycle = 'dev'",
-)
-
-# UpdateRegisteredModel on a model tagged lifecycle=prod
-#   grants still fold to EDIT, exactly as above
-#   applicable TARGET conditions for this user -> [ds_role's]
-#     oncall_role carries no condition, so it contributes no alternative
-#   OR over one alternative, which fails -> 403 DENIED
+# This design.
+# ds_role
+grant("registered_model", "*", "EDIT")
+condition("registered_model", type="TARGET", filter="tags.lifecycle = 'dev'")
+# oncall_role
+grant("registered_model", "*", "EDIT")
 ```
+
+```mermaid
+flowchart TD
+    subgraph HYP["HYPOTHETICAL - the clause rides on the grant"]
+        direction LR
+        H0["UpdateRegisteredModel on a model tagged lifecycle prod"]
+        H0 --> H1["ds_role grant - clause requires lifecycle dev"]
+        H0 --> H2["oncall_role grant - no clause"]
+        H1 --> H3["clause fails, so this grant is not applicable"]
+        H2 --> H4["no clause, so it is applicable everywhere - EDIT"]
+        H3 --> H5{"max fold over APPLICABLE grants"}
+        H4 --> H5
+        H5 --> H6["EDIT - ALLOWED. The restriction is gone and ds_role never changed"]
+    end
+    subgraph THIS["THIS DESIGN - the condition is keyed on role and resource type"]
+        direction LR
+        T0["UpdateRegisteredModel on a model tagged lifecycle prod"]
+        T0 --> T1["grants fold to EDIT, exactly as above"]
+        T1 --> T2["pool this user's TARGET conditions on registered_model"]
+        T2 --> T3["ds_role condition - requires lifecycle dev - fails"]
+        T2 --> T4["oncall_role holds none, so contributes NO alternative"]
+        T3 --> T5{"any alternative satisfied"}
+        T4 --> T5
+        T5 --> T6["no - 403 DENIED"]
+    end
+    HYP ~~~ THIS
+```
+
+The asymmetry at `T4` is what makes the restriction hold: an empty contribution is not a
+permissive one. Under the hypothetical shape the clause would have to be duplicated onto every
+grant that could authorize the write, including grants on roles this admin does not own, and
+missing one voids it silently.
 
 A role carrying a permissive same-type condition would still lift it -- see *Drawbacks*. A role
 carrying no condition cannot, and that is the ordinary case.
@@ -748,35 +766,49 @@ set the `lifecycle` tag."
 
 ```python
 # HYPOTHETICAL -- there is nothing for the clause to read.
-client.add_role_permission(
-    ds_role.id, "registered_model", "*", "EDIT", condition="tags.lifecycle != 'prod'"
-)
-
-# CreateRegisteredModel(name="fraud-model", tags={"lifecycle": "prod"})
-#   The clause asks about the resource's tags. The resource does not exist yet, and the tags
-#   in question are in the REQUEST BODY. There is no row to evaluate the clause against.
-# SetRegisteredModelTag("fraud-model", "lifecycle", "prod")
-#   Here a row does exist -- but the clause reads its CURRENT tags, so it judges the value
-#   being replaced rather than the value being written. A model already tagged dev passes,
-#   and the write that sets prod goes through.
+grant("registered_model", "*", "EDIT", condition="tags.lifecycle != 'prod'")
 ```
 
 ```python
 # This design -- the two questions are different condition types.
-client.add_condition(
-    role_id=ds_role.id,
-    resource_type="registered_model",
-    type="VALUE",                        # reads the request, not the resource
-    filter="tag_key != 'lifecycle'",
-)
-
-# CreateRegisteredModel(name="fraud-model", tags={"lifecycle": "prod"}) -> 403
-# SetRegisteredModelTag("fraud-model", "lifecycle", "dev")              -> 403
-# SetRegisteredModelTag("fraud-model", "team", "ml")                    -> 200
-#
-# A TARGET condition deliberately does NOT gate a create: no resource exists to judge. That
-# is why one clause slot cannot serve both questions.
+condition("registered_model", type="VALUE", filter="tag_key != 'lifecycle'")
 ```
+
+A resource clause reads the resource's *current* tags, which is the wrong side of the write. On a
+create there is no row at all; on a set-tag the row exists but holds the value being replaced.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate as Auth gate
+    participant Store
+
+    Note over Client,Store: HYPOTHETICAL - the clause reads the resource
+    Client->>Gate: CreateRegisteredModel with tag lifecycle prod
+    Gate->>Store: fetch the resource's current tags
+    Store-->>Gate: no such resource, it is being created
+    Gate-->>Client: nothing for the clause to be evaluated against
+
+    Client->>Gate: SetRegisteredModelTag lifecycle prod
+    Gate->>Store: fetch current tags
+    Store-->>Gate: lifecycle is dev
+    Note over Gate: the clause judges the value being REPLACED, not the one being WRITTEN
+    Gate-->>Client: 200 OK, and the model is now tagged prod
+
+    Note over Client,Store: THIS DESIGN - a VALUE condition reads the request
+    Client->>Gate: SetRegisteredModelTag lifecycle prod
+    Note over Gate: no resource read. The key being written is the subject
+    Gate-->>Client: 403 Forbidden
+```
+
+| Request under this design | Outcome |
+|---|---|
+| `CreateRegisteredModel(name="fraud-model", tags={"lifecycle": "prod"})` | 403 |
+| `SetRegisteredModelTag("fraud-model", "lifecycle", "dev")` | 403 |
+| `SetRegisteredModelTag("fraud-model", "team", "ml")` | 200 |
+
+A `TARGET` condition deliberately does not gate a create, because no resource exists to judge.
+That is why one clause slot cannot serve both questions.
 
 **3. Conditioning one child type when the creates are authorized by a container grant.**
 "Experiments this role creates may not carry `lifecycle`, while its prompt and model creates
@@ -785,32 +817,36 @@ stay unrestricted."
 ```python
 # HYPOTHETICAL -- creates are gated at the workspace level, so the workspace grant is the
 # only one available to carry the clause, and it authorizes every child type.
-client.add_role_permission(
-    ds_role.id, "workspace", "*", "USE", condition="tag_key != 'lifecycle'"
-)
-
-# CreateExperiment(tags={"lifecycle": "prod"})      -> denied      (intended)
-# CreateRegisteredModel(tags={"lifecycle": "prod"}) -> denied      (NOT intended)
-# CreatePrompt(tags={"lifecycle": "prod"})          -> denied      (NOT intended)
-#
-# Adding a resource_type field to the clause so it can name `experiment` alone is the
-# condition object, arrived at from the other direction.
+grant("workspace", "*", "USE", condition="tag_key != 'lifecycle'")
 ```
 
 ```python
 # This design -- the condition names its own resource type; the grant is untouched.
-client.add_role_permission(ds_role.id, "workspace", "*", "USE")
-client.add_condition(
-    role_id=ds_role.id,
-    resource_type="experiment",          # scopes the restriction, not the grant
-    type="VALUE",
-    filter="tag_key != 'lifecycle'",
-)
-
-# CreateExperiment(tags={"lifecycle": "prod"})      -> 403
-# CreateRegisteredModel(tags={"lifecycle": "prod"}) -> 200, untouched
-# CreatePrompt(tags={"lifecycle": "prod"})          -> 200, untouched
+grant("workspace", "*", "USE")
+condition("experiment", type="VALUE", filter="tag_key != 'lifecycle'")
 ```
+
+```mermaid
+flowchart TD
+    subgraph HYP["HYPOTHETICAL - one clause on the workspace grant"]
+        direction LR
+        HC["clause tag_key not lifecycle"] --> HW["workspace USE gate"]
+        HW --> HE["CreateExperiment - denied, intended"]
+        HW --> HM["CreateRegisteredModel - denied, NOT intended"]
+        HW --> HP["CreatePrompt - denied, NOT intended"]
+    end
+    subgraph THIS["THIS DESIGN - the condition names the type"]
+        direction LR
+        TC["condition scoped to experiment"] --> TW["workspace USE gate, unconditioned"]
+        TW --> TE["CreateExperiment - 403"]
+        TW --> TM["CreateRegisteredModel - 200, untouched"]
+        TW --> TP["CreatePrompt - 200, untouched"]
+    end
+    HYP ~~~ THIS
+```
+
+Adding a `resource_type` field to the clause so it can name `experiment` alone is the condition
+object, arrived at from the other direction.
 
 **4. A call that mutates resources it never names.** Transitioning a version with
 `archive_existing_versions=True` moves every other version already in the target stage to
@@ -818,63 +854,83 @@ client.add_condition(
 
 ```python
 # HYPOTHETICAL -- the clause is evaluated for the resource the request names.
-client.add_role_permission(
-    ds_role.id, "registered_model_version", "*", "EDIT",
-    condition="tags.lifecycle = 'dev'",
-)
-
-# Model `fraud-model`: version 1 tagged lifecycle=prod and parked in Staging,
-#                      version 2 tagged lifecycle=dev.
-# TransitionModelVersionStage("fraud-model", 2, "Staging", archive_existing_versions=True)
-#   The request names version 2, which passes the clause -> ALLOWED
-#   Version 1 is archived as a side effect, though the role may not touch it.
-# A grant confers a level over a resource pattern. Nothing in it designates "the set of
-# resources this call will affect" as the thing to judge.
+grant("registered_model_version", "*", "EDIT", condition="tags.lifecycle = 'dev'")
 ```
 
 ```python
 # This design -- a TARGET condition is defined over the resources the call affects.
-client.add_condition(
-    role_id=ds_role.id,
-    resource_type="registered_model_version",
-    type="TARGET",
-    filter="tags.lifecycle = 'dev'",
-)
-
-# TransitionModelVersionStage("fraud-model", 2, "Staging", archive_existing_versions=True)
-#   version 2 (named) and version 1 (archived as a side effect) are both judged
-#   -> 403 while version 1 is tagged lifecycle=prod
-#   -> 200 once every version the archive reaches passes
-#   -> 200 when the failing version sits outside the stage the archive reaches
-#   -> 200 for the same transition without archive_existing_versions, which names only one
+condition("registered_model_version", type="TARGET", filter="tags.lifecycle = 'dev'")
 ```
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate as Auth gate
+    participant Registry
+
+    Note over Client,Registry: fraud-model - version 1 tagged prod in Staging, version 2 tagged dev
+
+    Note over Client,Registry: HYPOTHETICAL - judge the resource the request names
+    Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
+    Gate->>Gate: evaluate the clause for version 2, which is tagged dev and passes
+    Gate-->>Registry: ALLOWED
+    Registry->>Registry: move version 2 into Staging
+    Registry->>Registry: archive version 1 as a side effect
+    Note over Registry: version 1 was tagged prod and the role may not touch it
+
+    Note over Client,Registry: THIS DESIGN - judge every resource the call affects
+    Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
+    Gate->>Registry: which versions does this archive reach
+    Registry-->>Gate: version 2 named, version 1 archived
+    Gate->>Gate: evaluate both, and version 1 is tagged prod so it fails
+    Gate-->>Client: 403 Forbidden
+```
+
+A grant confers a level over a resource pattern. Nothing in it designates "the set of resources
+this call will affect" as the thing to judge.
+
+| Same transition under this design | Outcome |
+|---|---|
+| while version 1 is tagged `lifecycle=prod` | 403 |
+| once every version the archive reaches passes | 200 |
+| when the failing version sits outside the stage the archive reaches | 200 |
+| without `archive_existing_versions`, which names only one version | 200 |
 
 **5. A restriction finer than any permission level.** "May not set the `champion` alias, but may
 set tags freely."
 
 ```python
 # HYPOTHETICAL -- no level separates the two, so there is nothing to key the clause on.
-client.add_role_permission(ds_role.id, "registered_model", "*", "EDIT")
-#   EDIT carries a single can_update, which authorizes the alias routes and the tag routes
-#   together. Dropping to READ removes both. A new level between them would have to be
-#   defined per field, and a level is a fixed bundle of capabilities, not a field selector.
+grant("registered_model", "*", "EDIT")
 ```
 
 ```python
 # This design -- the condition names the field.
-client.add_condition(
-    role_id=ds_role.id,
-    resource_type="registered_model",
-    type="VALUE",
-    filter="alias != 'champion'",
-)
-
-# SetRegisteredModelAlias("fraud-model", "champion", 3) -> 403
-# SetRegisteredModelAlias("fraud-model", "candidate", 3) -> 200
-# SetRegisteredModelTag("fraud-model", "team", "ml")     -> 200, tag routes unaffected
-#
-# The converse holds too: a tag clause does not gate an alias route.
+condition("registered_model", type="VALUE", filter="alias != 'champion'")
 ```
+
+```mermaid
+flowchart TD
+    subgraph HYP["HYPOTHETICAL - keyed on the level"]
+        direction LR
+        HE["EDIT"] --> HU["one can_update"]
+        HU --> HA["alias routes - authorized"]
+        HU --> HT["tag routes - authorized"]
+        HE --> HR["drop to READ instead"]
+        HR --> HN["removes BOTH, so tag writes are lost too"]
+    end
+    subgraph THIS["THIS DESIGN - keyed on the field"]
+        direction LR
+        TC["clause alias not champion"] --> TA["SetRegisteredModelAlias champion - 403"]
+        TC --> TB["SetRegisteredModelAlias candidate - 200"]
+        TC --> TT["SetRegisteredModelTag team ml - 200, tag routes unaffected"]
+    end
+    HYP ~~~ THIS
+```
+
+A level is a fixed bundle of capabilities, not a field selector: a new level between `READ` and
+`EDIT` would have to be defined per field. The converse holds too -- a tag clause does not gate
+an alias route.
 
 ### B. Single operation-keyed condition object
 
