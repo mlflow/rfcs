@@ -210,6 +210,22 @@ Neither requires moving resources or per-resource admin work.
   operations on a type. Distinguishing "editable while `dev`, deletable only while `prod`" would
   require per-operation target conditions; this is intentionally not supported in favor of the
   simpler uniform model.
+- **Per-capability conditions.** A condition carries no level, so it narrows every capability the
+  role holds on that type alike. "May read models tagged `env=prod` or `env=dev`, but may only
+  edit the `dev` ones" is therefore not expressible here: the write half is a `TARGET` condition
+  on `env=dev`, but the read half needs `SEARCH`, which is out of scope above.
+
+  That expectation is a reasonable one, and the shape chosen here is what keeps it cheap rather
+  than what forecloses it. The missing piece is a capability selector on the condition: when a
+  request checks capability C, keep the conditions whose selector names C or names nothing, and
+  combine them exactly as today. The grant fold is untouched -- it still resolves one effective
+  level per resource -- so this is one optional column plus a filter applied ahead of the
+  existing combination, not a change to how permissions are resolved. Because capabilities are
+  already tracked individually (`can_read`, `can_update`, `can_delete`, and so on), that one
+  selector would also subsume the per-operation granularity above. Attaching conditions to
+  grants is what would make this harder rather than easier: the fold would then have to run once
+  per matching condition set rather than once per resource, and because conditions may overlap,
+  one request can match several, which leaves no single key to fold on.
 - **Fields beyond tags and aliases.** The initial implementation conditions only on tag and
   alias values (the value namespace `tag_key`/`tag_value`/`alias`, and the target namespace
   `tags.*`/`aliases.*`). The design is extendable to other request and resource fields.
@@ -632,26 +648,51 @@ column, a table rename, or a data migration. See *Out of scope*.
 ### A. Attach conditions to the existing grant (capability-keyed)
 
 Extend the existing grant with condition clauses keyed by capability (update, delete, and so
-on), rather than modeling a condition as its own object.
+on), rather than modeling a condition as its own object. This is the natural first instinct, and
+in isolation it reads well: `(registered_model, *, READ, env=prod)` beside
+`(registered_model, *, EDIT, env=dev)` expresses a per-level case directly.
 
-**Rejected because** a grant's job is to confer a level (READ, USE, EDIT, MANAGE) on a resource
-type and pattern, answering what a role can do, while a condition carries no level and only
-narrows, answering under what conditions. That difference makes the separation necessary rather
-than cosmetic:
+**Rejected because** a restriction attached to a grant is only as strong as the grants nobody
+attached it to. Three consequences, in descending order of weight:
 
-- The restriction is level-independent: "may not set `lifecycle`" or "may only mutate `dev`"
-  holds no matter which write capability the operation checks, so it is a property of the role's
-  relationship to the type, not of any one grant.
-- Attaching it to a grant would tie it to that grant's level, and since a role can hold several
-  grants on the same type with the highest applicable one winning, it would be ambiguous which
-  grant's condition applies.
-- Create is gated at the workspace level, so a create-time value restriction has no
-  resource-type grant to hang off.
+- **A grant-attached restriction is void as soon as any other grant authorizes the operation.**
+  Applicable grants fold by `max` on level, and a grant carrying no condition is applicable
+  everywhere, so a single unconditioned `EDIT` grant -- what a broad platform role holds --
+  re-opens everything a conditioned `EDIT` grant was narrowing. The restriction would have to be
+  repeated on every grant that could authorize the operation, including grants on roles authored
+  by other admins, and missing one voids it silently. Keying on `(role, resource_type)` instead
+  composes: a user's conditions of a type are alternatives, but a role holding *no* condition
+  contributes no alternative, so merely holding another role cannot lift a restriction. (A role
+  holding a permissive *same-type condition* can, which is the gap recorded under *Drawbacks*.
+  The point here is that the ordinary case -- an unconditioned role -- cannot.)
+- **A grant has one condition slot, and request restrictions are not resource restrictions.** A
+  condition hanging off a grant is naturally a predicate on the resource: this grant applies to
+  models tagged `dev`. A value restriction has no resource to predicate on -- it judges the tags
+  and aliases the request is trying to write, before any resource is read, and on a create before
+  one exists. The slot would have to mean one of two different things depending on its content,
+  which is the `condition_type` distinction reintroduced inside the grant rather than avoided by
+  it.
+- **Create is gated at the workspace level, so a create-time value restriction has no
+  resource-type grant to hang off.** Attaching it to `(workspace, USE)` applies it to every child
+  type at once -- experiments, registered models, prompts, scorers -- when the intent was one of
+  them, and still leaves unsaid whether `env=prod` constrains what the caller may pass or which
+  resources the caller may touch.
 
-Keying the condition on `(role, resource_type)` with optional direct-parent scope, independent
-of level, removes the ambiguity and covers create. This contrasts cleanly with the merged
-sub-resource-permissions RFC's `NONE`, which is a grant because it is a level (absolute-deny),
-whereas conditions are not levels and instead layer over whatever level the grants conferred.
+Keying the condition on `(role, resource_type)` with optional direct-parent scope, independent of
+level, removes all three. This contrasts cleanly with the merged sub-resource-permissions RFC's
+`NONE`, which is a grant because it is a level (absolute-deny), whereas conditions are not levels
+and instead layer over whatever level the grants conferred.
+
+**`condition_type` is not a capability in disguise.** `VALUE` and `TARGET` name which question a
+filter answers -- what a request may set, versus which existing resources it may touch -- not
+which capability it gates. The two are orthogonal in both directions: one operation can need
+both, as in the *Basic example* above, where a single set-tag call is judged by a `VALUE`
+condition on the tag being written and a `TARGET` condition on the model being mutated; and one
+type spans many operations, as `TARGET` on `registered_model` governs set-tag, delete-tag,
+set-alias, rename, and delete alike. They also differ mechanically, which is why one slot cannot
+serve both: `VALUE` needs no resource read and treats a missing key as vacuous, while `TARGET`
+fetches or pushes down a predicate and treats a missing key as a failure. Conditioning on the
+capability as well remains reachable without disturbing any of this -- see *Out of scope*.
 
 ### B. Single operation-keyed condition object
 
