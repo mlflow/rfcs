@@ -872,22 +872,39 @@ sequenceDiagram
 
     Note over Client,Registry: HYPOTHETICAL - judge the resource the request names
     Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
+    Note over Gate: the request designates version 2, so that is what the gate is asked about
     Gate->>Gate: evaluate the clause for version 2, which is tagged dev and passes
     Gate-->>Registry: ALLOWED
     Registry->>Registry: move version 2 into Staging
     Registry->>Registry: archive version 1 as a side effect
-    Note over Registry: version 1 was tagged prod and the role may not touch it
+    Note over Gate,Registry: the pattern would have matched version 1, but nothing ever asked
 
-    Note over Client,Registry: THIS DESIGN - judge every resource the call affects
+    Note over Client,Registry: THIS DESIGN - the route declares the cascade it will trigger
     Client->>Gate: TransitionModelVersionStage version 2 to Staging, archive existing
-    Gate->>Registry: which versions does this archive reach
-    Registry-->>Gate: version 2 named, version 1 archived
-    Gate->>Gate: evaluate both, and version 1 is tagged prod so it fails
+    Note over Gate: archive flag set, so add a cascade context narrowed to the target stage
+    Gate->>Registry: does this model hold a version in that stage which fails
+    Registry-->>Gate: yes, version 1 is tagged prod
     Gate-->>Client: 403 Forbidden
 ```
 
-A grant confers a level over a resource pattern. Nothing in it designates "the set of resources
-this call will affect" as the thing to judge.
+**The wildcard does not help here, and it is worth being precise about why.** A resource pattern
+answers a filtering question -- the gate is asking about resource R, does this grant apply to R?
+It is a predicate on a resource already in hand, not a way to discover further resources to ask
+about. The request designates version 2, so version 2 is what the gate is asked about; version 1
+is archived inside the store after authorization has already returned. A `*` pattern would have
+matched version 1, but nothing ever asks. Widening the pattern cannot change that, because the
+pattern is not what determines the set being judged.
+
+What determines it is the route, which has to declare the cascade: when
+`archive_existing_versions` is set, the gate adds a context narrowed to the stage the archive
+actually reaches. The children are never enumerated -- the context names the parent and the gate
+asks the store whether that parent holds a child that fails, in one query.
+
+In fairness, that declaration could in principle be attached to a grant-carried clause too, so
+this case is not proof that no grant field could ever reach it. What it shows is narrower and
+still decisive: the grant's own vocabulary -- a level over a pattern -- does not reach it, the
+work has to be done per route either way, and a clause on the grant would additionally inherit
+the fold described in case 1, where any unconditioned `EDIT` grant re-opens the archive.
 
 | Same transition under this design | Outcome |
 |---|---|
