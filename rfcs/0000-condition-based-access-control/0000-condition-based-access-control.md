@@ -728,14 +728,16 @@ serve both: `VALUE` needs no resource read and treats a missing key as vacuous, 
 fetches or pushes down a predicate and treats a missing key as a failure. Conditioning on the
 capability as well remains reachable without disturbing any of this -- see *Out of scope*.
 
-**Cases extending the grant does not reach.** Each case below is enforced by this design and
-covered by the end-to-end suite. The claim is not that a grant field would be an inelegant way
-to express them, but that the grant's vocabulary -- a level over a resource pattern -- does not
-reach them, and that each repair converges on the condition object. Each case shows the
-two object shapes side by side -- a `grant` carrying a hypothetical `condition=` clause, against
-this design's separate `condition` object -- and then the flow the first shape gets wrong. The
-clause-carrying `grant` is **not** proposed API; it stands for the capability-keyed shape and is
-shown failing.
+**Where extending the grant goes wrong.** Each case below is enforced by this design and covered
+by the end-to-end suite. The claim is deliberately not that a clause on a grant cannot express
+these restrictions -- for the most part it can, and the first case concedes that it expresses a
+per-level restriction better than this design does. The claim is that one of two things happens:
+either the restriction fails to compose, because it becomes a property of the grant carrying it
+rather than of the role holding it, or the repair converges on the condition object by adding the
+fields a condition already has. Each case shows the two object shapes side by side -- a `grant`
+carrying a hypothetical `condition=` clause, against this design's separate `condition` object --
+and then the flow the first shape gets wrong. The clause-carrying `grant` is **not** proposed
+API; it stands for the capability-keyed shape and is shown failing.
 
 **1. A restriction that has to survive the other roles its holder has.** "The data-science role
 may mutate only `dev` models, whatever else the user holds."
@@ -793,6 +795,25 @@ missing one voids it silently.
 
 A role carrying a permissive same-type condition would still lift it -- see *Drawbacks*. A role
 carrying no condition cannot, and that is the ordinary case.
+
+The obvious repair is to stop leaving grants clause-less: give every grant condition fields of
+its own, so there is no unconditioned grant to fall through to. That turns the conditions into
+keys for the fold, which is where it gets expensive. The fold today resolves one effective level
+per resource; it would instead have to resolve one per matching condition set. Conditions may
+overlap, so a single request can match several sets at once, leaving no single key to fold on and
+forcing a precedence rule to be invented -- which set counts as the strongest match, before
+max-folding within it. Keying on `(role, resource_type)` leaves the fold untouched: it still
+resolves one level per resource, and conditions layer over whatever level it produced. The same
+reasoning is why attaching conditions to grants would make the per-capability extension harder
+rather than easier -- see *Out of scope*.
+
+It is worth being precise about what this case does and does not show, because the
+capability-keyed shape is not short of expressive power. It states a per-level restriction
+perfectly well in isolation, as the opening of this section concedes:
+`(registered_model, *, READ, lifecycle IN ('dev', 'prod'))` beside
+`(registered_model, *, EDIT, lifecycle = 'dev')` both reads correctly and folds correctly. What it
+cannot do is compose. The restriction becomes a property of the grant carrying it rather than of
+the role holding it, so it survives only for as long as no other applicable grant omits it.
 
 **2. A restriction on what a request may set, where there is no resource to judge.** "May not
 set the `lifecycle` tag."
@@ -880,42 +901,6 @@ flowchart TD
 
 Adding a `resource_type` field to the clause so it can name `experiment` alone is the condition
 object, arrived at from the other direction.
-
-**4. A restriction finer than any permission level.** "May not set the `champion` alias, but may
-set tags freely."
-
-```python
-# HYPOTHETICAL -- no level separates the two, so there is nothing to key the clause on.
-grant("registered_model", "*", "EDIT")
-```
-
-```python
-# This design -- the condition names the field.
-condition("registered_model", type="VALUE", filter="alias != 'champion'")
-```
-
-```mermaid
-flowchart TD
-    subgraph HYP["HYPOTHETICAL - keyed on the level"]
-        direction LR
-        HE["EDIT"] --> HU["one can_update"]
-        HU --> HA["alias routes - authorized"]
-        HU --> HT["tag routes - authorized"]
-        HE --> HR["drop to READ instead"]
-        HR --> HN["removes BOTH, so tag writes are lost too"]
-    end
-    subgraph THIS["THIS DESIGN - keyed on the field"]
-        direction LR
-        TC["clause alias not champion"] --> TA["SetRegisteredModelAlias champion - 403"]
-        TC --> TB["SetRegisteredModelAlias candidate - 200"]
-        TC --> TT["SetRegisteredModelTag team ml - 200, tag routes unaffected"]
-    end
-    HYP ~~~ THIS
-```
-
-A level is a fixed bundle of capabilities, not a field selector: a new level between `READ` and
-`EDIT` would have to be defined per field. The converse holds too -- a tag clause does not gate
-an alias route.
 
 ### B. Single operation-keyed condition object
 
