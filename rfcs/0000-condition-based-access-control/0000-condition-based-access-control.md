@@ -694,6 +694,42 @@ serve both: `VALUE` needs no resource read and treats a missing key as vacuous, 
 fetches or pushes down a predicate and treats a missing key as a failure. Conditioning on the
 capability as well remains reachable without disturbing any of this -- see *Out of scope*.
 
+**Cases extending the grant does not reach.** Each of the following is enforced by this design
+and covered by the end-to-end suite. The claim is not that a grant field would be an inelegant
+way to express them, but that there is no grant field that reaches them at all.
+
+1. **A restriction that survives the other roles its holder has.** "This role may mutate only
+   `dev` models, whatever else the user holds." No grant field does this: applicable grants fold
+   by `max` and a grant carrying no condition applies everywhere, so one broad `EDIT` grant on
+   another role re-opens it, and the restriction would have to be duplicated onto every grant
+   that could authorize the write. A `TARGET` condition on `(role, registered_model)` reading
+   `tags.env = 'dev'` holds, because a role carrying no condition contributes no alternative. (A
+   role carrying a permissive same-type condition still lifts it -- see *Drawbacks*.)
+2. **A restriction on what a request may set, where there is no resource to judge.** "May not set
+   the `lifecycle` tag." A condition hanging off a grant is a predicate on the resource that
+   grant applies to, and on a create no such resource exists yet. A `VALUE` condition reads the
+   request instead, so `tag_key != 'lifecycle'` gates an update and a create alike, while a
+   `TARGET` condition deliberately does not gate a create at all. That difference is what makes
+   the two types distinct rather than redundant.
+3. **Conditioning one child type when creates are authorized by a container grant.** "Experiments
+   this role creates may not carry `lifecycle`, while its prompt creates stay unrestricted."
+   Creates are gated at the workspace level, so the only grant available to hang a condition on
+   is `(workspace, USE)`, and a condition there covers every child type that grant authorizes:
+   experiments, registered models, prompts, scorers. Giving that condition a type field to
+   narrow it is the condition object, arrived at from the other direction. A condition names its
+   own `resource_type`, so a `registered_model` condition does not gate a prompt create.
+4. **A call that mutates resources it never names.** Transitioning a model version with
+   `archive_existing_versions` archives its siblings. A grant confers a level over a resource
+   pattern and has no vocabulary for "also judge every sibling this call will silently archive".
+   A `TARGET` condition is evaluated against the resources the call would affect, so the
+   transition is refused when a sibling in the stage the archive reaches fails the filter,
+   permitted when all of them pass, and unaffected by a failing version outside that stage.
+5. **A restriction finer than any level.** "May not set the `champion` alias, but may set tags
+   freely." `EDIT` carries a single `can_update`, which authorizes alias writes and tag writes
+   together, so no level -- existing or added -- separates them. A `VALUE` condition names the
+   field instead: `alias NOT IN ('champion')` gates the alias routes and leaves the tag routes
+   alone, and a tag clause likewise does not gate an alias route.
+
 ### B. Single operation-keyed condition object
 
 Model one object keyed on the operation (for example update-registered-model) carrying request
