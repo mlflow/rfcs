@@ -740,15 +740,43 @@ and then the flow the first shape gets wrong. The clause-carrying `grant` is **n
 API; it stands for the capability-keyed shape and is shown failing.
 
 **1. A restriction that has to survive the other roles its holder has.** "The data-science role
-may mutate only `dev` models, whatever else the user holds."
+may mutate only `dev` models, whatever else the user holds." The role is the subject here, so the
+objects are shown per role.
 
-This is the one case where the role is the subject, so the objects are shown per role.
+**What the capability-keyed shape does well.** A per-level restriction, which it states more
+directly than this design does, and folds correctly.
 
 ```python
 # HYPOTHETICAL capability-keyed shape -- not proposed API.
+grant("registered_model", "*", "READ", condition="tags.lifecycle IN ('dev', 'prod')")
+grant("registered_model", "*", "EDIT", condition="tags.lifecycle = 'dev'")
+```
+
+```mermaid
+flowchart TD
+    subgraph OK["capability-keyed, one role - the fold lands on the right level"]
+        direction LR
+        A0["model tagged lifecycle dev"] --> A1["READ clause dev or prod - applies"]
+        A0 --> A2["EDIT clause dev - applies"]
+        A1 --> A3{"max fold"}
+        A2 --> A3
+        A3 --> A4["EDIT"]
+        B0["model tagged lifecycle prod"] --> B1["READ clause dev or prod - applies"]
+        B0 --> B2["EDIT clause dev - does NOT apply"]
+        B1 --> B3{"max fold"}
+        B2 --> B3
+        B3 --> B4["READ"]
+    end
+```
+
+**What it cannot do.** Compose. The restriction is a property of the grant carrying it, not of
+the role holding it.
+
+```python
+# HYPOTHETICAL -- ds_role restricted, and a second role authored by a different admin.
 # ds_role
 grant("registered_model", "*", "EDIT", condition="tags.lifecycle = 'dev'")
-# oncall_role -- authored by a different admin, carrying no clause
+# oncall_role
 grant("registered_model", "*", "EDIT")
 ```
 
@@ -788,32 +816,47 @@ flowchart TD
     HYP ~~~ THIS
 ```
 
-The asymmetry at `T4` is what makes the restriction hold: an empty contribution is not a
-permissive one. Under the hypothetical shape the clause would have to be duplicated onto every
-grant that could authorize the write, including grants on roles this admin does not own, and
-missing one voids it silently.
+**Why clause fields on the grant do not fix it.** Leave no grant unconditioned, and the clause
+has to mean one of two incompatible things.
 
-A role carrying a permissive same-type condition would still lift it -- see *Drawbacks*. A role
-carrying no condition cannot, and that is the ordinary case.
+```python
+# HYPOTHETICAL -- the repair: clause fields on the grant itself, so none is unconditioned.
+# ds_role
+grant("registered_model", "*", "EDIT",
+      read=None, value=None, target="tags.lifecycle = 'dev'")
+# oncall_role -- a different admin, a different clause, also satisfied
+grant("registered_model", "*", "EDIT",
+      read=None, value=None, target="tags.team = 'ml'")
+```
 
-The obvious repair is to stop leaving grants clause-less: give every grant condition fields of
-its own, so there is no unconditioned grant to fall through to. That turns the conditions into
-keys for the fold, which is where it gets expensive. The fold today resolves one effective level
-per resource; it would instead have to resolve one per matching condition set. Conditions may
-overlap, so a single request can match several sets at once, leaving no single key to fold on and
-forcing a precedence rule to be invented -- which set counts as the strongest match, before
-max-folding within it. Keying on `(role, resource_type)` leaves the fold untouched: it still
-resolves one level per resource, and conditions layer over whatever level it produced. The same
-reasoning is why attaching conditions to grants would make the per-capability extension harder
-rather than easier -- see *Out of scope*.
+```mermaid
+flowchart TD
+    subgraph FORK["HYPOTHETICAL - a clause on a grant must mean one of two things"]
+        direction LR
+        F0["UpdateRegisteredModel on a model tagged lifecycle prod, team ml"]
+        F0 --> SEL["reading A - the clause SELECTS applicability"]
+        F0 --> VET["reading B - the clause VETOES"]
+        SEL --> S1["ds_role clause fails, so its grant drops out"]
+        S1 --> S2["oncall_role clause passes, so its EDIT applies"]
+        S2 --> S3["max fold - EDIT - the restriction is void again"]
+        VET --> V1["grants stop being purely additive"]
+        V1 --> V2["must know which clauses govern THIS request"]
+        V2 --> V3["group grants by clause set, but the sets overlap"]
+        V3 --> V4["no single key to fold on, so a precedence rule is invented"]
+    end
+    subgraph SEP["THIS DESIGN - the two questions are separated"]
+        direction LR
+        L0["grants SELECT, additively, folding to one level per resource as today"]
+        L0 --> L1["conditions VETO, keyed on role and resource type"]
+        L1 --> L2["no clause key, no precedence rule"]
+    end
+    FORK ~~~ SEP
+```
 
-It is worth being precise about what this case does and does not show, because the
-capability-keyed shape is not short of expressive power. It states a per-level restriction
-perfectly well in isolation, as the opening of this section concedes:
-`(registered_model, *, READ, lifecycle IN ('dev', 'prod'))` beside
-`(registered_model, *, EDIT, lifecycle = 'dev')` both reads correctly and folds correctly. What it
-cannot do is compose. The restriction becomes a property of the grant carrying it rather than of
-the role holding it, so it survives only for as long as no other applicable grant omits it.
+The same reasoning is why attaching conditions to grants would make the per-capability extension
+harder rather than easier -- see *Out of scope*. A role carrying a permissive same-type condition
+would still lift the restriction here -- see *Drawbacks*. A role carrying no condition cannot,
+and that is the ordinary case.
 
 **2. A restriction on what a request may set, where there is no resource to judge.** "May not
 set the `lifecycle` tag."
