@@ -9,11 +9,11 @@ rfc_pr:
 ## Summary
 
 Make agents the primary GenAI container in MLflow. Each agent has a persistent identity and
-immutable snapshots of its declared manifest that connect source code and AI asset dependencies with
-traces and evaluations. Teams can compare snapshots, approve them based on evidence, and investigate
-production issues. Other agents can discover approved agents through the registry. Eligible
-experiments can be converted to agents, while experiments remain supported for existing workflows
-and model training.
+immutable snapshots of its declared composition that connect source code and AI asset dependencies
+with traces and evaluations. Teams can compare snapshots, activate them based on evidence, and
+investigate production issues. Other agents can discover available agents through the registry.
+Eligible experiments can be converted to agents, while experiments remain supported for existing
+workflows and model training.
 
 OSS MLflow provides the default registry backend. Managed deployments can instead resolve agent
 records from an authoritative catalog or gateway, such as Unity AI Gateway. This draft seeks
@@ -53,9 +53,10 @@ Gateway) authoritative while MLflow resolves its agent records.
 
 ## User journeys
 
-A **snapshot** is MLflow's immutable record of an agent manifest, its resolved assets, and source
-metadata. Traces and evaluations refer to the agent container or a snapshot ID. A **revision** is an
-author-supplied marker for uncommitted code; it does not save that code.
+A **snapshot** is MLflow's immutable record of an agent's declared composition, resolved assets, and
+source metadata when available. Traces and evaluations refer to the agent container or a snapshot
+ID. A source **revision** is a Git commit when the code is committed, or an author-supplied marker
+for uncommitted code; the marker does not save that code.
 
 Tracing and evaluation still work as they do today. Snapshots connect those results to recorded
 source and declared AI assets; trace links show which assets a request actually used when available.
@@ -70,8 +71,9 @@ source and declared AI assets; trace links show which assets a request actually 
 
 ### Test an agent update
 
-1. Declare the agent in a manifest and run `mlflow.genai.evaluate`. MLflow infers the current commit
-   from a clean Git checkout when no source commit is supplied; the run records the snapshot ID.
+1. Declare the agent in a manifest and run `mlflow.genai.evaluate`. MLflow infers the current Git
+   commit as the source revision from a clean checkout when none is supplied; the run records the
+   snapshot ID.
 2. Change the code or its declared assets and evaluate again. A new commit or resolved asset creates
    a draft snapshot. If the Git checkout is dirty, the author supplies a `revision` to distinguish
    the local code state.
@@ -145,11 +147,9 @@ An agent author can declare its composition in `mlflow-agent.yaml`:
 name: support-agent
 version: { fromEnv: APP_VERSION }
 sources:
-  code:
-    kind: git
-    repository: https://github.com/example/support-agent
-    commit: { fromEnv: GIT_COMMIT }
-declared_assets:
+  - repository: https://github.com/example/support-agent
+    revision: { fromEnv: GIT_COMMIT }
+assets:
   prompts:
     system: prompts:/support@production
 ```
@@ -194,8 +194,8 @@ experiment. Each belongs to exactly one container. Relevant SDK and REST APIs ac
 association; autologging, trace ingestion, and trace search support it for traces.
 
 Agent names are unique within a workspace and cannot be renamed. An `AgentRef` pairs a name with an
-optional snapshot ID for APIs that select an agent or an exact registered composition; `version`
-alone need not identify one snapshot. `set_agent` and agent-level APIs such as dataset creation
+optional snapshot ID for APIs that select an agent or an exact registered composition. A publisher
+version may identify multiple snapshots. `set_agent` and agent-level APIs such as dataset creation
 accept the name directly.
 
 Illustrative API changes, with final names TBD:
@@ -211,7 +211,7 @@ system_prompt = agent.assets.prompts["system"]  # Resolved PromptVersion
 candidate = mlflow.set_agent(
     name="support-agent",
     version="2",
-    declared_assets={"prompts": {"system": "prompts:/support@production"}},
+    assets={"prompts": {"system": "prompts:/support@production"}},
 )
 snapshot_id = candidate.snapshot_id  # None when only the agent container is selected
 
@@ -233,28 +233,28 @@ With no manifest or other snapshot inputs, `set_agent(name=...)` selects the age
 traces remain at the agent level. A manifest or explicit snapshot input finds or creates a snapshot
 and returns its ID.
 
-The `declared_assets` groups named registry URIs by type; the returned agent from `set_agent`
-resolves them on access, reusing registry loading and caching behavior.
+`assets` groups named registry URIs by type; the handle returned by `set_agent` resolves them on
+access, reusing registry loading and caching behavior.
 
-The new `environment` field applies to traces and evaluation runs, not snapshots.
+`environment` applies to traces and evaluation runs, not snapshots.
 
 `set_agent` can load `mlflow-agent.yaml` by default, or use a manifest path supplied directly or
 through an environment variable. Explicit arguments replace the corresponding manifest fields.
 
-The manifest may read its publisher version or Git commit from a named environment variable, such as
-`version: {fromEnv: APP_VERSION}`. MLflow resolves the value when creating the snapshot and stores
-the resolved value; a referenced variable that is unset is an error. A release pipeline can supply
-the version and commit directly when creating the snapshot or set the variables referenced by the
-manifest.
+The manifest may read its publisher version or Git revision from a named environment variable, such
+as `version: {fromEnv: APP_VERSION}`. MLflow resolves the value when creating the snapshot and
+stores the resolved value; a referenced variable that is unset is an error. A release pipeline can
+supply the version and revision directly when creating the snapshot or set the variables referenced
+by the manifest.
 
-MLflow infers the commit from a clean Git checkout when none is declared. With uncommitted code, the
-commit alone cannot distinguish one local candidate from another. An author-supplied `revision`
-becomes part of snapshot identity, so changing it gives each candidate its own trace and evaluation
-evidence for comparisons without committing the changes. A dirty checkout requires a revision to
-create a snapshot, supplied in the manifest, through `set_agent(revision=...)`, or through an
-environment variable. An explicit override allows proceeding despite the dirty Git state, with
-traces kept at the agent level instead of assigned to a snapshot. With no Git checkout, a
-manifest-only snapshot is allowed without code provenance.
+MLflow infers the Git commit as the source revision from a clean checkout when none is declared.
+With uncommitted code, the commit alone cannot distinguish one local candidate from another. An
+author-supplied source `revision` becomes part of snapshot identity, so changing it gives each
+candidate its own trace and evaluation evidence for comparisons without committing the changes. A
+dirty checkout requires a source revision to create a snapshot, supplied in the manifest, through
+`set_agent(sources=...)`, or through an environment variable. An explicit override allows proceeding
+despite the dirty Git state, with traces kept at the agent level instead of assigned to a snapshot.
+With no Git checkout, a manifest-only snapshot is allowed without code provenance.
 
 The registry atomically finds or creates a snapshot for the resolved declaration. A new snapshot
 gets the next number under its agent and starts in `draft` status. A prior matching snapshot is
@@ -372,14 +372,14 @@ class HarnessInfo(TypedDict):
 
 
 class GitSource(TypedDict):
-    kind: Literal["git"]
+    type: Literal["git"]
     repository: str | None
-    commit: str | None  # None when revision is supplied
+    revision: str | None  # Git commit or author-supplied marker for uncommitted code
     subpath: str | None
 
 
 class ImageSource(TypedDict):
-    kind: Literal["oci_image"]
+    type: Literal["oci_image"]
     image: str
     digest: str
 
@@ -405,8 +405,7 @@ class AgentSnapshot(TypedDict):
     agent_name: str
     snapshot_id: str  # Server-assigned, monotonically increasing within the agent
     version: str | None  # Optional publisher-supplied metadata
-    revision: str | None  # Author-supplied marker for uncommitted source
-    sources: dict[str, SourceRef]
+    sources: list[SourceRef]
     harness: HarnessInfo | None
     registered_assets: dict[str, dict[str, str]]  # Named, pinned registry URIs
     external_models: list[ExternalModelRef]
@@ -426,8 +425,7 @@ class AgentAccessEndpoint(TypedDict):
     protocol: Literal["a2a", "mcp", "custom"]
     custom_protocol: dict | None  # Required for custom: protocol name and interface definition
     transport_type: str  # Protocol-specific; MCP uses streamable-http or sse
-    snapshot_id: str | None  # At most one of snapshot_id / version
-    version: str | None  # Resolve to newest active snapshot with this publisher version
+    version: str | None  # Advertised publisher version, if known; not a snapshot selector
     capabilities: list[dict]  # Advertised for this access route
     a2a_card: dict | None  # Last-synced card for this access route
     created_by: str | None
@@ -456,8 +454,8 @@ endpoints can supply them directly using the same AgentSkill shape.
 
 Composition follows these rules:
 
-- The manifest declares named asset references, sources, harness, external models, and optional
-  publisher version and revision. MLflow stores their resolved, canonical values in the snapshot.
+- The manifest declares named asset references, sources, harness, external models, and an optional
+  publisher version. MLflow stores their resolved, canonical values in the snapshot.
 - The manifest may reference asset aliases. `registered_assets` stores their resolved, pinned URIs,
   such as `prompts:/name/version` or `skills:/name/version`, under their declared names. The URI
   remains in the snapshot even if the referenced asset later becomes unavailable.
@@ -465,32 +463,27 @@ Composition follows these rules:
 - `registered_assets` and `external_models` are optional when registering a snapshot.
 - Declared and observed tools are distinguished by origin and may link to a registered MCP server
   using a version-pinned URI.
-- `harness` is optional. Named sources can identify code or harness configuration; Git sources can
-  point to a subpath. Sources initially support Git commits and image digests.
-- When a revision is supplied, `GitSource.commit` is `None`: the commit cannot identify uncommitted
-  code. The revision distinguishes that local state without making it retrievable.
+- `harness` is optional. Sources form a list; Git sources can point to a subpath. Sources initially
+  support Git revisions and image digests. The manifest requires `type` for an image and defaults to
+  `git` only when `repository` is present; it is not inferred from a URL suffix. Resolved sources
+  always include `type`.
+- A Git source revision is the commit for clean, committed code or an author-supplied marker for
+  uncommitted code. An author-supplied marker distinguishes local states without making them
+  retrievable.
 
-Snapshots with the same agent, publisher version, revision, resolved named assets, sources, harness,
-and external models are reused. Otherwise, MLflow assigns the next snapshot ID for that agent.
-Deleted snapshots are excluded from reuse. Undeclared code or dependency changes do not create a
-snapshot. `latest` selects the highest-numbered active snapshot; it is unresolved when none is
-active.
+Snapshots with the same agent, publisher version, resolved named assets, sources, harness, and
+external models are reused. Otherwise, MLflow assigns the next snapshot ID for that agent. Deleted
+snapshots are excluded from reuse. Undeclared code or dependency changes do not create a snapshot.
+`latest` selects the highest-numbered active snapshot; it is unresolved when none is active.
 
 Endpoints follow the [MCP access endpoint pattern](../0004-mcp-registry/0004-mcp-registry.md) for
 protocol and transport details. For `protocol="custom"`, `custom_protocol` describes the protocol
 name, interface, and integration requirements as JSON. This describes an endpoint, separately from
 the agent's `custom_descriptor`; the exact JSON structure remains TBD.
 
-An endpoint belongs to an agent and may pin a snapshot, select the latest active snapshot matching a
-publisher version, or leave its target unspecified. A version selector never resolves to a draft,
-deprecated, or deleted snapshot. The endpoint records its selector; read APIs can report separately
-whether that selector currently resolves. Its name identifies the access route. Endpoints serving
-multiple snapshots, such as A/B deployments, can leave the target unspecified; traces identify the
-snapshot actually used. An endpoint's URL, target, and cached A2A card can change without rewriting
-snapshot history. A snapshot explicitly pinned by an endpoint cannot be deleted; an endpoint using a
-version selector prevents deletion of its last eligible matching snapshot. Keep sync locations
-separate from access endpoints: a Git repository or card URL supplies metadata, while an endpoint
-identifies where consumers connect.
+An endpoint belongs to an agent and identifies an access route. Its optional publisher version is
+advertised to users and lets the UI show traces associated with the latest snapshot with that
+version in the agent container.
 
 #### Tools and relationships from traces
 
