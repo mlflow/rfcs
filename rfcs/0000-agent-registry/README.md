@@ -112,6 +112,14 @@ with links to the prompt version actually used when available.
 3. The user integrates the chosen endpoint, or the running agent retrieves details with `get_agent`
    and invokes the endpoint during the request.
 
+### Review a fleet of agents
+
+1. An operator creates a dev fleet and adds several cooperating agents, selecting the `dev`
+   environment for each membership.
+2. A developer who can read those agents' dev activity opens the fleet to compare quality and usage,
+   then filters its traces and sessions to selected agents.
+3. From the fleet's **Agents** tab, they open one agent to investigate its dev activity.
+
 ### Separate development and production activity
 
 1. An administrator defines `dev` and `prod` environments for the workspace. Developers can write
@@ -175,7 +183,8 @@ evaluations, and usage, with these changes:
   servers when known.
 
 The agent overview retains the GenAI experiment overview and adds first-class **Snapshot**,
-**Version**, and **Environment** filters. The environment filter includes unassigned activity.
+**Version**, and **Environment** filters. The environment filter includes unassigned activity. The
+main **Agents** page also supports filtering by fleet.
 
 Users can compare snapshots, see their evaluation results and production traces, and identify which
 prompt, tool, skill, model, or subagent changed. Harness-based agents can also identify the harness
@@ -277,6 +286,28 @@ This allows one export to contain traces from different agents or snapshots. MLf
 agent and snapshot pairing and environment permission. An agent that does not use the MLflow client
 may send a resolved manifest in the root span. With registration permission, MLflow can find or
 create a draft snapshot from its resolved contents and omit the manifest from stored spans.
+
+#### Agent fleets
+
+An agent can belong to multiple fleets in its workspace. A fleet has a stable ID, a mutable name,
+and a description of its purpose. The fleet owns its membership links to agents. Each link can
+optionally select a workspace environment; without a selector, it includes all environments and
+unassigned activity. Traces, sessions, and evaluation runs do not record fleet membership.
+
+In the UI, **Agent Fleets** opens a fleet overview with the GenAI quality and usage views, traces,
+and sessions across its agents. An agent multiselect filters these views, and an **Agents** tab
+links to each member's normal agent page with its selected environment applied. SDK and REST
+searches for agents, traces, sessions, and evaluations accept a fleet ID filter, with activity
+limited by each membership's environment selector.
+
+Fleet views reflect current membership, including past activity; sessions show only matching
+activity. Agents can appear in multiple fleets, so fleet totals are not additive. Membership does
+not change agent identity or activity ownership.
+
+Fleet ACLs govern reading and managing fleets. A fleet read succeeds with fleet read permission or
+read permission for every member's selected activity; otherwise it fails without partial results.
+Fleet read permission grants access only to selected activity, not other environments or writes.
+Adding a member requires manage permission on both the fleet and agent.
 
 #### Agent discovery
 
@@ -385,6 +416,19 @@ class ImageSource(TypedDict):
 
 
 SourceRef: TypeAlias = GitSource | ImageSource
+
+
+class AgentFleetMember(TypedDict):
+    agent_name: str
+    environment: str | None  # None selects all environments and unassigned activity
+
+
+class AgentFleet(TypedDict):
+    workspace: str | None
+    fleet_id: str  # Stable, server-assigned
+    name: str  # Mutable
+    description: str
+    members: list[AgentFleetMember]
 
 
 class Agent(TypedDict):
@@ -555,9 +599,9 @@ The work can be organized into three phases without committing to release bounda
 
 1. **Agent container:** Establish agent records and access checks through the configured registry
    backend. Make agents an alternative to experiments across GenAI APIs, autologging, trace
-   ingestion, search, and the UI. Add workspace environments, trace and evaluation permissions, and
-   environment filters. Support conversion of eligible experiments and compatibility for existing
-   clients.
+   ingestion, search, and the UI. Add optional agent fleets with fleet views and search filters,
+   workspace environments, trace and evaluation permissions, and environment filters. Support
+   conversion of eligible experiments and compatibility for existing clients.
 2. **Snapshots, discovery, and syncing:** Add agent manifests, snapshots, linked assets, harness and
    configuration metadata, endpoints, and governance. Add registration from manifests and
    snapshot-level trace and evaluation comparison. Expose discovery through SDK, REST, and the
