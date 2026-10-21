@@ -65,7 +65,7 @@ source and declared AI assets; trace links show which assets a request actually 
 
 1. Create an agent in the UI. It gets a persistent identity before any snapshot or endpoint is
    registered.
-2. Select it with `mlflow.set_agent(...)` and run the instrumented application.
+2. Select it by ID with `mlflow.set_agent(...)` and run the instrumented application.
 3. Open the agent's **Traces** page. When available, traces with a snapshot also link to recorded
    source (such as a Git commit) and declared assets.
 
@@ -152,7 +152,7 @@ eligible experiment. Agents can be registered before deployment, so an endpoint 
 An agent author can declare its composition in `mlflow-agent.yaml`:
 
 ```yaml
-name: support-agent
+agent_id: { fromEnv: MLFLOW_AGENT_ID }
 version: { fromEnv: APP_VERSION }
 sources:
   - repository: https://github.com/example/support-agent
@@ -202,45 +202,49 @@ Traces, evaluation runs, judges, and datasets can be associated with an agent in
 experiment. Each belongs to exactly one container. Relevant SDK and REST APIs accept the agent
 association; autologging, trace ingestion, and trace search support it for traces.
 
-Agent names are unique within a workspace and cannot be renamed. An `AgentRef` pairs a name with an
-optional snapshot ID for APIs that select an agent or an exact registered composition. A publisher
-version may identify multiple snapshots. `set_agent` and agent-level APIs such as dataset creation
-accept the name directly.
+Each agent has a globally unique, stable ID and a mutable name unique within its workspace. An
+`AgentRef` pairs the ID with an optional snapshot ID for APIs that select an agent or an exact
+registered composition. A publisher version may identify multiple snapshots. Agent-level APIs use
+the ID; names support discovery and display.
 
 Illustrative API changes, with final names TBD:
 
 ```python
+from mlflow import MlflowClient
 from mlflow.entities import AgentRef
 
+client = MlflowClient()
+agent_id = client.create_agent(name="support-agent")
 mlflow.set_experiment(experiment_id="123")  # Existing workflow
 mlflow.clear_active_destination()  # Switch from experiment to agent
-agent = mlflow.set_agent(name="support-agent")  # Uses mlflow-agent.yaml when present
+agent = mlflow.set_agent(agent_id=agent_id)  # Uses mlflow-agent.yaml when present
 system_prompt = agent.assets.prompts["system"]  # Resolved PromptVersion
 # Explicit fields can also declare a snapshot:
 candidate = mlflow.set_agent(
-    name="support-agent",
+    agent_id=agent_id,
     version="2",
     assets={"prompts": {"system": "prompts:/support@production"}},
 )
 snapshot_id = candidate.snapshot_id  # None when only the agent container is selected
 
 mlflow.search_traces(experiment_ids=["123"])
-mlflow.search_traces(agents=[AgentRef(name="support-agent", snapshot_id=snapshot_id)])
+mlflow.search_traces(agents=[AgentRef(agent_id=agent_id, snapshot_id=snapshot_id)])
 
-mlflow.genai.create_dataset(name="support-eval", agent_name="support-agent")
+mlflow.genai.create_dataset(name="support-eval", agent_id=agent_id)
+client.rename_agent(agent_id, "support-assistant")
 # create_dataset(..., experiment_id="123") remains supported.
 ```
 
 Explicit experiment and agent arguments are mutually exclusive. Setting an active agent while an
 experiment is active, or an experiment while an agent is active, is an error.
 
-Deployments can select an agent without calling `set_agent` by setting `MLFLOW_AGENT_NAME` and,
+Deployments can select an agent without calling `set_agent` by setting `MLFLOW_AGENT_ID` and,
 optionally, `MLFLOW_AGENT_SNAPSHOT_ID`. An explicit `set_agent` or `set_experiment` call takes
 precedence; without one, agent and experiment environment selectors cannot both be set.
 
-With no manifest or other snapshot inputs, `set_agent(name=...)` selects the agent container; its
-traces remain at the agent level. A manifest or explicit snapshot input finds or creates a snapshot
-and returns its ID.
+With no manifest or other snapshot inputs, `set_agent(agent_id=...)` selects the agent container;
+its traces remain at the agent level. A manifest or explicit snapshot input finds or creates a
+snapshot and returns its ID.
 
 `assets` groups named registry URIs by type; the handle returned by `set_agent` resolves them on
 access, reusing registry loading and caching behavior.
@@ -250,11 +254,10 @@ access, reusing registry loading and caching behavior.
 `set_agent` can load `mlflow-agent.yaml` by default, or use a manifest path supplied directly or
 through an environment variable. Explicit arguments replace the corresponding manifest fields.
 
-The manifest may read its publisher version or Git revision from a named environment variable, such
-as `version: {fromEnv: APP_VERSION}`. MLflow resolves the value when creating the snapshot and
-stores the resolved value; a referenced variable that is unset is an error. A release pipeline can
-supply the version and revision directly when creating the snapshot or set the variables referenced
-by the manifest.
+The manifest may read its agent ID, publisher version, or Git revision from a named environment
+variable, such as `version: {fromEnv: APP_VERSION}`. MLflow resolves the value when creating the
+snapshot and stores it; a referenced variable that is unset is an error. A release pipeline can
+supply these values directly or set the variables referenced by the manifest.
 
 MLflow infers the Git commit as the source revision from a clean checkout when none is declared.
 With uncommitted code, the commit alone cannot distinguish one local candidate from another. An
@@ -277,7 +280,7 @@ OTLP request headers provide defaults; root-span attributes can override them or
 
 | Field       | Request header               | Root-span attribute        |
 | ----------- | ---------------------------- | -------------------------- |
-| Agent       | `x-mlflow-agent-name`        | `mlflow.agent.name`        |
+| Agent       | `x-mlflow-agent-id`          | `mlflow.agent.id`          |
 | Snapshot    | `x-mlflow-agent-snapshot-id` | `mlflow.agent.snapshot_id` |
 | Environment | `x-mlflow-agent-environment` | `mlflow.agent.environment` |
 | Manifest    | —                            | `mlflow.agent.manifest`    |
@@ -358,8 +361,9 @@ OSS MLflow provides the default backend for agent identity and container metadat
 instead use another authoritative backend (e.g. Unity AI Gateway) to resolve agent records for
 discovery and enforce agent permissions. MLflow still owns snapshots and associates them, traces,
 and evaluations with the resolved agent; the external agent record need not be copied into MLflow's
-default registry tables. Agent names must be unique within a workspace. The backend interface and UI
-behavior for alternative backends remain follow-up design work.
+default registry tables. The configured backend supplies globally unique IDs and enforces
+workspace-unique names. The backend interface and UI behavior for alternative backends remain
+follow-up design work.
 
 #### Backwards compatibility and migration
 
@@ -419,7 +423,7 @@ SourceRef: TypeAlias = GitSource | ImageSource
 
 
 class AgentFleetMember(TypedDict):
-    agent_name: str
+    agent_id: str
     environment: str | None  # None selects all environments and unassigned activity
 
 
@@ -433,7 +437,8 @@ class AgentFleet(TypedDict):
 
 class Agent(TypedDict):
     workspace: str | None
-    name: str
+    agent_id: str  # Globally unique and stable; assigned by the configured registry backend
+    name: str  # Mutable, unique within the workspace
     description: str
     owner: str
     custom_descriptor: dict | None
@@ -446,7 +451,7 @@ class Agent(TypedDict):
 
 class AgentSnapshot(TypedDict):
     workspace: str | None
-    agent_name: str
+    agent_id: str
     snapshot_id: str  # Server-assigned, monotonically increasing within the agent
     version: str | None  # Optional publisher-supplied metadata
     sources: list[SourceRef]
@@ -463,7 +468,7 @@ class AgentSnapshot(TypedDict):
 
 class AgentAccessEndpoint(TypedDict):
     workspace: str | None
-    agent_name: str
+    agent_id: str
     name: str  # Unique within the agent; e.g., production or staging
     url: str
     protocol: Literal["a2a", "mcp", "custom"]
@@ -478,8 +483,8 @@ class AgentAccessEndpoint(TypedDict):
     last_updated_timestamp: int | None
 ```
 
-Agent-owned records identify their parent by workspace and agent name; snapshot IDs are unique
-within that agent. Public APIs use the current workspace when no workspace is supplied.
+Agent-owned records identify their parent by agent ID; snapshot IDs are unique within that agent.
+Public APIs use the current workspace when no workspace is supplied.
 
 Snapshot composition and source are immutable. Agent descriptors, endpoint capabilities and cards,
 snapshot status, and tags can change. Status follows the MCP and Skill registry lifecycle. Deleted
