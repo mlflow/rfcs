@@ -332,6 +332,11 @@ snapshots, and open the traces behind those results. From a trace, they can retu
 and registered prompts, models, tools, skills, and plugins. This connects production behavior to the
 assets that changed between snapshots.
 
+OTLP ingestion retains and indexes `service.instance.id` for SDK and REST trace search. The agent
+**Traces** view offers an **Instance ID** filter; a trace matches when one of its spans comes from
+that instance. This assumes one `service.namespace`/`service.name` pair sends traces to each agent
+container.
+
 Evaluation runs stay under the agent for comparison, including runs without a snapshot. Each run
 records its snapshot ID, if any, or shows that its traces used multiple snapshots.
 
