@@ -1016,7 +1016,8 @@ validation to fail rather than silently changing the requested scope. The
 client validates every selected skill and computes its content digest before
 sending a prepared batch to `POST /skills/bulk-register`. The endpoint invokes
 the store's `bulk_register_skills` operation, which registers the entire batch
-in one database transaction.
+in one database transaction. Each import is limited to 500 selected skills.
+Larger imports are rejected.
 
 Discovery stops descending at each skill root, even if that skill is filtered
 out. Nested manifests remain supporting content of the enclosing skill and are
@@ -1200,11 +1201,10 @@ package whose tree does not (for example, a Claude Code import or a directly
 registered source) keeps its original internal layout, so the pulled result
 reflects the source tree rather than a guaranteed Agent Plugins layout.
 
-**Digest verification.** Pull always computes the digest of fetched skill
-content. When the version has a recorded digest, a mismatch fails the pull.
-When it does not, the computed digest is available to the pull workflow but
-is not written back to the registry. Agent plugin pull applies the same
-behavior to every member and fails the whole pull on any recorded-digest
+**Digest verification.** When the version has a recorded digest, pull computes
+the digest of fetched skill content and a mismatch fails the pull. Otherwise,
+digest computation and verification are skipped. Agent plugin pull applies the
+same behavior to every member and fails the whole pull on any recorded-digest
 mismatch.
 
 `pull` is harness-agnostic. It downloads content but does not generate
