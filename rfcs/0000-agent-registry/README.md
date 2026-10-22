@@ -69,6 +69,17 @@ source and declared AI assets; trace links show which assets a request actually 
 3. Open the agent's **Traces** page. When available, traces with a snapshot also link to recorded
    source (such as a Git commit) and declared assets.
 
+### Trace an agent running in a harness
+
+1. Put the agent ID and declared assets in `mlflow-agent.yaml` and enable the MLflow Claude Code
+   tracing plugin.
+2. Start a session. The plugin detects the harness version and, when skill tracing is available,
+   registered skills installed in Claude Code's effective skill directories. MLflow creates or
+   reuses a snapshot from the resolved inputs.
+3. Open the agent's **Traces** page. The session links to its snapshot; skill links show which
+   available skills were activated. With only an agent ID and no manifest, the trace remains under
+   the agent without a snapshot.
+
 ### Test an agent update
 
 1. Declare the agent in a manifest and run `mlflow.genai.evaluate`. MLflow infers the current Git
@@ -275,6 +286,22 @@ version). A newly resolved declared asset from the alias moving can create a sna
 execution; each trace retains the snapshots and assets it actually used. A trace spanning different
 snapshots shows that mixture rather than claiming one snapshot. Arbitrary assets observed in traces
 do not trigger registration.
+
+#### Harness integrations
+
+An MLflow tracing plugin for a harness can read `mlflow-agent.yaml` to select the agent and supply
+snapshot inputs alongside the manifest. For example, the Claude Code plugin detects the harness name
+and version at session start. It resolves or creates a snapshot before exporting the session trace,
+following the same source revision and permission rules as other snapshot creation. Without a
+manifest or explicit snapshot inputs, it attaches the trace to the agent alone. Other harness
+integrations can use the same approach when they can identify their harness version and skill paths.
+
+After skill tracing is implemented, a plugin can scan the skill directories the harness actually
+loads. For skills pulled through MLflow, it verifies the marker against the installed content digest
+and adds the pinned skill URI to the snapshot's `registered_assets.skills`. Unmarked or modified
+skills are not recorded as registered versions. These detected assets describe skills available to
+the harness; the skill links on individual traces record which ones were activated. A changed set of
+verified available skills produces a different snapshot.
 
 OTLP request headers provide defaults; root-span attributes can override them or carry a manifest:
 
