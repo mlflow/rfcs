@@ -10,8 +10,8 @@ rfc_pr:
 
 Make agents the primary GenAI container in MLflow. Each agent has a persistent identity and
 immutable snapshots of its declared composition that connect source code and AI asset dependencies
-with traces and evaluations. Teams can compare snapshots, activate them based on evidence, and
-investigate production issues. Other agents can discover available agents through the registry.
+with traces and evaluations. Teams can compare snapshots, choose what to deploy based on evidence,
+and investigate production issues. Other agents can discover available agents through the registry.
 Eligible experiments can be converted to agents, while experiments remain supported for existing
 workflows and model training.
 
@@ -25,7 +25,7 @@ An agent should have one persistent identity in MLflow from development through 
 registry page would bring snapshots, source code, AI asset dependencies, evaluations, traces, and
 endpoints together. Each snapshot would show its prompts, models, tools, skills, and plugins
 alongside evaluation results and production quality, latency, and cost, with links to the underlying
-traces. Teams could compare candidates, activate a snapshot, and investigate production regressions
+traces. Teams could compare candidates, choose what to deploy, and investigate production regressions
 using the same record.
 
 MLflow's built-in AI Assistant or an external AI agent using MLflow's APIs could use this context as
@@ -86,7 +86,7 @@ source and declared AI assets; trace links show which assets a request actually 
    commit as the source revision from a clean checkout when none is supplied; the run records the
    snapshot ID.
 2. Change the code or its declared assets and evaluate again. A new commit or resolved asset creates
-   a draft snapshot. If the Git checkout is dirty, the author supplies a `revision` to distinguish
+   a snapshot. If the Git checkout is dirty, the author supplies a `revision` to distinguish
    the local code state.
 3. Compare the runs by snapshot, source, and observed assets.
 
@@ -99,7 +99,7 @@ with links to the prompt version actually used when available.
 
 1. A production agent declares its system prompt through the prompt's `production` alias. Its traces
    link agent snapshot 7 to prompt version 3.
-2. The prompt alias moves to version 4. When the client next resolves it, MLflow creates draft agent
+2. The prompt alias moves to version 4. When the client next resolves it, MLflow creates agent
    snapshot 8; traces already in flight retain the snapshots and assets they used.
 3. New traces link snapshot 8 to prompt version 4. The owner compares their quality and cost with
    snapshot 7; moving the prompt alias back reuses snapshot 7.
@@ -202,12 +202,13 @@ prompt, tool, skill, model, or subagent changed. Harness-based agents can also i
 and its declared configuration source. One logical agent can span development, staging, and
 production.
 
-Endpoint names such as `staging` and `production` identify access routes rather than snapshots. The
-computed `latest` reference selects the most recently created active snapshot; it does not mean that
-snapshot is deployed to production.
+Endpoint names such as `staging` and `production` identify access routes rather than snapshots. For
+a specified publisher version, the computed `latest` reference selects the snapshot with the highest
+per-agent snapshot number for that version. Without a version, it selects the highest-numbered
+snapshot for the agent. Neither selection means that snapshot is deployed to production.
 
-Users and other agents should be able to find agents to reuse and see which snapshots are approved
-for use.
+Users and other agents should be able to find agents to reuse and inspect their snapshots and
+evaluation evidence.
 
 Traces, evaluation runs, judges, and datasets can be associated with an agent instead of an
 experiment. Each belongs to exactly one container. Relevant SDK and REST APIs accept the agent
@@ -280,12 +281,11 @@ despite the dirty Git state, with traces kept at the agent level instead of assi
 With no Git checkout, a manifest-only snapshot is allowed without code provenance.
 
 The registry atomically finds or creates a snapshot for the resolved declaration. A new snapshot
-gets the next number under its agent and starts in `draft` status. A prior matching snapshot is
-reused, including after an asset alias rollback (e.g. a prompt alias is rolled back to a previous
-version). A newly resolved declared asset from the alias moving can create a snapshot during
-execution; each trace retains the snapshots and assets it actually used. A trace spanning different
-snapshots shows that mixture rather than claiming one snapshot. Arbitrary assets observed in traces
-do not trigger registration.
+gets the next number under its agent. A prior matching snapshot is reused, including after an asset
+alias rollback (e.g. a prompt alias is rolled back to a previous version). A newly resolved declared
+asset from the alias moving can create a snapshot during execution; each trace retains the snapshots
+and assets it actually used. A trace spanning different snapshots shows that mixture rather than
+claiming one snapshot. Arbitrary assets observed in traces do not trigger registration.
 
 #### Harness integrations
 
@@ -315,7 +315,7 @@ OTLP request headers provide defaults; root-span attributes can override them or
 This allows one export to contain traces from different agents or snapshots. MLflow validates each
 agent and snapshot pairing and environment permission. An agent that does not use the MLflow client
 may send a resolved manifest in the root span. With registration permission, MLflow can find or
-create a draft snapshot from its resolved contents and omit the manifest from stored spans.
+create a snapshot from its resolved contents and omit the manifest from stored spans.
 
 #### Agent fleets
 
@@ -490,7 +490,6 @@ class AgentSnapshot(TypedDict):
     harness: HarnessInfo | None
     registered_assets: dict[str, dict[str, str]]  # Named, pinned registry URIs
     external_models: list[ExternalModelRef]
-    status: Literal["draft", "active", "deprecated"]
     tags: dict[str, str]
     created_by: str | None
     last_updated_by: str | None
@@ -519,8 +518,8 @@ Agent-owned records identify their parent by agent ID; snapshot IDs are unique w
 Public APIs use the current workspace when no workspace is supplied.
 
 Snapshot composition and source are immutable. Agent descriptors, endpoint capabilities and cards,
-snapshot status, and tags can change. Status follows the MCP and Skill registry lifecycle. Deleted
-snapshots are absent from API responses; an internal tombstone reserves each deleted snapshot ID.
+and tags can change. Deleted snapshots are absent from API responses; an internal tombstone reserves
+each deleted snapshot ID.
 
 Audit fields follow the MCP and Skill registries. Agent audit fields can come from the configured
 backend; MLflow records snapshot audit fields. `owner` identifies who is responsible for an agent,
@@ -555,7 +554,9 @@ Composition follows these rules:
 Snapshots with the same agent, publisher version, resolved named assets, sources, harness, and
 external models are reused. Otherwise, MLflow assigns the next snapshot ID for that agent. Deleted
 snapshots are excluded from reuse. Undeclared code or dependency changes do not create a snapshot.
-`latest` selects the highest-numbered active snapshot; it is unresolved when none is active.
+For a specified publisher version, `latest` selects the highest-numbered existing snapshot with that
+version. Without a version, it selects the highest-numbered existing snapshot for the agent. It is
+unresolved when no snapshot matches.
 
 Endpoints follow the [MCP access endpoint pattern](../0004-mcp-registry/0004-mcp-registry.md) for
 protocol and transport details. For `protocol="custom"`, `custom_protocol` describes the protocol
@@ -584,8 +585,7 @@ corresponding outbound call spans.
 
 Server-side sync jobs can run periodically or on demand from registration, the SDK, or a UI
 **Refresh metadata** action. Show the last successful sync and any failure so users can judge
-whether the record is current. Snapshots created by sync default to `draft`, with a configurable
-initial status.
+whether the record is current.
 
 #### Plugin-based sync providers
 
@@ -621,7 +621,7 @@ Endpoint capabilities indexed from the card follow the
 from the card's `skills` list. These describe advertised capabilities, such as "handle customer
 refunds," rather than installed `SKILL.md` packages or internal tools such as `lookup_order`.
 
-Create a draft snapshot when the card declares a previously unseen publisher version. A card refresh
+Create a snapshot when the card declares a previously unseen publisher version. A card refresh
 under the same version updates the endpoint's cached card and advertised capabilities without
 changing snapshot composition.
 
@@ -660,4 +660,3 @@ The work can be organized into three phases without committing to release bounda
 
 - Should datasets eventually be decoupled from agents and experiments for reuse across containers?
 - Should judges be reusable across a workspace, with optional agent association?
-- Does `active` mean approved for discovery and use, or does approval need a separate workflow?
