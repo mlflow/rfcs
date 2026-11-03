@@ -51,6 +51,7 @@ uniqueness constraint to detect a name collision.
 | `subpath` | `String(2048)` | nullable; path within the artifact |
 | `digest` | `String(64)` | content hash of the resolved skill content, computed client-side and submitted; stored and indexed but not server-verified and not used to drive import reuse (see Content digest) |
 | `status` | `String(20)` | default `'active'` |
+| `status_reason` | `Text` | nullable; reason for the current non-active status |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `created_at` | `BigInteger` | millis since epoch |
@@ -152,8 +153,7 @@ not-`deleted` rule. Soft-deleting a
 version removes any aliases that point to it. Agent plugin aliases (`agent_plugin_aliases`) follow the same
 pattern against `agent_plugin_versions.version`, and additionally reject a
 withdrawn target (a plugin version that contains a `deleted` member), so
-an alias cannot bypass the kill switch (see Deletion semantics). Retired plugin
-versions are also ineligible alias targets; retirement removes their aliases.
+an alias cannot bypass the kill switch (see Deletion semantics).
 
 ### `agent_plugins`
 
@@ -184,13 +184,13 @@ PrimaryKey: `(workspace, organization, name)`.
 | `version_patch` | `Integer` | extracted SemVer patch component |
 | `version_prerelease_sort_key` | `String(512)` | order-preserving encoding of the prerelease identifiers, so SemVer precedence is a plain `ORDER BY` |
 | `plugin_json` | `JSON` | canonical Agent Plugins manifest; immutable after creation, with the version field canonicalized (normalized) on ingest |
-| `retirement_reason` | `Text` | nullable; required on transition to `retired` |
 | `search_text` | `Text` | derived discovery projection of name, mutable parent description, organization, and this version's manifest description, keywords, and author name; parent search matches the latest-resolved version's value |
 | `source_type` | `String(20)` | server-set; `git`, `oci`, `zip`, `mlflow`, `assembled` |
 | `source` | `String(2048)` | optional pointer to agent plugin |
 | `ref` | `String(2048)` | nullable; git branch, tag, or commit |
 | `subpath` | `String(2048)` | nullable; path within the artifact |
 | `status` | `String(20)` | default `'active'` |
+| `status_reason` | `Text` | nullable; reason for the current non-active status |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
 | `created_at` | `BigInteger` | millis since epoch |
@@ -201,8 +201,7 @@ CASCADE delete.
 
 **Version ordering.** All versions are valid SemVer (semverish inputs are
 normalized on creation). Latest resolution first selects active candidates, or
-non-deleted non-active candidates when none are active, excluding retired and
-withdrawn plugin versions from both sets. Semantic precedence
+non-deleted non-active candidates when none are active. Semantic precedence
 determines the result. `version_major`/`version_minor`/`version_patch` narrow
 candidates efficiently, and `version_prerelease_sort_key` carries full
 prerelease precedence, so the whole comparison is a single SQL `ORDER BY` with
@@ -302,43 +301,33 @@ Keep the skill membership table unchanged and add:
 | `plugin_name` | `String(128)` | PK, FK to plugin version |
 | `plugin_version` | `String(128)` | PK, FK to plugin version |
 | `member_name` | `String(128)` | PK; exact local `mcpServers` key |
-| `client_config` | `JSON` | nullable; immutable standard server-entry object for packaged members |
-| `server_name` | `String(256)` | nullable; registered MCP server identity, never a version |
-| `access_binding_id` | `BigInteger` | nullable; selected binding for Phase 2 assembled members |
+| `client_config` | `JSON` | required; immutable standard server-entry object for both plugin kinds |
+| `server_name` | `String(256)` | nullable; registered MCP server identity |
+| `server_version` | `String(256)` | nullable; concrete registered version, optionally resolved from an alias at registration |
 
-The plugin-version FK cascades on hard delete. Server and binding relations
-are application-enforced, without FKs, and must remain in the plugin workspace,
-including during workspace moves. Index `(plugin_workspace, server_name)` and
-`access_binding_id`.
+The plugin-version FK cascades on hard delete. Server relations are
+application-enforced, without FKs, and must remain in the plugin workspace,
+including during workspace moves. Index `(plugin_workspace, server_name)`.
 
-- **Member shape:** packaged members store `client_config`; Phase 2 assembled
-  members instead store `access_binding_id` and its matching server identity,
-  filled from the binding if omitted. MCP and skill names occupy separate
-  namespaces. The 128-character name limit is MLflow-specific.
-- **Configuration:** store one standard server entry, not all of `mcp.json`.
-  Validate against locally supported Agent Plugins MCP rules, reject secrets,
-  and cap serialized UTF-8 JSON at 64 KiB.
-- **Server association:** require existence and READ permission. Block server
-  hard deletion while referenced by non-deleted plugin versions; server-version
-  lifecycle changes do not withdraw identity-linked members.
-- **Binding deletion:** block while any referencing version is neither retired
-  nor deleted. Explicit confirmation and permission on every affected resource
-  allow atomic retirement, alias removal, and binding deletion. New references
-  invalidate confirmation. Enforce this under concurrency and on indirect
-  deletion/cleanup paths. Retain historical binding IDs and never reuse them.
+- Server associations require READ permission and do not rewrite the package's
+  configuration or verify the version running at an endpoint. Version and alias
+  selectors are mutually exclusive; aliases resolve at registration.
+- Hard deletion of an associated server or version is blocked while referenced
+  by a non-deleted plugin version.
+- Copying an access binding creates an immutable configuration snapshot. Later
+  binding updates or deletion do not affect the plugin or block binding deletion;
+  pull does not recheck binding approval. Configuration changes require a new
+  plugin version.
 
-**Phase 2 access-binding extension.** Add this column to RFC-0004's
+**Access-binding configuration.** Add this column to RFC-0004's
 `mcp_access_bindings`; existing columns remain unchanged:
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `client_config` | `JSON` | nullable; complete standard remote MCP client configuration |
 
-Require either explicit `transport_type` and `endpoint_url` or a valid remote
-`client_config` containing `type` and `url`. Derive omitted binding fields;
-supplied values must match. Keep the stored representations consistent across
-SDK/REST operations, including configuration removal, and apply the same size
-bound. Without configuration, generate a minimal entry from the binding fields.
+Accept either `transport_type` and `endpoint_url` or a remote `client_config`
+containing `type` and `url`; reject conflicting values when both are supplied.
 Authentication is client-managed; stdio and embedded credentials are unsupported.
 
 ### `agent_plugin_tags`
@@ -471,7 +460,8 @@ used by the Model Registry and RFC-0004:
   paths owned by the versions it removes, never a whole identity prefix.
 - Version delete operations (`delete_skill_version` and
   `delete_agent_plugin_version`) are soft deletes. They set
-  `status='deleted'` when allowed by the lifecycle transition rules,
+  `status='deleted'` and the optional `status_reason` when allowed by the
+  lifecycle transition rules,
   update `last_updated_at` and `last_updated_by` to the authenticated
   principal, remove aliases that point to the deleted version, and exclude
   the version from normal
@@ -695,6 +685,7 @@ class SkillVersion:
     source_type: SkillSourceType | None = None
     digest: str | None = None
     status: SkillStatus = SkillStatus.ACTIVE
+    status_reason: str | None = None
 
     tags: dict[str, str] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
@@ -714,9 +705,17 @@ class SkillVersion:
 | `source_type` | `SkillSourceType \| None` | Server-set discriminator (`git`, `oci`, `zip`, `mlflow`), populated on responses. On create, a client that knows the type of an external pointer (CLI subcommand, SDK typed class) submits it and the server validates it against the source value; without an explicit type the server infers it (see the field-inference rules below). `mlflow` is flow-derived and never client-supplied. Together with `source` it determines how content is stored and how `pull` routes |
 | `digest` | `str \| None` | Content hash of the resolved skill content (the same notion as a dataset `digest`). Submitted when the creation client inspects the content; client-asserted and not server-verified. It identifies a version by content within a skill name. Stored, returned on get, and indexed so callers can group versions by content (clean diffs between agent plugin versions, and traces before and after a change linking to the same content); it does not drive import, which always creates a new member version (see Content digest) |
 | `status` | `SkillStatus` | Per-version lifecycle: `draft`, `active`, `deprecated`, `deleted` |
+| `status_reason` | `str \| None` | Optional reason for the current non-active status; recommended for deletion |
 | `aliases` | `list[str]` | Alias names currently pointing at this version (read-only, projected from alias table) |
 
 ### SkillVersion field details
+
+**Status reasons (both entity types).** See [Status and lifecycle](0008-mvp-skill-registry.md#status-and-lifecycle)
+for warning and error behavior. A status change sets the supplied reason or
+clears it if omitted; `active` always clears it. Without a status change,
+omission leaves the reason unchanged and explicit null clears it (`NOT_SET` in
+SDK/store calls; REST field-presence tracking). These updates do not bypass
+terminal-state or visibility rules.
 
 **Source type extensibility.** The `source_type` enum is intentionally
 small for the initial implementation. New source types (e.g., `s3`,
@@ -918,7 +917,7 @@ identity.
 
 **Immutability contract.** `source` and `version` are immutable
 after creation. To point to different content, register a new
-version. Mutable fields (`status`, `tags`) can be updated
+version. Mutable fields (`status`, `status_reason`, `tags`) can be updated
 independently.
 
 ### AgentPlugin entity
@@ -928,14 +927,6 @@ package. It follows the same top-level MLflow pattern as Skill while deriving
 its canonical name and version metadata from immutable manifests.
 
 ```python
-class AgentPluginStatus(StrEnum):
-    DRAFT = "draft"
-    ACTIVE = "active"
-    DEPRECATED = "deprecated"
-    RETIRED = "retired"
-    DELETED = "deleted"
-
-
 @dataclass
 class AgentPlugin:
     name: str
@@ -943,7 +934,7 @@ class AgentPlugin:
     description: str | None = None
     icons: list[RegistryIcon] | None = None  # mutable user-defined icons; API returns null when unset
     workspace: str | None = None
-    status: AgentPluginStatus | None = None  # read-only, derived from parent-resolved version
+    status: SkillStatus | None = None  # read-only, derived from parent-resolved version
     tags: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)  # read-only; manifest version targets
     latest_version: str | None = None  # read-only, Agent Plugin resolution rule
@@ -955,8 +946,7 @@ class AgentPlugin:
 
 `AgentPlugin.status` is read-only and comes from the same latest-resolved
 version as `latest_version`. Both are `None` when the plugin has no
-eligible version (excluding retired, deleted, and withdrawn versions).
-Parent `description` and `icons` are mutable MLflow
+non-`deleted` version. Parent `description` and `icons` are mutable MLflow
 presentation metadata. When `description` is unset, the UI may fall back to
 the resolved `plugin_json["description"]`; the API returns the parent value
 as stored. `icons` has no fallback (the Agent Plugins manifest defines no
@@ -965,7 +955,7 @@ icon field): the UI shows its default plugin glyph when unset.
 ### AgentPluginVersion entity
 
 A versioned snapshot of the canonical package manifest, source authority,
-lifecycle state, registered-skill references, and owned MCP configuration members.
+lifecycle state, optional registered-skill membership, and owned MCP configuration members.
 
 Skill members are referenced by URI string rather than a separate
 data class. The URI format follows MLflow's `models:/name/version`
@@ -978,13 +968,22 @@ convention:
 All three forms are resolved to a concrete `member_version` at create time and
 frozen into the member row (see the member-list URI resolution note below).
 
+Public SDK and REST fields use `skills` and `mcp_servers`. Their different types
+are intentional: skill URI strings reference independently registered versions;
+MCP objects define plugin-owned connection configuration and optional registry
+associations, rather than independently registered configuration entities.
+
 ```python
+from mlflow.entities import MCPServerRef
+
+
 @dataclass(frozen=True)
 class MCPConfigMember:
     member_name: str
-    client_config: dict[str, Any] | None = None
+    client_config: dict[str, Any]
     server_name: str | None = None
-    access_binding_id: int | None = None
+    server_version: str | None = None
+    server_alias: str | None = None  # input-only; resolved to server_version on registration
 
 
 @dataclass
@@ -996,11 +995,11 @@ class AgentPluginVersion:
     source: GitSource | OCISource | ZipSource | MlflowSource | None = None  # MlflowSource is server-populated, never client-constructed
     source_type: SkillSourceType | None = None
 
-    status: AgentPluginStatus = AgentPluginStatus.ACTIVE
-    retirement_reason: str | None = None
+    status: SkillStatus = SkillStatus.ACTIVE
+    status_reason: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
     skills: list[str] = field(default_factory=list)
-    mcp_members: list[MCPConfigMember] = field(default_factory=list)
+    mcp_servers: list[MCPConfigMember] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
     workspace: str | None = None
     created_by: str | None = None
@@ -1041,8 +1040,7 @@ stores a null or incomplete canonical payload.
 **Latest resolution.** Active candidates take precedence. Semantic precedence
 selects latest. Creation time breaks ties (e.g., versions differing only in
 build metadata). The same rule applies to non-deleted non-active candidates
-when no active version exists. Retired and withdrawn versions are excluded
-from both candidate sets.
+when no active version exists.
 
 **Agent plugin-level source and kind.** An agent plugin version is either
 packaged or assembled, never both. Kind is derived from the persisted
@@ -1092,7 +1090,7 @@ that package.
 **Immutability contract.** `plugin_json`, the member list, and source fields of
 an agent plugin version are immutable after creation. To change the canonical
 manifest, members, or source pointer, register a new agent plugin version.
-Mutable fields (`status`, `tags`) can be updated independently.
+Mutable fields (`status`, `status_reason`, `tags`) can be updated independently.
 
 The low-level registry API validates the manifest but does not fetch a remote
 artifact to validate its layout. Client-side import performs format-specific
@@ -1311,6 +1309,7 @@ class SkillRegistryMixin:
         subpath: str | None = None,
         digest: str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
         created_by: str | None = None,
         expected_parent_exists: bool | None = None,
     ) -> SkillVersion:
@@ -1367,6 +1366,7 @@ class SkillRegistryMixin:
         version: int,
         organization: str = "",
         status: SkillStatus | None = NOT_SET,
+        status_reason: str | None = NOT_SET,
         last_updated_by: str | None = None,
     ) -> SkillVersion:
         raise NotImplementedError(self.__class__.__name__)
@@ -1377,6 +1377,7 @@ class SkillRegistryMixin:
         version: int,
         organization: str = "",
         last_updated_by: str | None = None,
+        status_reason: str | None = None,
     ) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1483,12 +1484,13 @@ class SkillRegistryMixin:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         skills: list[str] | None = None,
-        mcp_members: list[MCPConfigMember] | None = None,
+        mcp_servers: list[MCPConfigMember] | None = None,
         source_type: str | None = None,
         source: str | None = None,
         ref: str | None = None,
         subpath: str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
         created_by: str | None = None,
     ) -> AgentPluginVersion:
         raise NotImplementedError(self.__class__.__name__)
@@ -1499,24 +1501,26 @@ class SkillRegistryMixin:
         organization: str = "",
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
-        skill_members: list[dict[str, Any]] | None = None,
-        mcp_members: list[MCPConfigMember] | None = None,
+        member_skills: list[dict[str, Any]] | None = None,
+        mcp_servers: list[MCPConfigMember] | None = None,
         source_type: str | None = None,
         source: str | None = None,
         ref: str | None = None,
         subpath: str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
         created_by: str | None = None,
     ) -> tuple[AgentPluginVersion, list[SkillVersion]]:
         """Register a packaged agent plugin as a single unit of work. For each
-        entry in skill_members (a name, a subpath locating the skill within the
+        entry in member_skills (a name, a subpath locating the skill within the
         package, a client-computed content digest, and an optional
         description), create the Skill when the name is free or add a version when
         the name has previously been a member of this same plugin (derived from
         this plugin's member rows), set search_text, and create a member
         SkillVersion whose source is derived from the package (the package's
         source_type and source, with the entry's subpath) and whose digest is
-        the entry's digest. Import never reuses an existing skill version on the
+        the entry's digest. Apply status and status_reason to the plugin and
+        newly created member versions. Import never reuses an existing skill version on the
         strength of a matching digest: every discovered member gets a new
         version so that each version keeps exactly one immutable, package-derived
         source (see Content digest). Then create the packaged AgentPluginVersion
@@ -1564,8 +1568,8 @@ class SkillRegistryMixin:
         name: str,
         version: str,
         organization: str = "",
-        status: AgentPluginStatus | None = NOT_SET,
-        retirement_reason: str | None = NOT_SET,
+        status: SkillStatus | None = NOT_SET,
+        status_reason: str | None = NOT_SET,
         last_updated_by: str | None = None,
     ) -> AgentPluginVersion:
         raise NotImplementedError(self.__class__.__name__)
@@ -1576,6 +1580,7 @@ class SkillRegistryMixin:
         version: str,
         organization: str = "",
         last_updated_by: str | None = None,
+        status_reason: str | None = None,
     ) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
@@ -1682,6 +1687,7 @@ def register_skill(
     organization: str = "",
     source: GitSource | OCISource | ZipSource | str,
     status: str = "active",
+    status_reason: str | None = None,
 ) -> SkillVersion:
     """Register a skill version. The server assigns the next
     monotonic integer version. Auto-creates the parent Skill if
@@ -1736,9 +1742,10 @@ def register_agent_plugin(
     version: str | None = None,
     organization: str = "",
     skills: list[str] | None = None,
-    mcp_members: list[MCPConfigMember] | None = None,
+    mcp_servers: list[MCPConfigMember] | None = None,
     source: GitSource | OCISource | ZipSource | str | None = None,
     status: str = "active",
+    status_reason: str | None = None,
 ) -> AgentPluginVersion:
     """Validate or synthesize a canonical manifest, create or reuse the
     parent AgentPlugin, and register one immutable version. version is
@@ -1773,6 +1780,7 @@ def import_skills(
     organization: str = "",
     skill_names: list[str] | None = None,
     status: str = "active",
+    status_reason: str | None = None,
 ) -> list[SkillVersion]:
     """Fetch a Git repository and recursively discover skills beneath the
     GitSource subpath, or the repository root when no subpath is set.
@@ -1781,8 +1789,8 @@ def import_skills(
     Validate all selected skills, compute their digests, and submit the prepared
     definitions to the transactional, idempotent bulk-registration endpoint.
     Status accepts active or draft and applies to newly created versions.
-    It is sent in each skill definition. Reused versions retain their
-    existing status."""
+    Status and the optional status_reason are sent in each skill definition.
+    Reused versions retain their existing status and reason."""
 
 
 @dataclass
@@ -1791,7 +1799,7 @@ class PluginIntrospectionResult:
     plugin_name: str | None
     plugin_json: dict[str, Any]
     skills: list[IntrospectedSkill]
-    mcp_members: list[MCPConfigMember]
+    mcp_servers: list[MCPConfigMember]
     recognized_unregistered_content: list[str]
     warnings: list[PluginImportWarning]
 
@@ -1818,7 +1826,9 @@ def import_agent_plugin(
     plugin_name: str | None = None,
     version: str | None = None,
     organization: str = "",
-    mcp_server_associations: dict[str, str] | None = None,
+    mcp_server_associations: dict[str, MCPServerRef] | None = None,
+    status: str = "active",
+    status_reason: str | None = None,
 ) -> PluginImportResult:
     """Import a plugin as a packaged agent plugin.
 
@@ -1827,7 +1837,10 @@ def import_agent_plugin(
     skills, each with a source derived from the package (the package's
     source_type and source, plus a subpath locating the skill); and preserves
     the package source. Indexes standard mcp.json entries as owned members;
-    mcp_server_associations maps local member names to registered server names.
+    mcp_server_associations maps local member names to MCPServerRef values
+    (name with an optional version or alias, as defined in RFC-0004).
+    Aliases are resolved at registration. Status and the optional status_reason
+    apply to the plugin and its newly created skill versions.
     plugin_name is used only when the selected adapter cannot
     derive a name. version is required when the detected manifest does not
     contain a version field. A typed source class (GitSource, OCISource,
@@ -1902,6 +1915,7 @@ class MlflowClient:
         source: GitSource | OCISource | ZipSource | str | None = None,
         digest: str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
     ) -> SkillVersion:
         """Local input must be a prepared gzip-tar archive. The client validates
         and uploads it without inspecting the manifest or computing a digest.
@@ -1941,11 +1955,13 @@ class MlflowClient:
     ) -> PagedList[SkillVersion]: ...
 
     def update_skill_version(
-        self, *, name: str, version: int, organization: str = "", status: str | None = NOT_SET
+        self, *, name: str, version: int, organization: str = "",
+        status: str | None = NOT_SET, status_reason: str | None = NOT_SET
     ) -> SkillVersion: ...
 
     def delete_skill_version(
-        self, *, name: str, version: int, organization: str = ""
+        self, *, name: str, version: int, organization: str = "",
+        status_reason: str | None = None,
     ) -> None: ...
 
     # --- Agent plugins ---
@@ -1962,9 +1978,10 @@ class MlflowClient:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         skills: list[str] | None = None,
-        mcp_members: list[MCPConfigMember] | None = None,
+        mcp_servers: list[MCPConfigMember] | None = None,
         source: GitSource | OCISource | ZipSource | str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
     ) -> AgentPluginVersion:
         """version is required when plugin_json is None or when
         plugin_json does not contain a version field."""
@@ -1976,16 +1993,17 @@ class MlflowClient:
         organization: str = "",
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
-        skill_members: list[dict[str, Any]] | None = None,
-        mcp_members: list[MCPConfigMember] | None = None,
+        member_skills: list[dict[str, Any]] | None = None,
+        mcp_servers: list[MCPConfigMember] | None = None,
         source: GitSource | OCISource | ZipSource | str | None = None,
         status: str = "active",
+        status_reason: str | None = None,
     ) -> tuple[AgentPluginVersion, list[SkillVersion]]:
         """Post a client-prepared import payload to the transactional
         import-registration endpoint. The server creates the member skills
         and the packaged plugin version atomically; source_type is server-set
         and each member skill's source is derived from the package. Each
-        skill_members entry carries a name, a subpath locating the skill within
+        member_skills entry carries a name, a subpath locating the skill within
         the package, a client-computed content digest, and an optional
         description read from its SKILL.md during local inspection. Returns
         the packaged AgentPluginVersion and the member SkillVersions (all newly
@@ -2036,11 +2054,12 @@ class MlflowClient:
 
     def update_agent_plugin_version(
         self, *, name: str, version: str, organization: str = "",
-        status: str | None = NOT_SET, retirement_reason: str | None = NOT_SET
+        status: str | None = NOT_SET, status_reason: str | None = NOT_SET
     ) -> AgentPluginVersion: ...
 
     def delete_agent_plugin_version(
-        self, *, name: str, version: str, organization: str = ""
+        self, *, name: str, version: str, organization: str = "",
+        status_reason: str | None = None,
     ) -> None: ...
 
     # --- Tags and aliases ---
@@ -2241,7 +2260,7 @@ All paths relative to the logical skills router prefix.
 | `POST` | `/@{organization}/{name}/versions` | Register a skill version from a remote pointer or uploaded content; auto-creates the parent when authorized |
 | `GET` | `/@{organization}/{name}/versions` | Search versions |
 | `GET` | `/@{organization}/{name}/versions/{version}` | Get a specific version |
-| `PATCH` | `/@{organization}/{name}/versions/{version}` | Update version status |
+| `PATCH` | `/@{organization}/{name}/versions/{version}` | Update version status or reason |
 | `DELETE` | `/@{organization}/{name}/versions/{version}` | Soft-delete a version (`status='deleted'`) |
 | `POST` | `/@{organization}/{name}/tags` | Set a skill-level tag |
 | `DELETE` | `/@{organization}/{name}/tags/{key}` | Delete a skill-level tag |
@@ -2315,7 +2334,7 @@ All paths relative to the logical agent-plugins router prefix.
 | `POST` | `/@{organization}/{name}/versions` | Create an agent plugin version with members |
 | `GET` | `/@{organization}/{name}/versions` | Search agent plugin versions |
 | `GET` | `/@{organization}/{name}/versions/{version}` | Get a specific agent plugin version |
-| `PATCH` | `/@{organization}/{name}/versions/{version}` | Update agent plugin version status |
+| `PATCH` | `/@{organization}/{name}/versions/{version}` | Update agent plugin version status or reason |
 | `DELETE` | `/@{organization}/{name}/versions/{version}` | Soft-delete an agent plugin version (`status='deleted'`) |
 | `POST` | `/@{organization}/{name}/tags` | Set an agent plugin-level tag |
 | `DELETE` | `/@{organization}/{name}/tags/{key}` | Delete an agent plugin-level tag |
@@ -2395,15 +2414,12 @@ that memberships are not a stored field on the skill.
 Plugin parent/version searches support `mcp_member_name` and `mcp_server_name`;
 combined predicates match one member row. Parent search checks any non-deleted
 version, subject to READ permission. Server matches are declared, not observed.
-Retired versions are excluded by default but available through explicit get,
-history, or `status = 'retired'` searches.
 
 On parent search, `status` and `source_type` filters match values derived from
-the latest-resolved eligible version (also excluding retired and withdrawn
-plugin versions): `status` matches the same derived
+the latest-resolved non-`deleted` version: `status` matches the same derived
 status that drives the entity's read-only `status`, and `source_type` matches
 that version's stored source type. Parent tables do not duplicate either field.
-A parent with no eligible version has `None` for those derived values and
+A parent with no non-`deleted` version has `None` for those derived values and
 is excluded by equality filters on them. To filter on the status or source type
 of specific versions, use version search.
 
@@ -2465,10 +2481,12 @@ class CreateSkillVersionRequest(BaseModel):
     subpath: str | None = None
     digest: str | None = None  # client-computed content hash; stored and indexed, not server-verified
     status: str = "active"
+    status_reason: str | None = None
 
 
 class UpdateSkillVersionRequest(BaseModel):
     status: str | None = None
+    status_reason: str | None = None
 
 
 class BulkRegisterSkillRequest(BaseModel):
@@ -2479,6 +2497,7 @@ class BulkRegisterSkillRequest(BaseModel):
     subpath: str | None = None
     digest: str
     status: str = SkillStatus.ACTIVE.value
+    status_reason: str | None = None
 
 
 class BulkRegisterSkillsRequest(BaseModel):
@@ -2515,21 +2534,23 @@ class PluginJSONPayload(BaseModel):
 
 class MCPConfigMemberPayload(BaseModel):
     member_name: str = Field(min_length=1, max_length=128)
-    client_config: dict[str, Any] | None = None
+    client_config: dict[str, Any]
     server_name: str | None = None
-    access_binding_id: int | None = None
+    server_version: str | None = None
+    server_alias: str | None = None  # input-only; resolved to server_version on registration
 
 
 class CreateAgentPluginVersionRequest(BaseModel):
     version: str | None = None
     plugin_json: PluginJSONPayload | None = None
     skills: list[str] | None = None
-    mcp_members: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
     source_type: str | None = None  # optional explicit type for an external package source (git/oci/zip only; mlflow and assembled are flow-derived and rejected here); validated against `source`, with inference as the fallback when omitted (see Field inference)
     source: str | None = None
     ref: str | None = None
     subpath: str | None = None
     status: str = "active"
+    status_reason: str | None = None
 
 
 class RegisterAgentPluginRequest(CreateAgentPluginVersionRequest):
@@ -2558,18 +2579,19 @@ class ImportRegisterRequest(BaseModel):
     plugin_json: PluginJSONPayload
     version: str | None = None  # required when plugin_json omits a version
     organization: str = ""
-    skill_members: list[MemberSkillDefinition] = Field(default_factory=list)  # discovered members with metadata
-    mcp_members: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    member_skills: list[MemberSkillDefinition] = Field(default_factory=list)  # discovered members with metadata
+    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
     source_type: str | None = None  # optional explicit type for the external package pointer (git/oci/zip only); the import client fetched the source, so it always knows the type and submits it; validated against `source`, with inference as the fallback (see Field inference)
     source: str | None = None  # external package pointer; null for an MLflow-stored package
     ref: str | None = None
     subpath: str | None = None
     status: str = "active"
+    status_reason: str | None = None
 
 
 class UpdateAgentPluginVersionRequest(BaseModel):
     status: str | None = None
-    retirement_reason: str | None = None
+    status_reason: str | None = None
 
 
 class SkillAliasResponse(BaseModel):
@@ -2615,6 +2637,7 @@ class SkillVersionResponse(BaseModel):
     subpath: str | None = None
     digest: str | None = None
     status: str = "active"
+    status_reason: str | None = None
     aliases: list[str] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
@@ -2664,9 +2687,9 @@ class AgentPluginVersionResponse(BaseModel):
     ref: str | None = None
     subpath: str | None = None
     status: str = "active"
-    retirement_reason: str | None = None
+    status_reason: str | None = None
     skills: list[str] = Field(default_factory=list)
-    mcp_members: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
     aliases: list[str] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
@@ -2791,7 +2814,7 @@ flag also accepted; for example, `mlflow skills get skills:/code-review` and
 | `mlflow skills search` | `search_skills()` | Search skills |
 | `mlflow skills get-version` | `get_skill_version()` | Get a specific version |
 | `mlflow skills search-versions` | `search_skill_versions()` | Search versions of a skill |
-| `mlflow skills update-version` | `update_skill_version()` | Update version status |
+| `mlflow skills update-version` | `update_skill_version()` | Update version status or reason |
 | `mlflow skills delete-version` | `delete_skill_version()` | Soft-delete a version (withdrawal kill switch) |
 | `mlflow skills set-alias` | `set_skill_alias()` | Set a version alias |
 | `mlflow skills delete-alias` | `delete_skill_alias()` | Delete a version alias |
@@ -2814,7 +2837,7 @@ flag also accepted; for example, `mlflow skills get skills:/code-review` and
 | `mlflow agent-plugins delete-tag` | `delete_agent_plugin_tag()` | Delete an agent plugin-level tag |
 | `mlflow agent-plugins set-version-tag` | `set_agent_plugin_version_tag()` | Set an agent plugin version tag |
 | `mlflow agent-plugins delete-version-tag` | `delete_agent_plugin_version_tag()` | Delete an agent plugin version tag |
-| `mlflow agent-plugins update-version` | `update_agent_plugin_version()` | Update agent plugin version status |
+| `mlflow agent-plugins update-version` | `update_agent_plugin_version()` | Update agent plugin version status or reason |
 | `mlflow agent-plugins delete-version` | `delete_agent_plugin_version()` | Soft-delete a version |
 | `mlflow agent-plugins introspect` | `introspect_agent_plugin()` | Preview a local or remote plugin without registry writes |
 | `mlflow agent-plugins import` | `import_agent_plugin()` | Import a plugin as a packaged agent plugin |
@@ -2826,16 +2849,19 @@ as the SDK's typed source classes do), so registration through these
 surfaces never depends on the server inferring the type from the URL's
 shape.
 
-`import` accepts repeatable `--mcp-server MEMBER=SERVER_NAME` mappings
-(SDK: `mcp_server_associations`); packaged configurations come from root
-`mcp.json`. Low-level SDK/REST requests use `mcp_members`. Phase 2
-`register`/`create-version` add repeatable `--mcp-binding MEMBER=BINDING_ID`,
-with server identity derived and validated by the server; Phase 1 rejects it.
+`import` accepts repeatable `--mcp-server MEMBER=SERVER_NAME` mappings,
+with optional `--mcp-server-version MEMBER=VERSION` or
+`--mcp-server-alias MEMBER=ALIAS` selectors (mutually exclusive per member).
+The SDK uses `mcp_server_associations`; packaged configurations come from root
+`mcp.json`. Low-level SDK/REST requests use `mcp_servers` with `server_name`
+and optional `server_version` or input-only `server_alias`.
+`register`/`create-version` accept repeatable `--mcp-binding MEMBER=BINDING_ID`
+to copy configuration and server associations from approved access bindings.
 
-`update-version --status retired --retirement-reason TEXT` retires a version.
-Phase 2 binding deletion requires the exact plugin-version identities confirmed
-for retirement. UI/CLI collect confirmation; SDK/REST accept the explicit list,
-not a blanket cascade flag.
+Both `mlflow skills` and `mlflow agent-plugins` accept optional `--status-reason`
+on registration/import, `update-version`, and `delete-version`. Version DELETE
+endpoints accept it as an optional query parameter; create/update requests use
+the JSON field of the same name.
 
 `create-version` and `register` accept `--plugin-json PATH` for a full standard
 manifest. When omitted for an assembled plugin, `--version` is required and
@@ -2910,7 +2936,7 @@ The importer:
    supported schema rules. Invalid MCP files/entries produce warnings with
    the component failure boundaries in the main RFC. Other non-skill content
    is reported without membership semantics; harness-native MCP formats are
-   not reinterpreted as standard configurations in Phase 1.
+   not reinterpreted as standard configurations.
 
 When multiple markers exist, the standard root manifest takes precedence. The
 canonical name follows the Agent Plugins naming constraints. A supplied
@@ -3050,13 +3076,8 @@ install or export an MLflow agent plugin.
 
 ## Pull semantics details
 
-**MCP materialization.** Packaged pull preserves `mcp.json` unchanged. Phase 2
-assembled pull resolves each binding once, checks its workspace and server
-identity, and writes standard root `mcp.json` using local member names.
-Retired versions or unavailable/invalid bindings fail the whole pull.
-Pull does not fetch schemas, expand placeholders, launch servers, or substitute
-endpoints. Binding updates affect future pulls, even of the same plugin version,
-but not previously generated packages.
+**MCP materialization.** Packaged pulls preserve `mcp.json` unchanged; assembled
+pulls generate it from stored `client_config` snapshots using local member names.
 
 **Source availability.** The registry stores source pointers but does
 not cache or proxy content. If a source is unreachable or the content
