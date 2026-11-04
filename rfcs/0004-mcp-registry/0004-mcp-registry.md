@@ -7,8 +7,8 @@
 
 | Author(s)              | [Jon Burdo](https://github.com/jonburdo), [Dan Kuc](https://github.com/dkuc), [Matthew Prahl](https://github.com/mprahl) |
 | :--------------------- | :-- |
-| **Date Last Modified** | 2026-10-12 |
-| **AI Assistant(s)**    | Claude Code, GPT 5.4, Cursor, Codex |
+| **Date Last Modified** | 2026-11-04 |
+| **AI Assistant(s)**    | Claude Code, GPT 5.4, Cursor, Codex, OpenCode |
 
 **Table of contents**
 
@@ -39,11 +39,11 @@
 
 # Summary
 
-Add an MCP Registry to MLflow — a governed, versioned registry for [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server definitions. The registry stores metadata-first records aligned with the [upstream MCP registry specification](https://registry.modelcontextprotocol.io/docs), but differs from an MCP gateway: it is the system of record for canonical server definitions, version history, aliases, governance, and approved direct-access bindings, rather than the live traffic layer that mediates MCP requests. The design is intended to integrate cleanly with a future MCP gateway in MLflow AI Gateway, while remaining useful on its own as a governed registry. This is intended to complement, not replace, the public GitHub-hosted MCP registry.
+Add an MCP Registry to MLflow — a governed, versioned registry for [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server definitions. The registry stores metadata-first records aligned with the [upstream MCP registry specification](https://registry.modelcontextprotocol.io/docs), but differs from an MCP gateway: it is the system of record for canonical server definitions, version history, aliases, governance, and approved direct-access endpoints, rather than the live traffic layer that mediates MCP requests. The design is intended to integrate cleanly with a future MCP gateway in MLflow AI Gateway, while remaining useful on its own as a governed registry. This is intended to complement, not replace, the public GitHub-hosted MCP registry.
 
-MLflow MCP should feel like one product. The registry is the governed source of truth, and a future MLflow MCP Gateway should build on the same server identities, versions, and aliases rather than introducing a separate MCP catalog. Gateway-managed deployment records can be layered on top later, but the catalog remains the registry. In the UX, this naturally yields two complementary listings over the same governed data: a registry listing of all governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in a workspace.
+MLflow MCP should feel like one product. The registry is the governed source of truth, and a future MLflow MCP Gateway should build on the same server identities, versions, and aliases rather than introducing a separate MCP catalog. Gateway-managed deployment records can be layered on top later, but the catalog remains the registry. In the UX, this naturally yields two complementary listings over the same governed data: a registry listing of all governed MCP servers, and an access-endpoint listing of approved direct endpoints currently surfaced in a workspace.
 
-MLflow stores the publisher-declared semantic version from `server_json["version"]` as the canonical version of a server definition. It does not introduce a second MLflow-specific version. Approved direct connectivity, when present, is represented by separate `MCPAccessBinding` records rather than mutable runtime metadata on the version itself.
+MLflow stores the publisher-declared semantic version from `server_json["version"]` as the canonical version of a server definition. It does not introduce a second MLflow-specific version. Approved direct connectivity, when present, is represented by separate `MCPAccessEndpoint` records rather than mutable runtime metadata on the version itself.
 
 # Basic example
 
@@ -125,15 +125,15 @@ version = mlflow.genai.get_mcp_server_version_by_alias(
 
 ```python
 # Record an approved direct access path for the production alias.
-binding = mlflow.genai.create_mcp_access_binding(
+endpoint = mlflow.genai.create_mcp_access_endpoint(
     server_name="io.github.anthropic/brave-search",
     server_alias="production",
-    endpoint_url="https://mcp.acme.internal/brave-search",
+    url="https://mcp.acme.internal/brave-search",
     transport_type="streamable-http",
 )
 
-# binding.endpoint_url == "https://mcp.acme.internal/brave-search"
-# binding.transport_type == "streamable-http"
+# endpoint.url == "https://mcp.acme.internal/brave-search"
+# endpoint.transport_type == "streamable-http"
 ```
 
 ## Record an MCP server on a trace
@@ -157,20 +157,20 @@ with mlflow.start_span("list_resources") as span:
     resources = list_mcp_resources()
 ```
 
-When using an approved direct endpoint discovered through the registry, pass its access binding instead of copying its server coordinates:
+When using an approved direct endpoint discovered through the registry, pass its access endpoint instead of copying its server coordinates:
 
 ```python
-bindings = mlflow.genai.search_mcp_access_bindings(
+endpoints = mlflow.genai.search_mcp_access_endpoints(
     server_name="io.github.anthropic/brave-search",
     server_alias="production",
 )
-binding = next(
-    b for b in bindings if b.endpoint_url == "https://mcp.acme.internal/brave-search"
+endpoint = next(
+    e for e in endpoints if e.url == "https://mcp.acme.internal/brave-search"
 )
 
 with mlflow.start_span("brave_web_search", span_type=SpanType.TOOL) as span:
-    span.link_mcp_server(binding, tool="brave_web_search")
-    result = call_brave_web_search(binding.endpoint_url)
+    span.link_mcp_server(endpoint, tool="brave_web_search")
+    result = call_brave_web_search(endpoint.url)
 ```
 
 ## Motivation
@@ -189,7 +189,7 @@ As MCP adoption grows, organizations accumulate MCP server definitions across te
 
 The MCP Registry and an MCP Gateway are related but distinct capabilities:
 
-- **MCP Registry**: the control-plane system of record for governed MCP assets. It stores canonical `server_json`, version history, aliases, tags, lifecycle state, and direct access binding records that describe approved non-gateway connection paths.
+- **MCP Registry**: the control-plane system of record for governed MCP assets. It stores canonical `server_json`, version history, aliases, tags, lifecycle state, and direct access endpoint records that describe approved non-gateway connection paths.
 - **MCP Gateway**: a runtime data-plane service that receives live client traffic and mediates connectivity, authentication, routing, policy enforcement, and request-time observability. In MLflow, a future gateway should consume registry identities and version/alias resolution, while owning its own runtime deployment records and policies.
 
 This RFC defines the registry layer first. It does **not** yet design the MLflow MCP Gateway runtime, extend the existing AI Gateway into an MCP Gateway, or define MCP proxy semantics. Instead, it establishes the governed MCP server identities, aliases, and direct-access records that a future gateway would resolve against, so gateway configuration is derived from the registry rather than becoming a second source of truth.
@@ -199,9 +199,9 @@ This RFC defines the registry layer first. It does **not** yet design the MLflow
 1. **Governed registration**: Platform administrators register MCP server definitions (both internally developed packages and hosted remote endpoints) as governed, versioned assets with stable identity
 2. **Lifecycle management**: MCP server versions move through statuses (draft → active → deprecated → deleted) to control downstream surfacing
 3. **Discovery and resolution**: MLflow-aware clients and runtimes discover active MCP servers and resolve them by name + version or alias
-4. **Direct connectivity association**: Operators can record approved direct connection paths as first-class binding records, bridging the gap between "what is governed" and "what is live"
+4. **Direct connectivity association**: Operators can record approved direct connection paths as first-class endpoint records, bridging the gap between "what is governed" and "what is live"
 5. **Version history**: Multiple versions of an MCP server coexist with independent lifecycle states, supporting deprecation without erasing history
-6. **After-the-fact governance**: MCP servers already running in a hosted environment can have registry records and direct-access bindings created after the fact, associating existing deployments with governed assets without requiring redeployment
+6. **After-the-fact governance**: MCP servers already running in a hosted environment can have registry records and direct-access endpoints created after the fact, associating existing deployments with governed assets without requiring redeployment
 
 ### User journeys
 
@@ -211,10 +211,10 @@ Journey 1's registry and access flows, along with the additional flows below, be
 
 1. An admin registers an MCP server definition in MLflow from a canonical `server.json` payload (stored by MLflow as `server_json`), such as a public NPM-backed server or an internally hosted remote server.
 2. A new MCP server entry appears in the registry listing with its version history and metadata, even before it has any approved access path.
-3. The admin optionally sets aliases such as `dev`, `staging`, and `production`, and records approved direct-access bindings for any remote endpoints that users are allowed to call directly.
-4. The workspace can also show a separate access-binding listing that surfaces the approved direct endpoints currently available in that workspace.
-5. End users can browse either the registry listing to see all governed MCP servers, or the access-binding listing to see the approved direct endpoints currently surfaced in the workspace. From the registry listing, they can inspect the canonical `server_json` definition for local/package-based consumption. From the access-binding listing, they can select a direct endpoint and follow it back to the governed server, version, or alias it resolves to.
-6. When a new version is available, the admin registers the new `server.json`, optionally updates aliases or direct access bindings to point at it, and can optionally deprecate the older version without deleting history.
+3. The admin optionally sets aliases such as `dev`, `staging`, and `production`, and records approved direct-access endpoints for any remote endpoints that users are allowed to call directly.
+4. The workspace can also show a separate access-endpoint listing that surfaces the approved direct endpoints currently available in that workspace.
+5. End users can browse either the registry listing to see all governed MCP servers, or the access-endpoint listing to see the approved direct endpoints currently surfaced in the workspace. From the registry listing, they can inspect the canonical `server_json` definition for local/package-based consumption. From the access-endpoint listing, they can select a direct endpoint and follow it back to the governed server, version, or alias it resolves to.
+6. When a new version is available, the admin registers the new `server.json`, optionally updates aliases or direct access endpoints to point at it, and can optionally deprecate the older version without deleting history.
 7. In Phase 4, tracing can associate a trace with the governed MCP server and, when known, its version for debugging, rollback and fix analysis, and lightweight auditing.
 
 #### Additional Phase 1 flows
@@ -222,20 +222,20 @@ Journey 1's registry and access flows, along with the additional flows below, be
 **Alias-based promotion without changing clients**
 
 1. An admin registers versions `v1` and `v2` of the same `MCPServer`, allowing both to remain available at the same time for legacy and new clients.
-2. The admin creates an access binding that targets an alias such as `production` rather than pinning the binding to a raw version string.
-3. Clients continue resolving the same alias while the admin moves the alias from `v1` to `v2`, without changing the binding or client configuration.
+2. The admin creates an access endpoint that targets an alias such as `production` rather than pinning the endpoint to a raw version string.
+3. Clients continue resolving the same alias while the admin moves the alias from `v1` to `v2`, without changing the endpoint or client configuration.
 
 **Agent discovers directly usable MCP servers**
 
 1. An agent or application searches for governed MCP servers that currently have approved direct-access paths.
-2. The returned server records include access binding summaries so the agent can choose an approved direct endpoint without making a second discovery call.
-3. The agent then chooses either local/package-based consumption from `server_json` or a remote direct endpoint from the attached access bindings, depending on the runtime it supports.
+2. The returned server records include access endpoint summaries so the agent can choose an approved direct endpoint without making a second discovery call.
+3. The agent then chooses either local/package-based consumption from `server_json` or a remote direct endpoint from the attached access endpoints, depending on the runtime it supports.
 
 #### Journey 2: Governed registry with future gateway deployment
 
 1. An admin registers an MCP server definition in MLflow and sees it appear in the same registry listing and version history used in Journey 1.
 2. As a future integration, the admin uses a `Deploy` action or API to publish that governed server through MLflow MCP Gateway.
-3. That deploy flow creates or updates a gateway-owned runtime record (for example, an `MCPGatewayBinding`) that targets the chosen governed version or alias, while keeping the registry as the system of record for identity and lifecycle.
+3. That deploy flow creates or updates a gateway-owned runtime record (for example, an `MCPGatewayEndpoint`) that targets the chosen governed version or alias, while keeping the registry as the system of record for identity and lifecycle.
 4. Once gateway access is active, the same governed MCP server can be surfaced through availability-oriented discovery without introducing a separate gateway catalog. The gateway contributes another access path, but discovery still points back to the same governed server identity in the registry.
 5. End users discover the server through the same registry listing and any derived availability filtering, then connect through MLflow MCP Gateway using MLflow-managed access. The gateway resolves the request to the governed MCP server version or alias recorded in the registry.
 6. For version updates, if the gateway-owned deployment record targets an alias, the admin can move that alias so gateway traffic follows the governed pointer without updating the gateway record or forcing every client to adopt a new raw version string.
@@ -243,9 +243,9 @@ Journey 1's registry and access flows, along with the additional flows below, be
 
 ### Out of scope
 
-- **Runtime execution and orchestration** — The registry may store direct access binding records, but it does not provision, host, scale, or manage MCP runtimes
+- **Runtime execution and orchestration** — The registry may store direct access endpoint records, but it does not provision, host, scale, or manage MCP runtimes
 - **End-user connectivity, proxying, or usage control enforcement** — Consumers can still connect directly to an MCP endpoint unless a future MLflow gateway or proxy mediates access; centralized MLflow-credential-based access through a gateway is future work
-- **MCP Gateway runtime and deployment UX** — This RFC does not define the MLflow MCP Gateway runtime, including request routing, protocol mediation, authentication behavior, usage control, runtime APIs, deploy UX, or gateway-managed binding entities
+- **MCP Gateway runtime and deployment UX** — This RFC does not define the MLflow MCP Gateway runtime, including request routing, protocol mediation, authentication behavior, usage control, runtime APIs, deploy UX, or gateway-managed endpoint entities
 - **Upstream MCP registry API compatibility layer** — A separate router implementing the upstream `GET /v0.1/servers` API shape is deferred to [Phase 2](#adoption-strategy); this RFC defines MLflow-native APIs
 
 ## MCP registry spec alignment
@@ -288,12 +288,12 @@ erDiagram
     MCPServer ||--o{ MCPServerTag : "has tags"
     MCPServer ||--o{ MCPServerAlias : "has aliases"
     MCPServerVersion ||--o{ MCPServerVersionTag : "has tags"
-    MCPServer ||--o{ MCPAccessBinding : "has direct access bindings"
+    MCPServer ||--o{ MCPAccessEndpoint : "has direct access endpoints"
 ```
 
-Access bindings are attached to a parent `MCPServer` and target either a specific version or an alias on that server.
+Access endpoints are attached to a parent `MCPServer` and target either a specific version or an alias on that server.
 
-A future gateway-managed entity such as `MCPGatewayBinding` would follow the same parent/target pattern, but is omitted from the Phase 1 entity diagram because its gateway-specific fields and lifecycle are intentionally out of scope for this RFC.
+A future gateway-managed entity such as `MCPGatewayEndpoint` would follow the same parent/target pattern, but is omitted from the Phase 1 entity diagram because its gateway-specific fields and lifecycle are intentionally out of scope for this RFC.
 
 #### MCPServer
 
@@ -326,7 +326,7 @@ class MCPServer:
     status: MCPStatus | None = None  # read-only; derived from the latest-resolved version's status
     tags: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)  # read-only; populated from mcp_server_aliases table, e.g. {"production": "1.2.0"}
-    access_bindings: list["MCPAccessBinding"] = field(default_factory=list)  # read-only
+    access_endpoints: list["MCPAccessEndpoint"] = field(default_factory=list)  # read-only
     latest_version: str | None = None  # read-only; resolved latest version using the shared latest-resolution rule
     created_by: str | None = None
     last_updated_by: str | None = None
@@ -342,7 +342,7 @@ class MCPServer:
 
 **Audit field population**: `created_by` and `last_updated_by` are populated from the authenticated MLflow user when authentication is enabled. In unauthenticated installs, these fields remain empty.
 
-**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. MLflow then uses one shared latest-resolution rule across `MCPServer.latest_version`, the reserved `latest` alias, `server_alias="latest"` binding resolution, and server-level derived metadata. Resolution prefers the highest semantic version among `active` versions if one exists; otherwise it falls back to the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in semantic-version ordering, while build metadata does not affect precedence. If no non-`deleted` version exists, the server has no resolved latest version.
+**Latest resolution**: MLflow treats `latest` as a reserved system pointer rather than a normal alias. The upstream `server.json` schema describes `version` as `Version string for this server. SHOULD follow semantic versioning.` MLflow chooses to enforce that guidance as a requirement: `server_json["version"]` must be a valid semantic version at creation time. MLflow then uses one shared latest-resolution rule across `MCPServer.latest_version`, the reserved `latest` alias, `server_alias="latest"` endpoint resolution, and server-level derived metadata. Resolution prefers the highest semantic version among `active` versions if one exists; otherwise it falls back to the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in semantic-version ordering, while build metadata does not affect precedence. If no non-`deleted` version exists, the server has no resolved latest version.
 
 #### MCPServerVersion
 
@@ -386,9 +386,9 @@ class MCPServerVersion:
     last_updated_timestamp: int | None = None
 ```
 
-**Immutability contract**: `name`, `version`, and `server_json` are immutable after creation. To change the canonical publisher-managed MCP payload, register a new version rather than mutating an existing one in place. This is an intentional MLflow choice even though the upstream API spec defines an optional version-update endpoint. Mutable MLflow-managed fields (`status`, `tags`, `tools`) can still be updated independently. Approved direct connectivity is modeled separately via `MCPAccessBinding`.
+**Immutability contract**: `name`, `version`, and `server_json` are immutable after creation. To change the canonical publisher-managed MCP payload, register a new version rather than mutating an existing one in place. This is an intentional MLflow choice even though the upstream API spec defines an optional version-update endpoint. Mutable MLflow-managed fields (`status`, `tags`, `tools`) can still be updated independently. Approved direct connectivity is modeled separately via `MCPAccessEndpoint`.
 
-**Tools metadata**: The `tools` field on `MCPServerVersion` stores the declared tools this MCP server version can provide. Each tool is represented as an `MCPTool` dataclass matching the [MCP Tool schema](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) — name, title, description, input/output schemas, annotations, icons, and execution hints. The upstream `server.json` schema does not include a tools field; this is an MLflow extension for discovery and governance. `tools` is mutable so it can be populated after initial registration — for example, when a platform engineer registers an external server by URL and later populates tools after observing what the endpoint exposes. `MCPServerVersion` is the source of truth for tools; `MCPAccessBinding` responses project tools read-only from the resolved version for search convenience. Tool filtering is a future gateway concern.
+**Tools metadata**: The `tools` field on `MCPServerVersion` stores the declared tools this MCP server version can provide. Each tool is represented as an `MCPTool` dataclass matching the [MCP Tool schema](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) — name, title, description, input/output schemas, annotations, icons, and execution hints. The upstream `server.json` schema does not include a tools field; this is an MLflow extension for discovery and governance. `tools` is mutable so it can be populated after initial registration — for example, when a platform engineer registers an external server by URL and later populates tools after observing what the endpoint exposes. `MCPServerVersion` is the source of truth for tools; `MCPAccessEndpoint` responses project tools read-only from the resolved version for search convenience. Tool filtering is a future gateway concern.
 
 Retaining older versions enables:
 
@@ -404,9 +404,9 @@ Retaining older versions enables:
 
 **Typed payload**: The `server_json` field uses `dict` in the entity and store layers for simplicity. At the API layer, the `CreateMCPServerVersionRequest` uses a `ServerJSONPayload` Pydantic model (with `extra="allow"`) that validates the payload on ingestion and extracts typed fields. See [server_json validation](#server_json-validation).
 
-#### MCPAccessBinding
+#### MCPAccessEndpoint
 
-A direct access binding is the separate record that says a governed MCP server version or alias can be reached through an approved non-gateway endpoint. An `MCPServerVersion` is the governed metadata record for a server definition; by itself, it does not mean there is an approved direct endpoint available in the workspace. `MCPAccessBinding` is what makes that governed server show up in direct-access discovery. The registry is intentionally runtime-agnostic: MLflow-aware clients or runtimes may resolve a registered MCP server through MLflow and then either use the canonical `server_json` payload directly (for example, for local `packages[]` consumption) or follow an approved direct access binding. When the canonical server definition changes, publishers register a new version. When only direct connectivity changes, operators create or update access bindings without creating a new version.
+A direct access endpoint is the separate record that says a governed MCP server version or alias can be reached through an approved non-gateway endpoint. An `MCPServerVersion` is the governed metadata record for a server definition; by itself, it does not mean there is an approved direct endpoint available in the workspace. `MCPAccessEndpoint` is what makes that governed server show up in direct-access discovery. The registry is intentionally runtime-agnostic: MLflow-aware clients or runtimes may resolve a registered MCP server through MLflow and then either use the canonical `server_json` payload directly (for example, for local `packages[]` consumption) or follow an approved direct access endpoint. When the canonical server definition changes, publishers register a new version. When only direct connectivity changes, operators create or update access endpoints without creating a new version.
 
 ```python
 class MCPRemoteTransportType(StrEnum):
@@ -415,10 +415,10 @@ class MCPRemoteTransportType(StrEnum):
 
 
 @dataclass
-class MCPAccessBinding:
-    binding_id: int  # stable MLflow-managed binding identifier
+class MCPAccessEndpoint:
+    id: str  # stable MLflow-managed endpoint identifier (UUID string; see Endpoint IDs)
     server_name: str  # MCPServer name
-    endpoint_url: str  # required approved direct endpoint
+    url: str  # required approved direct endpoint
     transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP
     server_version: str | None = None  # exactly one of server_version / server_alias must be set
     server_alias: str | None = None
@@ -430,23 +430,23 @@ class MCPAccessBinding:
     last_updated_timestamp: int | None = None
 ```
 
-**Binding target**: An access binding points to either a concrete `server_version` or a `server_alias`, but never both. A binding that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string. In addition to user-defined aliases, bindings may also target the reserved system alias `latest`. Unlike stored aliases, `latest` is not persisted in `mcp_server_aliases`; it is resolved dynamically using the same latest-version rule as `get_mcp_server_version_by_alias(..., alias="latest")`.
+**Endpoint target**: An access endpoint points to either a concrete `server_version` or a `server_alias`, but never both. An endpoint that follows an alias is useful for operational flows such as "production" where the live endpoint should track a stable governance pointer rather than a pinned version string. In addition to user-defined aliases, endpoints may also target the reserved system alias `latest`. Unlike stored aliases, `latest` is not persisted in `mcp_server_aliases`; it is resolved dynamically using the same latest-version rule as `get_mcp_server_version_by_alias(..., alias="latest")`.
 
-**Connection details**: `endpoint_url` and `transport_type` together describe how a client connects to the approved endpoint. These are properties of the binding itself, not of the governed server version it points to — an enterprise may deploy the same governed server behind a different transport than the publisher declared in `server_json.remotes[]`. For example, a publisher may declare SSE endpoints in their upstream metadata while the enterprise deploys the same server internally behind a streamable-http reverse proxy.
+**Connection details**: `url` and `transport_type` together describe how a client connects to the approved endpoint. These are properties of the endpoint itself, not of the governed server version it points to — an enterprise may deploy the same governed server behind a different transport than the publisher declared in `server_json.remotes[]`. For example, a publisher may declare SSE endpoints in their upstream metadata while the enterprise deploys the same server internally behind a streamable-http reverse proxy.
 
-**Why a separate entity**: Direct connectivity changes independently from the canonical MCP definition. Modeling approved direct access as a separate binding avoids mutating version records when an endpoint moves, when an alias changes, or when multiple approved direct entrypoints exist for the same governed server. It is valid for multiple versions of the same `MCPServer` to be available at once, for example to support both `v1` and `v2` clients during a migration, and the model does not prevent multiple approved direct endpoints from targeting the same governed version when needed. Binding detail and binding summary responses include a `resolved_version` field for convenience; when the binding target can be resolved, it contains the fully resolved governed version, and otherwise it is `null`.
+**Why a separate entity**: Direct connectivity changes independently from the canonical MCP definition. Modeling approved direct access as a separate endpoint avoids mutating version records when an endpoint moves, when an alias changes, or when multiple approved direct entrypoints exist for the same governed server. It is valid for multiple versions of the same `MCPServer` to be available at once, for example to support both `v1` and `v2` clients during a migration, and the model does not prevent multiple approved direct endpoints from targeting the same governed version when needed. Endpoint detail and endpoint summary responses include a `resolved_version` field for convenience; when the endpoint target can be resolved, it contains the fully resolved governed version, and otherwise it is `null`.
 
-**Binding lifecycle**: An access binding exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the binding is deleted. Bindings that follow the reserved `latest` pointer remain valid as long as the shared latest-resolution rule resolves to some version. If `latest` no longer resolves, those bindings should be eagerly deleted rather than left behind as hidden unresolved rows. This keeps get/search behavior simple: normal APIs only return resolvable bindings.
+**Endpoint lifecycle**: An access endpoint exists only while the direct access path should be surfaced. When a direct endpoint is no longer approved, the endpoint is deleted. Endpoints that follow the reserved `latest` pointer remain valid as long as the shared latest-resolution rule resolves to some version. If `latest` no longer resolves, those endpoints should be eagerly deleted rather than left behind as hidden unresolved rows. This keeps get/search behavior simple: normal APIs only return resolvable endpoints.
 
-**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed server name + version or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access bindings.
+**Future gateway relationship**: A future MLflow MCP Gateway may introduce its own gateway-managed entity that resolves against the same governed server name + version or alias model in the registry, following the same parent/target resolution pattern while adding gateway-specific fields and lifecycle. This RFC only defines direct access endpoints.
 
 #### Future gateway path (informative)
 
 The intended future evolution path is:
 
-1. The registry remains the source of truth for governed server identity and resolution through `MCPServer`, `MCPServerVersion`, and `MCPServerAlias`. In Phase 1, it also owns the direct-access `MCPAccessBinding` records.
+1. The registry remains the source of truth for governed server identity and resolution through `MCPServer`, `MCPServerVersion`, and `MCPServerAlias`. In Phase 1, it also owns the direct-access `MCPAccessEndpoint` records.
 2. A future MLflow MCP Gateway introduces a gateway-owned entity that points to the same governed server and resolves through either a concrete `version` or an `alias`.
-3. Discovery remains unified: the registry listing continues to show governed MCP servers, while availability-oriented discovery can surface either direct-access bindings or future gateway-managed access paths without creating a second MCP catalog.
+3. Discovery remains unified: the registry listing continues to show governed MCP servers, while availability-oriented discovery can surface either direct-access endpoints or future gateway-managed access paths without creating a second MCP catalog.
 4. Version rollouts continue to use governed aliases. If a gateway-owned deployment record targets an alias, moving that alias updates the resolved governed version without requiring the gateway deployment record itself to change.
 5. Trace linking continues to resolve through governed identity: gateway request -> gateway-managed entity -> governed alias or version -> `{workspace, name, version}`.
 
@@ -454,7 +454,7 @@ The intended future evolution path is:
 erDiagram
     MCPServer ||--o{ MCPServerVersion : "has versions"
     MCPServer ||--o{ MCPServerAlias : "has aliases"
-    MCPServer ||--o{ MCPAccessBinding : "direct access"
+    MCPServer ||--o{ MCPAccessEndpoint : "direct access"
 ```
 
 #### server_json and the upstream MCP specification
@@ -472,9 +472,9 @@ Below is a subset of the fields that the upstream spec defines:
 
 MLflow preserves the full `server_json` payload as provided by the publisher, and MLflow-aware clients can read and parse that full payload directly. Publisher-declared `remotes[]` remain part of the preserved upstream metadata, but they are not the MLflow source of truth for approved direct enterprise connectivity.
 
-**Source of truth for direct access**: `MCPAccessBinding` is the MLflow-governed source of truth for approved direct endpoints that MLflow should surface to users. For convenience, registration helpers may optionally create bindings from declared `remotes[]`, but once created the binding is the governed record MLflow uses for approved direct connectivity. When `create_access_bindings_from_remotes=True`, the helper creates one direct-access binding per declared `remotes[]` entry, targets the newly created version, uses the literal `url` value from the upstream payload, and carries over the `transport_type` from the upstream entry.
+**Source of truth for direct access**: `MCPAccessEndpoint` is the MLflow-governed source of truth for approved direct endpoints that MLflow should surface to users. For convenience, registration helpers may optionally create endpoints from declared `remotes[]`, but once created the endpoint is the governed record MLflow uses for approved direct connectivity. When `create_access_endpoints_from_remotes=True`, the helper creates one direct-access endpoint per declared `remotes[]` entry, targets the newly created version, uses the literal `url` value from the upstream payload, and carries over the `transport_type` from the upstream entry.
 
-MLflow-managed fields such as `status` and `tools` are stored as first-class MLflow fields on `MCPServerVersion`, **not** inside `server_json`. Direct access bindings are stored in `MCPAccessBinding`, not embedded into `server_json`. `MCPServerVersion` is the source of truth for tools; binding responses project tools read-only from the resolved version. In API responses, version-level MLflow-managed fields are projected into a namespaced `_meta` block for interoperability:
+MLflow-managed fields such as `status` and `tools` are stored as first-class MLflow fields on `MCPServerVersion`, **not** inside `server_json`. Direct access endpoints are stored in `MCPAccessEndpoint`, not embedded into `server_json`. `MCPServerVersion` is the source of truth for tools; endpoint responses project tools read-only from the resolved version. In API responses, version-level MLflow-managed fields are projected into a namespaced `_meta` block for interoperability:
 
 ```json
 {
@@ -538,7 +538,7 @@ class MCPServerTag:
 
 Aliases provide stable version pointers. For example, setting alias `"production"` to version `"1.2.0"` allows consumers to resolve `get_mcp_server_version_by_alias("my-server", "production")` without tracking specific version strings. `MCPServer` exposes the full alias → version map, and version entities expose the subset of alias names that currently target that version.
 
-Aliases are most useful when more than one version may intentionally be live at once. Common patterns include `dev` / `staging` / `production` promotion, parallel deployment of old and new versions during a breaking change, legacy `v1` and `v2` compatibility under the same governed server identity, and local workflows where users intentionally choose among multiple versions. Because access bindings can target aliases, operators can move a stable environment pointer without changing the governed server identity or forcing every client to track a raw version string.
+Aliases are most useful when more than one version may intentionally be live at once. Common patterns include `dev` / `staging` / `production` promotion, parallel deployment of old and new versions during a breaking change, legacy `v1` and `v2` compatibility under the same governed server identity, and local workflows where users intentionally choose among multiple versions. Because access endpoints can target aliases, operators can move a stable environment pointer without changing the governed server identity or forcing every client to track a raw version string.
 
 ### Status lifecycle
 
@@ -572,7 +572,7 @@ stateDiagram-v2
 | `active` | `draft`, `deprecated` |
 | `deprecated` | `active`, `deleted` |
 
-`draft` lets teams stage MCP server versions — validating metadata, setting aliases, and configuring access bindings — before making them discoverable. Transitioning from `draft` to `active` is an explicit publish action. A draft can also be discarded directly (`draft` → `deleted`) without ever being published. `active` can return to `draft` (unpublish) when a version was published prematurely or needs rework. Draft versions never win while an `active` version exists, but when no `active` version exists they can still resolve `latest` — and therefore drive reserved `latest` alias resolution, `latest_version`, and derived server metadata — if the highest semantic-version non-`deleted` non-`active` version is `draft`.
+`draft` lets teams stage MCP server versions — validating metadata, setting aliases, and configuring access endpoints — before making them discoverable. Transitioning from `draft` to `active` is an explicit publish action. A draft can also be discarded directly (`draft` → `deleted`) without ever being published. `active` can return to `draft` (unpublish) when a version was published prematurely or needs rework. Draft versions never win while an `active` version exists, but when no `active` version exists they can still resolve `latest` — and therefore drive reserved `latest` alias resolution, `latest_version`, and derived server metadata — if the highest semantic-version non-`deleted` non-`active` version is `draft`.
 
 `deprecated` can return to `active` (re-activate) to handle cases where a deprecation was premature or a planned replacement is not yet ready. Deprecated versions remain directly addressable by exact version or alias. They never win while an `active` version exists, but when no `active` version exists they can still resolve `latest` — and therefore drive reserved `latest` alias resolution, `latest_version`, and derived server metadata — if the highest semantic-version non-`deleted` non-`active` version is `deprecated`. `deleted` is terminal.
 
@@ -591,12 +591,12 @@ The six registry tables and one trace-link table are created via Alembic migrati
 | `workspace` | `String(63)` | PK, default `'default'` |
 | `name` | `String(256)` | PK |
 | `display_name` | `String(256)` | mutable human-readable label |
-| `description` | `String(5000)` | |
+| `description` | `Text` | |
 | `icons` | `JSON` | nullable; sized icon variants (src, sizes, mimeType, theme) |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 #### `mcp_server_versions` — one row per version
 
@@ -604,10 +604,11 @@ The six registry tables and one trace-link table are created via Alembic migrati
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK → mcp_servers |
 | `name` | `String(256)` | PK, FK → mcp_servers |
-| `version` | `String(256)` | PK, publisher-supplied |
+| `version` | `String(128)` | PK, publisher-supplied |
 | `version_major` | `Integer` | extracted from validated semantic version |
 | `version_minor` | `Integer` | extracted from validated semantic version |
 | `version_patch` | `Integer` | extracted from validated semantic version |
+| `version_prerelease_sort_key` | `String(512)` | materialized prerelease ordering key |
 | `server_json` | `JSON` | immutable canonical MCP payload |
 | `display_name` | `String(256)` | mutable human-readable label |
 | `status` | `String(20)` | default `'draft'` |
@@ -615,14 +616,14 @@ The six registry tables and one trace-link table are created via Alembic migrati
 | `source` | `String(512)` | provenance URI |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
 
-**Semantic version ordering**: `version_major`, `version_minor`, and `version_patch` are materialized from the validated semantic version string at write time. `get_latest_mcp_server_version` filters to `active` rows, orders them by these numeric fields in descending order, and then applies full semantic-version precedence in application code when multiple candidates share the same `major.minor.patch` and differ by prerelease identifiers. Build metadata remains part of the stored canonical version string but is ignored for precedence.
+**Semantic version ordering**: `version_major`, `version_minor`, `version_patch`, and `version_prerelease_sort_key` are materialized from the validated semantic version string at write time. `get_latest_mcp_server_version` filters to `active` rows, orders them by these materialized fields in descending order, with `created_at` and finally the raw version string as tiebreakers. Build metadata remains part of the stored canonical version string but is ignored for precedence.
 
-**Index**: `ix_mcp_server_versions_latest_lookup` on `(workspace, name, status, version_major, version_minor, version_patch)` supports latest-resolution lookups.
+**Index**: `idx_mcp_server_versions_latest` on `(workspace, name, status, version_major, version_minor, version_patch)` supports latest-resolution lookups. The index intentionally covers only the coarse semver prefix to stay within MySQL's 3072-byte key limit; prerelease and later tiebreak columns are applied outside the index.
 
 #### `mcp_server_tags` — server-level key-value metadata
 
@@ -639,7 +640,7 @@ FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
 |--------|------|-------|
 | `workspace` | `String(63)` | PK, FK → mcp_server_versions |
 | `name` | `String(256)` | PK, FK → mcp_server_versions |
-| `version` | `String(256)` | PK, FK → mcp_server_versions |
+| `version` | `String(128)` | PK, FK → mcp_server_versions |
 | `key` | `String(256)` | PK |
 | `value` | `Text` | |
 
@@ -650,37 +651,37 @@ FK: `(workspace, name)` → `mcp_servers`, CASCADE delete.
 | `workspace` | `String(63)` | PK, FK → mcp_servers |
 | `name` | `String(256)` | PK, FK → mcp_servers |
 | `alias` | `String(256)` | PK |
-| `version` | `String(256)` | target version string |
+| `version` | `String(128)` | target version string |
 
 FK: `(workspace, name)` → `mcp_servers`, CASCADE delete/update.
 
 This matches MLflow's registered model alias pattern: aliases are stored in a parent-scoped table, and the target version is validated when aliases are set and projected back onto version entities when they are read.
 
-#### `mcp_access_bindings` — approved direct connection paths
+#### `mcp_access_endpoints` — approved direct connection paths
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `binding_id` | `BigInteger` | PK, auto-incrementing binding ID |
+| `id` | `String(36)` | PK; UUID string generated as `ae-<uuid4 hex>` |
 | `workspace` | `String(63)` | not-null, default `'default'` |
 | `server_name` | `String(256)` | FK → mcp_servers |
-| `server_version` | `String(256)` | nullable; exactly one of `server_version` / `server_alias` must be set |
+| `server_version` | `String(128)` | nullable; exactly one of `server_version` / `server_alias` must be set |
 | `server_alias` | `String(256)` | nullable |
-| `endpoint_url` | `String(2048)` | direct endpoint URL |
+| `url` | `String(2048)` | direct endpoint URL |
 | `transport_type` | `String(32)` | default `'streamable-http'` |
 | `created_by` | `String(256)` | |
 | `last_updated_by` | `String(256)` | |
-| `creation_timestamp` | `BigInteger` | millis since epoch |
-| `last_updated_timestamp` | `BigInteger` | millis since epoch |
+| `created_at` | `BigInteger` | millis since epoch |
+| `last_updated_at` | `BigInteger` | millis since epoch |
 
 FK: `(workspace, server_name)` → `mcp_servers`, CASCADE delete.
 
-**Validation**: Application-level validation enforces that exactly one of `server_version` / `server_alias` is set. For version bindings, the version must exist on the parent server. For alias bindings, `server_alias` must either be a stored alias on the parent server or the reserved system alias `latest`. Creating or updating a binding with `server_alias="latest"` is only valid when the shared latest-resolution rule currently resolves to some non-`deleted` version; otherwise the request fails. `endpoint_url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side binding/deployment entity against the same governed server identities.
+**Validation**: Application-level validation enforces that exactly one of `server_version` / `server_alias` is set. For version endpoints, the version must exist on the parent server. For alias endpoints, `server_alias` must either be a stored alias on the parent server or the reserved system alias `latest`. Creating or updating an endpoint with `server_alias="latest"` is only valid when the shared latest-resolution rule currently resolves to some non-`deleted` version; otherwise the request fails. `url` is required. A future MLflow MCP Gateway may define and manage its own gateway-side endpoint/deployment entity against the same governed server identities.
 
 **Indexes**:
 
-- `ix_mcp_access_bindings_server_name` on `(workspace, server_name)`
-- `ix_mcp_access_bindings_version` on `(workspace, server_name, server_version)`
-- `ix_mcp_access_bindings_alias` on `(workspace, server_name, server_alias)`
+- `ix_mcp_access_endpoints_server_name` on `(workspace, server_name)`
+- `ix_mcp_access_endpoints_version` on `(workspace, server_name, server_version)`
+- `ix_mcp_access_endpoints_alias` on `(workspace, server_name, server_alias)`
 
 #### `span_mcp_server_links` — observed provenance
 
@@ -703,11 +704,11 @@ Like RFC 0009's `span_skill_links`, this table stores one idempotent observation
 
 **JSON columns**: `server_json` uses SQLAlchemy's `JSON` type (with `mssql.JSON` for SQL Server), following the pattern established by MLflow's evaluation dataset records and span dimension attributes. This maps to native `JSON` on PostgreSQL and MySQL (with database-level validation on write), and to `NVARCHAR(MAX)` / `TEXT` on MSSQL and SQLite.
 
-**Workspace handling**: All tables are workspace-scoped. Server-scoped tables use `(workspace, name)` as their leading identity components. Access binding tables use `binding_id` as the sole primary key, with `workspace` as a non-null column (not part of the PK). Single-tenant deployments use the `'default'` workspace.
+**Workspace handling**: All tables are workspace-scoped. Server-scoped tables use `(workspace, name)` as their leading identity components. Access endpoint tables use `id` as the sole primary key, with `workspace` as a non-null column (not part of the PK). Single-tenant deployments use the `'default'` workspace.
 
-**Binding IDs**: `binding_id` is an integer-style MLflow-managed identifier, similar in spirit to experiment IDs. It gives access bindings a stable, concise resource key without overloading mutable fields such as `server_version`, `server_alias`, or `endpoint_url` as part of the binding's identity. The nested API paths retain `{name}` for parent-resource scoping, authorization, and URL consistency even though `binding_id` is the stable binding identifier. `binding_id` is globally unique via a single auto-incrementing sequence, following the same pattern as `experiment_id`. A composite `(workspace, binding_id)` PK is not used because SQLite — MLflow's default backend — does not support autoincrement on composite primary keys.
+**Endpoint IDs**: `id` is a UUID string generated by the store as `ae-<uuid4 hex>` and stored in a `String(36)` column. This follows MLflow's established prefixed-UUID identifier pattern for newer resources — the AI Gateway generates `e-` (endpoints), `d-` (model definitions), `s-` (secrets), and similar prefixes, and issues use `iss-` — and gives access endpoints a stable, concise resource key without overloading mutable fields such as `server_version`, `server_alias`, or `url` as part of the endpoint's identity. The nested API paths retain `{name}` for parent-resource scoping, authorization, and URL consistency; the `{endpoint_id}` path parameter, SDK arguments, and store method parameters refer to this `id` value.
 
-**Timestamps**: Set at the application layer via `get_current_time_millis()`, not via DDL defaults.
+**Timestamps**: Set at the application layer via `get_current_time_millis()`, not via DDL defaults. Database columns are named `created_at` / `last_updated_at`; the entity and REST layers expose them as `creation_timestamp` / `last_updated_timestamp`, following the mapping used by other MLflow entities.
 
 ### Abstract store interface
 
@@ -820,22 +821,22 @@ class MCPServerRegistryMixin:
     def delete_mcp_server_version(self, name: str, version: str) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
-    # --- MCPAccessBinding operations ---
+    # --- MCPAccessEndpoint operations ---
 
-    def create_mcp_access_binding(
+    def create_mcp_access_endpoint(
         self,
         server_name: str,
-        endpoint_url: str,
+        url: str,
         transport_type: MCPRemoteTransportType = MCPRemoteTransportType.STREAMABLE_HTTP,
         server_version: str | None = None,
         server_alias: str | None = None,
-    ) -> MCPAccessBinding:
+    ) -> MCPAccessEndpoint:
         raise NotImplementedError(self.__class__.__name__)
 
-    def get_mcp_access_binding(self, server_name: str, binding_id: int) -> MCPAccessBinding:
+    def get_mcp_access_endpoint(self, server_name: str, endpoint_id: str) -> MCPAccessEndpoint:
         raise NotImplementedError(self.__class__.__name__)
 
-    def search_mcp_access_bindings(
+    def search_mcp_access_endpoints(
         self,
         server_name: str | None = None,
         server_version: str | None = None,
@@ -844,21 +845,21 @@ class MCPServerRegistryMixin:
         max_results: int = SEARCH_MAX_RESULTS_DEFAULT,
         order_by: list[str] | None = None,
         page_token: str | None = None,
-    ) -> PagedList[MCPAccessBinding]:
+    ) -> PagedList[MCPAccessEndpoint]:
         raise NotImplementedError(self.__class__.__name__)
 
-    def update_mcp_access_binding(
+    def update_mcp_access_endpoint(
         self,
         server_name: str,
-        binding_id: int,
+        endpoint_id: str,
         server_version: str | None = NOT_SET,
         server_alias: str | None = NOT_SET,
-        endpoint_url: str | None = NOT_SET,
+        url: str | None = NOT_SET,
         transport_type: MCPRemoteTransportType | None = NOT_SET,
-    ) -> MCPAccessBinding:
+    ) -> MCPAccessEndpoint:
         raise NotImplementedError(self.__class__.__name__)
 
-    def delete_mcp_access_binding(self, server_name: str, binding_id: int) -> None:
+    def delete_mcp_access_endpoint(self, server_name: str, endpoint_id: str) -> None:
         raise NotImplementedError(self.__class__.__name__)
 
     # --- Tag operations (key/value style, not tag-object style) ---
@@ -887,13 +888,13 @@ class MCPServerRegistryMixin:
 For update fields, omitting a parameter leaves the stored value unchanged, while passing
 `None` to a nullable field explicitly sets the field to `null`.
 
-**User-facing vs. store layer**: The Python SDK exposes `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as the canonical entry points for registering MCP servers. These handle the common workflow of ingesting a canonical `server.json`, auto-creating the parent `MCPServer` if needed, and optionally creating access bindings from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations remain available on `MlflowClient` for programmatic use cases, but are not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
+**User-facing vs. store layer**: The Python SDK exposes `register_mcp_server(...)` and `register_mcp_server_from_url(...)` as the canonical entry points for registering MCP servers. These handle the common workflow of ingesting a canonical `server.json`, auto-creating the parent `MCPServer` if needed, and optionally creating access endpoints from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations remain available on `MlflowClient` for programmatic use cases, but are not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. The URL helper is client-side and fetches the canonical `server.json` over HTTPS before calling the same registration path.
 
-**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, or if `version` is not a valid semantic version, creation fails with a validation error. On success, the store also materializes `version_major`, `version_minor`, and `version_patch` from the parsed version. New versions default to `draft` status.
+**Name and version extraction**: `create_mcp_server_version` extracts both `name` and `version` from `server_json` at the store layer. In the native REST API, version creation is nested under `/{name}/versions`; `server_json["name"]` must match the path parameter, and the matching parent `MCPServer` is looked up or auto-created if needed. If either `name` or `version` is missing from `server_json`, or if `version` is not a valid semantic version, creation fails with a validation error. On success, the store also materializes `version_major`, `version_minor`, `version_patch`, and `version_prerelease_sort_key` from the parsed version. New versions default to `draft` status.
 
 **Status transition enforcement**: `update_mcp_server_version` validates that status transitions follow the allowed paths (draft→active, draft→deleted, active→draft, active→deprecated, deprecated→active, deprecated→deleted). `deleted` is terminal. New versions default to `draft`; transitioning to `active` is an explicit publish action, and any later status change is likewise an explicit admin action rather than automatic MLflow behavior.
 
-**Latest version**: `get_latest_mcp_server_version` returns the same shared latest pointer described above: the highest semantic version among `active` versions if one exists, otherwise the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in precedence and build metadata do not affect precedence. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same rule is reused when an `MCPAccessBinding` targets `server_alias="latest"`.
+**Latest version**: `get_latest_mcp_server_version` returns the same shared latest pointer described above: the highest semantic version among `active` versions if one exists, otherwise the highest semantic version among non-`deleted` non-`active` versions. Prerelease identifiers participate in precedence and build metadata do not affect precedence. The alias name `latest` is reserved: `set_mcp_server_alias(..., alias="latest", ...)` is rejected, while `get_mcp_server_version_by_alias(..., alias="latest")` is treated as a convenience alias for `get_latest_mcp_server_version(...)`. The same rule is reused when an `MCPAccessEndpoint` targets `server_alias="latest"`.
 
 **Parent-derived status resolution**: `MCPServer.status` follows the parent-resolution rule defined above: prefer the highest semantic-version `active` version if one exists; otherwise fall back to the highest semantic-version non-`deleted` non-`active` version.
 
@@ -957,12 +958,12 @@ All paths below are relative to the logical MCP router prefix.
 | `GET` | `/{name}/versions/{version}` | Get a specific version |
 | `PATCH` | `/{name}/versions/{version}` | Update version (status, display name) |
 | `DELETE` | `/{name}/versions/{version}` | Delete a version |
-| `POST` | `/{name}/bindings` | Create a direct access binding |
-| `GET` | `/bindings` | List/search access bindings across the workspace |
-| `GET` | `/{name}/bindings` | List/search access bindings for a specific server |
-| `GET` | `/{name}/bindings/{binding_id}` | Get an access binding |
-| `PATCH` | `/{name}/bindings/{binding_id}` | Update an access binding |
-| `DELETE` | `/{name}/bindings/{binding_id}` | Delete an access binding |
+| `POST` | `/{name}/endpoints` | Create a direct access endpoint |
+| `GET` | `/endpoints` | List/search access endpoints across the workspace |
+| `GET` | `/{name}/endpoints` | List/search access endpoints for a specific server |
+| `GET` | `/{name}/endpoints/{endpoint_id}` | Get an access endpoint |
+| `PATCH` | `/{name}/endpoints/{endpoint_id}` | Update an access endpoint |
+| `DELETE` | `/{name}/endpoints/{endpoint_id}` | Delete an access endpoint |
 | `POST` | `/{name}/tags` | Set a server-level tag |
 | `DELETE` | `/{name}/tags/{key}` | Delete a server-level tag |
 | `POST` | `/{name}/versions/{version}/tags` | Set a version-level tag |
@@ -971,11 +972,11 @@ All paths below are relative to the logical MCP router prefix.
 | `GET` | `/{name}/aliases/{alias}` | Resolve alias to version; reserved `latest` resolves through semantic-version latest logic |
 | `DELETE` | `/{name}/aliases/{alias}` | Delete an alias |
 
-Resource identifiers (`name`, `version`, `alias`, `binding_id`, `key`) are path parameters, not query parameters. This makes URLs self-describing and enables standard HTTP caching.
+Resource identifiers (`name`, `version`, `alias`, `endpoint_id`, `key`) are path parameters, not query parameters. This makes URLs self-describing and enables standard HTTP caching.
 
-Because the router exposes both a static workspace-level `GET /bindings` route and a parameterized `GET /{name}/...` namespace, the static `/bindings` route must be registered before the `/{name}` routes so the literal string `bindings` is not interpreted as a server name.
+Because the router exposes both a static workspace-level `GET /endpoints` route and a parameterized `GET /{name}/...` namespace, the static `/endpoints` route must be registered before the `/{name}` routes so the literal string `endpoints` is not interpreted as a server name.
 
-Latest resolution is expressed through the alias route, not through a special `/versions/latest` endpoint. Callers that want the system-defined latest pointer should use `GET /{name}/aliases/latest` or create/update bindings with `server_alias="latest"`.
+Latest resolution is expressed through the alias route, not through a special `/versions/latest` endpoint. Callers that want the system-defined latest pointer should use `GET /{name}/aliases/latest` or create/update endpoints with `server_alias="latest"`.
 
 #### Request and response models
 
@@ -1029,17 +1030,17 @@ class UpdateMCPServerVersionRequest(BaseModel):
     tools: list[MCPToolPayload] | None = None
 
 
-class CreateMCPAccessBindingRequest(BaseModel):
+class CreateMCPAccessEndpointRequest(BaseModel):
     server_version: str | None = None
     server_alias: str | None = None
-    endpoint_url: str
+    url: str
     transport_type: str = "streamable-http"
 
 
-class UpdateMCPAccessBindingRequest(BaseModel):
+class UpdateMCPAccessEndpointRequest(BaseModel):
     server_version: str | None = None
     server_alias: str | None = None
-    endpoint_url: str | None = None
+    url: str | None = None
     transport_type: str | None = None
 
 
@@ -1048,10 +1049,10 @@ class AliasResponse(BaseModel):
     version: str
 
 
-class MCPAccessBindingSummaryResponse(BaseModel):
-    binding_id: int
+class MCPAccessEndpointSummaryResponse(BaseModel):
+    id: str
     server_name: str
-    endpoint_url: str
+    url: str
     transport_type: str = "streamable-http"
     server_version: str | None = None
     server_alias: str | None = None
@@ -1064,7 +1065,7 @@ class MCPServerResponse(BaseModel):
     description: str | None = None
     icons: list[MCPIconPayload] | None = None
     status: str | None = None  # derived from the latest-resolved version's status
-    access_bindings: list[MCPAccessBindingSummaryResponse] = Field(default_factory=list)
+    access_endpoints: list[MCPAccessEndpointSummaryResponse] = Field(default_factory=list)
     latest_version: str | None = None  # read-only; resolved latest version using the shared latest-resolution rule
     aliases: list[AliasResponse] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
@@ -1090,10 +1091,10 @@ class MCPServerVersionResponse(BaseModel):
     last_updated_timestamp: int | None = None
 
 
-class MCPAccessBindingResponse(BaseModel):
-    binding_id: int
+class MCPAccessEndpointResponse(BaseModel):
+    id: str
     server_name: str
-    endpoint_url: str
+    url: str
     transport_type: str = "streamable-http"
     tools: list[MCPToolPayload] | None = None  # read-only; projected from resolved version
     server_version: str | None = None
@@ -1119,11 +1120,11 @@ class SetTagRequest(BaseModel):
 
 `MCPServerResponse.display_name`, `description`, and `icons` are returned exactly as stored on `MCPServer`. If the user has not set them, the API returns `null`. Any fallback to fields in `server_json` is presentation-only behavior applied by the UI, not by the API.
 
-Binding detail and binding summary responses may include `resolved_version`
+Endpoint detail and endpoint summary responses may include `resolved_version`
 for convenience so callers do not need a second lookup to understand
-alias-backed bindings.
+alias-backed endpoints.
 
-For bindings that target `server_alias="latest"`, `resolved_version` reflects the version selected by the shared latest-resolution rule rather than a stored alias row.
+For endpoints that target `server_alias="latest"`, `resolved_version` reflects the version selected by the shared latest-resolution rule rather than a stored alias row.
 
 #### Pagination
 
@@ -1142,23 +1143,33 @@ Response:
 }
 ```
 
+Endpoint search responses use the same envelope with an `mcp_access_endpoints` key:
+
+```json
+{
+  "mcp_access_endpoints": [...],
+  "next_page_token": "..."
+}
+```
+
 #### Filter expressions
 
-The `filter_string` parameter supports expressions following existing MLflow filter syntax. Search endpoints support the subset of fields relevant to that resource type (server, version, or access binding):
+The `filter_string` parameter supports expressions following existing MLflow filter syntax. Search endpoints support the subset of fields relevant to that resource type (server, version, or access endpoint):
 
 - `name = 'io.github.anthropic/brave-search'`
 - `name LIKE '%search%'`
+- `display_name = 'Brave Search'` (server-level only; mutable user-defined label)
 - `status = 'active'`
 - `status IN ('active', 'deprecated')`
-- `has_access_bindings = 'true'` (server-level only; return only governed servers that currently have at least one approved direct-access binding)
-- `transport_type = 'streamable-http'` (binding-level; filter access bindings by transport type)
+- `has_access_endpoints = 'true'` (server-level only; return only governed servers that currently have at least one approved direct-access endpoint)
+- `transport_type = 'streamable-http'` (endpoint-level; filter access endpoints by transport type)
 - `tags.team = 'platform'`
 
-`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access binding summaries on each `MCPServer` result. `search_mcp_access_bindings()` lists approved direct-access bindings across the workspace, and `search_mcp_access_bindings(server_name=...)` narrows that same API to a specific governed server. The `has_access_bindings = 'true'` filter is available for callers that only want directly usable MCP servers. Search and get APIs only surface bindings whose targets can currently be resolved. In particular, bindings that previously targeted `server_alias="latest"` should have been deleted once the shared latest-resolution rule no longer resolved rather than remaining retrievable in an unresolved state.
+`search_mcp_servers()` is the catalog-discovery API across governed MCP servers and always returns attached access endpoint summaries on each `MCPServer` result. `search_mcp_access_endpoints()` lists approved direct-access endpoints across the workspace, and `search_mcp_access_endpoints(server_name=...)` narrows that same API to a specific governed server. The `has_access_endpoints = 'true'` filter is available for callers that only want directly usable MCP servers. Search and get APIs only surface endpoints whose targets can currently be resolved. In particular, endpoints that previously targeted `server_alias="latest"` should have been deleted once the shared latest-resolution rule no longer resolved rather than remaining retrievable in an unresolved state.
 
 ### Python SDK
 
-The Python SDK exposes a user-facing `mlflow.genai` API that keeps the registry flows concise while still surfacing the main operations explicitly. `register_mcp_server` is the canonical entry point for creating MCP servers and versions — it auto-creates the parent `MCPServer` if needed and optionally creates access bindings from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations are available on `MlflowClient` for programmatic use, but are intentionally not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. Similar CLI commands will be added for the same operations, but this RFC does not spell out a separate CLI surface in detail.
+The Python SDK exposes a user-facing `mlflow.genai` API that keeps the registry flows concise while still surfacing the main operations explicitly. `register_mcp_server` is the canonical entry point for creating MCP servers and versions — it auto-creates the parent `MCPServer` if needed and optionally creates access endpoints from declared `remotes[]`. The lower-level `create_mcp_server()` and `create_mcp_server_version()` operations are available on `MlflowClient` for programmatic use, but are intentionally not re-exported in the `mlflow.genai` convenience layer to avoid multiple ways to do the same thing. Similar CLI commands will be added for the same operations, but this RFC does not spell out a separate CLI surface in detail.
 
 ```python
 import mlflow
@@ -1170,7 +1181,7 @@ def register_mcp_server(
     source: str | None = None,
     status: str = "draft",
     tools: list[MCPTool] | None = None,
-    create_access_bindings_from_remotes: bool = False,
+    create_access_endpoints_from_remotes: bool = False,
 ) -> MCPServerVersion: ...
 
 def register_mcp_server_from_url(
@@ -1180,7 +1191,7 @@ def register_mcp_server_from_url(
     source: str | None = None,
     status: str = "draft",
     tools: list[MCPTool] | None = None,
-    create_access_bindings_from_remotes: bool = False,
+    create_access_endpoints_from_remotes: bool = False,
 ) -> MCPServerVersion: ...
 
 def get_mcp_server(*, name: str) -> MCPServer: ...
@@ -1229,18 +1240,18 @@ def update_mcp_server_version(
 
 def delete_mcp_server_version(*, name: str, version: str) -> None: ...
 
-def create_mcp_access_binding(
+def create_mcp_access_endpoint(
     *,
     server_name: str,
-    endpoint_url: str,
+    url: str,
     transport_type: str = "streamable-http",
     server_version: str | None = None,
     server_alias: str | None = None,
-) -> MCPAccessBinding: ...
+) -> MCPAccessEndpoint: ...
 
-def get_mcp_access_binding(*, server_name: str, binding_id: int) -> MCPAccessBinding: ...
+def get_mcp_access_endpoint(*, server_name: str, endpoint_id: str) -> MCPAccessEndpoint: ...
 
-def search_mcp_access_bindings(
+def search_mcp_access_endpoints(
     *,
     server_name: str | None = None,
     server_version: str | None = None,
@@ -1249,19 +1260,19 @@ def search_mcp_access_bindings(
     max_results: int = 100,
     order_by: list[str] | None = None,
     page_token: str | None = None,
-) -> PagedList[MCPAccessBinding]: ...
+) -> PagedList[MCPAccessEndpoint]: ...
 
-def update_mcp_access_binding(
+def update_mcp_access_endpoint(
     *,
     server_name: str,
-    binding_id: int,
-    endpoint_url: str | None = NOT_SET,
+    endpoint_id: str,
+    url: str | None = NOT_SET,
     transport_type: str | None = NOT_SET,
     server_version: str | None = NOT_SET,
     server_alias: str | None = NOT_SET,
-) -> MCPAccessBinding: ...
+) -> MCPAccessEndpoint: ...
 
-def delete_mcp_access_binding(*, server_name: str, binding_id: int) -> None: ...
+def delete_mcp_access_endpoint(*, server_name: str, endpoint_id: str) -> None: ...
 
 def set_mcp_server_tag(*, name: str, key: str, value: str) -> None: ...
 
@@ -1279,10 +1290,10 @@ def delete_mcp_server_alias(*, name: str, alias: str) -> None: ...
 version = mlflow.genai.register_mcp_server(server_json={...})
 version = mlflow.genai.register_mcp_server_from_url(
     url="https://example.com/server.json",
-    create_access_bindings_from_remotes=True,
+    create_access_endpoints_from_remotes=True,
 )
-servers = mlflow.genai.search_mcp_servers(filter_string="has_access_bindings = 'true'")
-bindings = mlflow.genai.search_mcp_access_bindings()
+servers = mlflow.genai.search_mcp_servers(filter_string="has_access_endpoints = 'true'")
+endpoints = mlflow.genai.search_mcp_access_endpoints()
 ```
 
 For SDK update methods, `NOT_SET` means "leave unchanged" while `None` means "clear this nullable field". This mirrors the store-layer update contract so callers can distinguish partial updates from explicit nulling.
@@ -1316,19 +1327,19 @@ The MCP Servers page lives under the GenAI workflow in the MLflow sidebar, along
 
 > **Note:** The mockups below are for illustrative purposes only and do not fully align with the MLflow design system. The final implementation will follow MLflow's established design system and component library.
 >
-> The mockups below show the governed registry listing and detail view only. A separate access-binding listing is described in prose here, but does not yet have a dedicated mockup.
+> The mockups below show the governed registry listing and detail view only. A separate access-endpoint listing is described in prose here, but does not yet have a dedicated mockup.
 
 ![MCP Servers list view](mcp-servers-list-view.png)
 
-The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-binding listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest resolved version (if any), derived status, source, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the presentation-only fallback described above. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access bindings.
+The MCP Servers page supports two closely related listings: a registry listing of governed MCP servers, and an access-endpoint listing of approved direct endpoints currently surfaced in the workspace. The registry listing uses a card-based layout consistent with other MLflow pages, showing each server's name, latest resolved version (if any), derived status, source, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the presentation-only fallback described above. Users can filter by state and search by name or description. That same governed listing can also be filtered to show only servers that currently have approved direct-access endpoints.
 
-The access-binding listing lives in the same page and presents one row or card per approved direct endpoint. Each entry shows the endpoint URL, the governed MCP server it belongs to, and the target version or alias it resolves through. From this listing, users can navigate back to the governed server detail page to inspect the full `server_json`, tags, aliases, and version history behind that endpoint. This view is intended to answer "what direct MCP endpoints are available in this workspace right now?" without creating a second catalog separate from the governed registry.
+The access-endpoint listing lives in the same page and presents one row or card per approved direct endpoint. Each entry shows the endpoint URL, the governed MCP server it belongs to, and the target version or alias it resolves through. From this listing, users can navigate back to the governed server detail page to inspect the full `server_json`, tags, aliases, and version history behind that endpoint. This view is intended to answer "what direct MCP endpoints are available in this workspace right now?" without creating a second catalog separate from the governed registry.
 
 A "Create MCP Server" button initiates registration. A grid/list toggle allows switching between card and table views.
 
 ![MCP Servers detail view](mcp-servers-details-view.png)
 
-The detail view shows the server's metadata, versions list, aliases, direct access bindings, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the same presentation-only fallback described above. Individual version pages display the `server_json` payload, aliases, status, and any access bindings targeting that version or one of its aliases. Access binding detail views show the target (`version` or `alias`) and approved endpoint information, and the access-binding listing links back to the governed server records they expose.
+The detail view shows the server's metadata, versions list, aliases, direct access endpoints, and tags. When `display_name`, `description`, or `icons` are unset, the UI may apply the same presentation-only fallback described above. Individual version pages display the `server_json` payload, aliases, status, and any access endpoints targeting that version or one of its aliases. Access endpoint detail views show the target (`version` or `alias`) and approved endpoint information, and the access-endpoint listing links back to the governed server records they expose.
 
 **Tools display**: The version detail page displays the declared tools for that version — tool name, description, and input schema. This helps platform engineers and end users understand what capabilities a governed server version provides.
 
@@ -1340,7 +1351,7 @@ As a possible future UI integration, the registry detail view could expose a `De
 
 ### Trace linking
 
-An MCP server link identifies `{workspace, name}` and, when known, a concrete version. Grouping the span links by server and optional version answers which governed servers were present in a run. Discovery and tool-call spans provide the surrounding usage context. A name-only link does not claim which version ran and must never be filled with the current `latest` version. An access binding can supply the server coordinates, but the stored link is to the server rather than the binding. Alias retargeting and endpoint changes therefore do not rewrite historical traces.
+An MCP server link identifies `{workspace, name}` and, when known, a concrete version. Grouping the span links by server and optional version answers which governed servers were present in a run. Discovery and tool-call spans provide the surrounding usage context. A name-only link does not claim which version ran and must never be filled with the current `latest` version. An access endpoint can supply the server coordinates, but the stored link is to the server rather than the endpoint. Alias retargeting and endpoint changes therefore do not rewrite historical traces.
 
 #### Span contract and SDK
 
@@ -1360,7 +1371,7 @@ class MCPServerRef:
 class Span:
     def link_mcp_server(
         self,
-        server: MCPServerRef | MCPServerVersion | MCPAccessBinding,
+        server: MCPServerRef | MCPServerVersion | MCPAccessEndpoint,
         *,
         tool: str | None = None,
         cache_ttl_seconds: float | None = None,
@@ -1371,11 +1382,11 @@ The input determines the recorded identity:
 
 - `MCPServerRef` is an SDK-only value for a name and at most one of version or alias. An alias resolves when annotated; an unresolved alias fails. Only the concrete version is stored.
 - `MCPServerVersion` supplies its name and version directly.
-- `MCPAccessBinding` is reloaded by ID on cache miss or expiry. It supplies its server name and refreshed `resolved_version`, or a name-only link if unresolved. A missing binding or changed endpoint URL or transport fails on refresh. The binding target is registry context, not proof of the version the runtime served.
+- `MCPAccessEndpoint` is reloaded by ID on cache miss or expiry. It supplies its server name and refreshed `resolved_version`, or a name-only link if unresolved. A missing endpoint or changed endpoint URL or transport fails on refresh. The endpoint target is registry context, not proof of the version the runtime served.
 
-All inputs use the trace workspace; version and binding objects from another workspace fail. A span holds one server identity, and a conflicting second link fails. Raw URLs are not accepted because they may identify several bindings.
+All inputs use the trace workspace; version and endpoint objects from another workspace fail. A span holds one server identity, and a conflicting second link fails. Raw URLs are not accepted because they may identify several endpoints.
 
-Alias and binding lookups share a process-local cache: `MLFLOW_MCP_SERVER_CACHE_TTL_SECONDS` defaults to 60 seconds, `cache_ttl_seconds` overrides it, and `0` bypasses it. Concrete versions and name-only refs need no lookup.
+Alias and endpoint lookups share a process-local cache: `MLFLOW_MCP_SERVER_CACHE_TTL_SECONDS` defaults to 60 seconds, `cache_ttl_seconds` overrides it, and `0` bypasses it. Concrete versions and name-only refs need no lookup.
 
 | Span attribute | Value |
 |---|---|
@@ -1400,7 +1411,7 @@ An MCP server can declare its governed name and optional version once at startup
 
 #### First autologging integration: LangChain MCPAdapter
 
-A framework autologger can match an MCP connection's URL and transport to one approved access binding in the active workspace, accounting for equivalent transport spellings. At tool discovery, it resolves that binding and associates each returned tool object with the governed server name and optional version. When a tool runs in a traced application, the integration annotates its tool-call span with those coordinates and the tool name. Discovery may happen before a trace starts, so provenance must follow the tool object into execution; merely looking up a binding or loading tools does not link a later trace. Unmatched or ambiguous connections remain unlinked.
+A framework autologger can match an MCP connection's URL and transport to one approved access endpoint in the active workspace, accounting for equivalent transport spellings. At tool discovery, it resolves that endpoint and associates each returned tool object with the governed server name and optional version. When a tool runs in a traced application, the integration annotates its tool-call span with those coordinates and the tool name. Discovery may happen before a trace starts, so provenance must follow the tool object into execution; merely looking up an endpoint or loading tools does not link a later trace. Unmatched or ambiguous connections remain unlinked.
 
 The first framework integration in scope is [LangChain's `MCPAdapter`](https://docs.langchain.com/oss/python/langchain/mcp), used by LangGraph applications. It provides a concrete example for community contributors and coding agents to follow when adding support for other MCP clients. A LangGraph application can use it with a registered access endpoint:
 
@@ -1410,10 +1421,10 @@ from langchain.mcp import MCPAdapter
 from langgraph.prebuilt import ToolNode
 
 mlflow.langchain.autolog()  # With the proposed MCPAdapter instrumentation.
-binding = mlflow.genai.get_mcp_access_binding(
-    server_name="io.acme/weather", binding_id=17
+endpoint = mlflow.genai.get_mcp_access_endpoint(
+    server_name="io.acme/weather", endpoint_id="ae-0f14d2c3b5a74e8f9a0c1d2e3f4a5b6"
 )
-async with MCPAdapter(binding.endpoint_url) as adapter:
+async with MCPAdapter(endpoint.url) as adapter:
     mcp_tools = await adapter.list_tools()
 tool_node = ToolNode(mcp_tools)  # Used by the LangGraph agent.
 ```
@@ -1424,7 +1435,7 @@ For URL targets, MLflow autologging can:
 2. Monkey-patch `MCPAdapter.list_tools()` to call the original method and add the matched registry identity to each returned tool under an MLflow-specific metadata key.
 3. Read that [tool metadata in the tool-start callback](https://github.com/langchain-ai/langchain/blob/master/libs/core/langchain_core/tools/base.py) and annotate the corresponding MLflow span.
 
-The monkey-patches must be active before discovery and version-gated while `langchain.mcp` is beta. Multi-server targets or prebuilt clients remain unlinked when a tool cannot be matched to an endpoint unambiguously. The first integration includes an end-to-end example showing a registered binding, discovered tool, annotated tool-call span, and trace search result. A community issue will track other client and framework integrations, using this implementation as the reference.
+The monkey-patches must be active before discovery and version-gated while `langchain.mcp` is beta. Multi-server targets or prebuilt clients remain unlinked when a tool cannot be matched to an endpoint unambiguously. The first integration includes an end-to-end example showing a registered endpoint, discovered tool, annotated tool-call span, and trace search result. A community issue will track other client and framework integrations, using this implementation as the reference.
 
 ### Impact on existing MLflow components
 
@@ -1464,9 +1475,9 @@ Phases 1–3 are delivered. Phase 4 adds trace linking without a breaking change
 **Phase 1: Core registry**
 
 - Entities, database schema, store implementation, REST API, Python SDK, CLI
-- Access bindings for approved direct connection paths
+- Access endpoints for approved direct connection paths
 - Users can register and version MCP server definitions
-- Direct resolution via canonical `server_json` payloads or approved access bindings
+- Direct resolution via canonical `server_json` payloads or approved access endpoints
 - Existing MLflow functionality is unaffected
 
 **Phase 2: Upstream spec compatibility**
