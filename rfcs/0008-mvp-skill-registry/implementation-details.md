@@ -291,8 +291,8 @@ rejected before insert.
 
 ### `agent_plugin_version_mcp_members`
 
-MCP members are owned by a plugin version, not independent registry entities.
-Keep the skill membership table unchanged and add:
+Each row maps a plugin-local MCP name to an access binding, which owns the
+client configuration. The skill membership table is unchanged.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -301,34 +301,35 @@ Keep the skill membership table unchanged and add:
 | `plugin_name` | `String(128)` | PK, FK to plugin version |
 | `plugin_version` | `String(128)` | PK, FK to plugin version |
 | `member_name` | `String(128)` | PK; exact local `mcpServers` key |
-| `client_config` | `JSON` | required; immutable standard server-entry object for both plugin kinds |
-| `server_name` | `String(256)` | nullable; registered MCP server identity |
-| `server_version` | `String(256)` | nullable; concrete registered version, optionally resolved from an alias at registration |
+| `access_binding_id` | `BigInteger` | required; referenced access binding in the plugin workspace |
 
-The plugin-version FK cascades on hard delete. Server relations are
-application-enforced, without FKs, and must remain in the plugin workspace,
-including during workspace moves. Index `(plugin_workspace, server_name)`.
+The plugin-version FK cascades on hard delete; binding references are
+application-enforced and remain after binding deletion. Binding IDs are never
+reused. Bindings must stay in the plugin workspace, including during moves.
+Index `(plugin_workspace, access_binding_id)`.
 
-- Server associations require READ permission and do not rewrite the package's
-  configuration or verify the version running at an endpoint. Version and alias
-  selectors are mutually exclusive; aliases resolve at registration.
-- Hard deletion of an associated server or version is blocked while referenced
-  by a non-deleted plugin version.
-- Copying an access binding creates an immutable configuration snapshot. Later
-  binding updates or deletion do not affect the plugin or block binding deletion;
-  pull does not recheck binding approval. Configuration changes require a new
-  plugin version.
+**RFC-0004 schema extensions.** Update `mcp_access_bindings`:
 
-**Access-binding configuration.** Add this column to RFC-0004's
-`mcp_access_bindings`; existing columns remain unchanged:
+| Column | Change |
+|--------|--------|
+| `client_config` | Add nullable JSON for one standard remote or stdio client entry |
+| `server_name` | Make nullable |
+| `server_version`, `server_alias` | Optional, mutually exclusive selectors requiring `server_name` |
+| `endpoint_url`, `transport_type` | Allow null for stdio; retain remote endpoint/transport inputs |
 
-| Column | Type | Notes |
-|--------|------|-------|
-| `client_config` | `JSON` | nullable; complete standard remote MCP client configuration |
+Validate [stdio installation context](0008-mvp-skill-registry.md#mcp-configuration-members)
+on creation/update and plugin registration. New bindings and memberships commit
+atomically, allowing bundled stdio context to come from the plugin being created.
+The server checks membership metadata; clients check package files and recheck
+current configuration on pull.
 
-Accept either `transport_type` and `endpoint_url` or a remote `client_config`
-containing `type` and `url`; reject conflicting values when both are supplied.
-Authentication is client-managed; stdio and embedded credentials are unsupported.
+Without a version/alias selector, `resolved_version=None`; otherwise RFC-0004's
+dynamic resolution and cleanup rules apply. Cleanup and explicit binding
+deletion have the same effect on pulls. Plugin deletion leaves bindings intact.
+
+See [Access-binding API extensions](#access-binding-api-extensions) for input
+validation, Python signatures, and HTTP routes, and [Permissions](0008-mvp-skill-registry.md#permissions)
+for binding grants.
 
 ### `agent_plugin_tags`
 
@@ -713,9 +714,8 @@ class SkillVersion:
 **Status reasons (both entity types).** See [Status and lifecycle](0008-mvp-skill-registry.md#status-and-lifecycle)
 for warning and error behavior. A status change sets the supplied reason or
 clears it if omitted; `active` always clears it. Without a status change,
-omission leaves the reason unchanged and explicit null clears it (`NOT_SET` in
-SDK/store calls; REST field-presence tracking). These updates do not bypass
-terminal-state or visibility rules.
+draft/deprecated versions leave an omitted reason unchanged and clear it on explicit null (`NOT_SET` in SDK/store calls; REST
+field-presence tracking). Deleted versions remain terminal.
 
 **Source type extensibility.** The `source_type` enum is intentionally
 small for the initial implementation. New source types (e.g., `s3`,
@@ -952,10 +952,47 @@ the resolved `plugin_json["description"]`; the API returns the parent value
 as stored. `icons` has no fallback (the Agent Plugins manifest defines no
 icon field): the UI shows its default plugin glyph when unset.
 
+### MCPAccessBinding extensions
+
+The RFC-0004 dataclass gains `client_config` and optional constructor fields so
+it can represent a new binding, an ID-only reference, or a fetched record:
+
+```python
+from mlflow.entities import MCPServerVersion, MCPTool
+
+
+@dataclass
+class MCPAccessBinding:
+    binding_id: int | None = None
+    client_config: dict[str, Any] | None = None
+    server_name: str | None = None
+    server_version: str | None = None
+    server_alias: str | None = None
+    endpoint_url: str | None = None
+    transport_type: str | None = None  # remote compatibility field: streamable-http or sse
+    resolved_version: MCPServerVersion | None = None  # read-only
+    tools: list[MCPTool] | None = None  # read-only projection from resolved_version
+    workspace: str | None = None
+    created_by: str | None = None
+    last_updated_by: str | None = None
+    creation_timestamp: int | None = None
+    last_updated_timestamp: int | None = None
+```
+
+Persisted bindings always have a positive ID. A new object must supply valid
+configuration when submitted; an ID-only object is a reference, not a complete
+configuration. Standalone binding GET/search returns current fields; plugin
+responses return ID-only objects, including for missing or unreadable bindings.
+Pull fetches current configuration through the binding API. Resolved server
+metadata and RFC-0004's tools projection require READ on the associated server
+as well as the binding; otherwise those projections are omitted. A stdio pull
+relying on server package metadata therefore also requires server READ.
+
 ### AgentPluginVersion entity
 
 A versioned snapshot of the canonical package manifest, source authority,
-lifecycle state, optional registered-skill membership, and owned MCP configuration members.
+lifecycle state, optional registered-skill membership, and MCP access-binding
+references.
 
 Skill members are referenced by URI string rather than a separate
 data class. The URI format follows MLflow's `models:/name/version`
@@ -968,22 +1005,20 @@ convention:
 All three forms are resolved to a concrete `member_version` at create time and
 frozen into the member row (see the member-list URI resolution note below).
 
-Public SDK and REST fields use `skills` and `mcp_servers`. Their different types
-are intentional: skill URI strings reference independently registered versions;
-MCP objects define plugin-owned connection configuration and optional registry
-associations, rather than independently registered configuration entities.
+Public SDK and REST fields use `skills` and `mcp_servers`. Skills are URI
+references; `mcp_servers` maps plugin-local names to `MCPAccessBinding` objects.
+An object with `binding_id=None` requests creation in the plugin registration
+transaction. An object with an ID references the existing binding; its current
+stored configuration is authoritative, and registration does not update it from
+the supplied object. The SDK serializes only `binding_id` for existing objects,
+even when passed a fetched object containing configuration or audit metadata.
+New objects serialize only writable fields; caller objects are not mutated.
+Plugin responses carry allocated IDs, decoded as `MCPAccessBinding(binding_id=...)`.
+For HTTP, an existing-ID entry must contain only `binding_id`; supplying creation
+fields alongside it is rejected rather than silently updating the binding.
 
 ```python
 from mlflow.entities import MCPServerRef
-
-
-@dataclass(frozen=True)
-class MCPConfigMember:
-    member_name: str
-    client_config: dict[str, Any]
-    server_name: str | None = None
-    server_version: str | None = None
-    server_alias: str | None = None  # input-only; resolved to server_version on registration
 
 
 @dataclass
@@ -999,7 +1034,7 @@ class AgentPluginVersion:
     status_reason: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
     skills: list[str] = field(default_factory=list)
-    mcp_servers: list[MCPConfigMember] = field(default_factory=list)
+    mcp_servers: dict[str, MCPAccessBinding] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
     workspace: str | None = None
     created_by: str | None = None
@@ -1056,7 +1091,7 @@ specific version it operates on.
   plugin, either an external typed source (`source_type` of `git`, `oci`,
   or `zip`) or a package tree uploaded to MLflow artifact storage
   (`source_type="mlflow"`). `pull` fetches the whole agent plugin as a
-  unit, including `mcp.json` and any other non-skill content. On import,
+  unit and regenerates root `mcp.json` from current access bindings. On import,
   each member skill version is created with a source **derived** from the
   package: the same `source_type` and `source` as the package, with a
   `subpath` locating the skill within it (for an mlflow-stored package the
@@ -1075,22 +1110,27 @@ The server sets the plugin version's `source_type` from the creation flow,
 not from a user-supplied value: a package source (external pointer or
 MLflow upload) yields a packaged version, and a version created from member
 references with no plugin-level package yields `source_type="assembled"`.
-A packaged plugin has a plugin-level source and members whose sources are
+A packaged plugin has a plugin-level source and skill members whose sources are
 derived from (and therefore subpaths of) that same package; an assembled
-plugin has no plugin-level source and members that each carry their own
+plugin has no plugin-level source and skill members that each carry their own
 independent source. What a plugin version cannot do is combine a
-plugin-level source with members whose sources are independent of that
-package. In an assembled agent plugin, every member is an independently
+plugin-level source with skill members whose sources are independent of that
+package. In an assembled agent plugin, every skill member is an independently
 resolvable skill carrying its own `source_type`, whether an external pointer
 (`git`, `oci`, `zip`) or MLflow-stored content (`mlflow`, resolved by
 identity); the API rejects only the disallowed combination above, a
-plugin-level source together with members whose content is independent of
+plugin-level source together with skill members whose content is independent of
 that package.
+
+This source-consistency rule applies to skills. MCP bindings remain independent
+configuration records for both plugin kinds.
 
 **Immutability contract.** `plugin_json`, the member list, and source fields of
 an agent plugin version are immutable after creation. To change the canonical
 manifest, members, or source pointer, register a new agent plugin version.
 Mutable fields (`status`, `status_reason`, `tags`) can be updated independently.
+MCP member names and binding IDs are immutable; binding configuration and its
+optional server association remain mutable on the binding.
 
 The low-level registry API validates the manifest but does not fetch a remote
 artifact to validate its layout. Client-side import performs format-specific
@@ -1225,13 +1265,14 @@ authenticated SQL-backed server continue to use the public API.
 ### Audit metadata
 
 `created_by` and `last_updated_by` are server-derived audit fields. They are
-not accepted in REST request bodies or public `mlflow.genai` or
-`MlflowClient` methods. A REST handler obtains the authenticated principal
-and passes it to the store through internal parameters.
+not writable through REST, `mlflow.genai`, or `MlflowClient`. The SDK omits any
+read-only metadata on nested binding objects when serializing requests.
+Handlers pass the authenticated principal to stores through internal parameters.
 
 Store audit parameters are internal inputs supplied by server handlers.
 Skill and Agent Plugin REST stores retain them for interface compatibility
-but do not serialize them. The remote server determines audit identity.
+but do not serialize them, including when forwarding inline binding creation.
+The remote server determines audit identity.
 
 On creation, the store initializes both fields to the authenticated
 principal. When a version-creation operation auto-creates its parent, the
@@ -1484,7 +1525,7 @@ class SkillRegistryMixin:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         skills: list[str] | None = None,
-        mcp_servers: list[MCPConfigMember] | None = None,
+        mcp_servers: dict[str, MCPAccessBinding] | None = None,
         source_type: str | None = None,
         source: str | None = None,
         ref: str | None = None,
@@ -1502,7 +1543,7 @@ class SkillRegistryMixin:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         member_skills: list[dict[str, Any]] | None = None,
-        mcp_servers: list[MCPConfigMember] | None = None,
+        mcp_servers: dict[str, MCPAccessBinding] | None = None,
         source_type: str | None = None,
         source: str | None = None,
         ref: str | None = None,
@@ -1523,8 +1564,10 @@ class SkillRegistryMixin:
         newly created member versions. Import never reuses an existing skill version on the
         strength of a matching digest: every discovered member gets a new
         version so that each version keeps exactly one immutable, package-derived
-        source (see Content digest). Then create the packaged AgentPluginVersion
-        referencing every member skill version. If a member name is already taken
+        source (see Content digest). Create bindings whose binding_id is None,
+        or validate READ access to existing binding IDs. Then
+        create the packaged AgentPluginVersion referencing the skills and bindings.
+        If a member name is already taken
         in the organization by a skill that is not part of this plugin's history,
         the whole import fails. All of it commits in one database transaction or
         none of it does. A store that cannot provide a single-transaction unit
@@ -1742,14 +1785,15 @@ def register_agent_plugin(
     version: str | None = None,
     organization: str = "",
     skills: list[str] | None = None,
-    mcp_servers: list[MCPConfigMember] | None = None,
+    mcp_servers: dict[str, MCPAccessBinding] | None = None,
     source: GitSource | OCISource | ZipSource | str | None = None,
     status: str = "active",
     status_reason: str | None = None,
 ) -> AgentPluginVersion:
     """Validate or synthesize a canonical manifest, create or reuse the
     parent AgentPlugin, and register one immutable version. version is
-    required when plugin_json is None or does not contain a version."""
+    required when plugin_json is None or does not contain a version. Inline
+    bindings and the plugin version are committed atomically."""
 
 
 def search_agent_plugins(
@@ -1799,7 +1843,7 @@ class PluginIntrospectionResult:
     plugin_name: str | None
     plugin_json: dict[str, Any]
     skills: list[IntrospectedSkill]
-    mcp_servers: list[MCPConfigMember]
+    mcp_servers: dict[str, MCPAccessBinding]  # preview only; binding_id=None
     recognized_unregistered_content: list[str]
     warnings: list[PluginImportWarning]
 
@@ -1827,6 +1871,7 @@ def import_agent_plugin(
     version: str | None = None,
     organization: str = "",
     mcp_server_associations: dict[str, MCPServerRef] | None = None,
+    mcp_servers: dict[str, MCPAccessBinding] | None = None,
     status: str = "active",
     status_reason: str | None = None,
 ) -> PluginImportResult:
@@ -1836,21 +1881,24 @@ def import_agent_plugin(
     validates or constructs canonical plugin_json; discovers and registers
     skills, each with a source derived from the package (the package's
     source_type and source, plus a subpath locating the skill); and preserves
-    the package source. Indexes standard mcp.json entries as owned members;
-    mcp_server_associations maps local member names to MCPServerRef values
-    (name with an optional version or alias, as defined in RFC-0004).
-    Aliases are resolved at registration. Status and the optional status_reason
-    apply to the plugin and its newly created skill versions.
+    the package source. Creates access bindings from standard mcp.json entries
+    and references them from the plugin. mcp_servers overrides discovered entries
+    by local name using new or existing MCPAccessBinding objects.
+    mcp_server_associations sets context only on new bindings; reject association
+    overrides for existing bindings. Override keys may replace discovered names
+    or add MCP members; association keys must name a resulting new binding and
+    must agree with any association already supplied on that object.
+    Status and status_reason apply to the plugin and its new skill versions.
     plugin_name is used only when the selected adapter cannot
     derive a name. version is required when the detected manifest does not
     contain a version field. A typed source class (GitSource, OCISource,
     ZipSource) is converted to flat REST fields; a plain string is also
     accepted for convenience. Fetching and inspection are client-side; the
-    member skills and the plugin version are then created atomically by the
-    server via the POST /import endpoint. The `ImportRegisterResponse` carries
-    the packaged plugin version and the member skill versions (created or
-    created), which populate `PluginImportResult.plugin_version` and
-    `skill_versions` without additional reads.
+    member skills, new bindings, and the plugin version are created atomically
+    by the server via the POST /import endpoint.
+    The `ImportRegisterResponse` carries the plugin version with allocated
+    binding IDs and the newly created member skill versions, which populate
+    `PluginImportResult.plugin_version` and `skill_versions` without extra reads.
     """
 
 
@@ -1978,7 +2026,7 @@ class MlflowClient:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         skills: list[str] | None = None,
-        mcp_servers: list[MCPConfigMember] | None = None,
+        mcp_servers: dict[str, MCPAccessBinding] | None = None,
         source: GitSource | OCISource | ZipSource | str | None = None,
         status: str = "active",
         status_reason: str | None = None,
@@ -1994,15 +2042,15 @@ class MlflowClient:
         version: str | None = None,
         plugin_json: dict[str, Any] | None = None,
         member_skills: list[dict[str, Any]] | None = None,
-        mcp_servers: list[MCPConfigMember] | None = None,
+        mcp_servers: dict[str, MCPAccessBinding] | None = None,
         source: GitSource | OCISource | ZipSource | str | None = None,
         status: str = "active",
         status_reason: str | None = None,
     ) -> tuple[AgentPluginVersion, list[SkillVersion]]:
         """Post a client-prepared import payload to the transactional
-        import-registration endpoint. The server creates the member skills
-        and the packaged plugin version atomically; source_type is server-set
-        and each member skill's source is derived from the package. Each
+        import-registration endpoint. The server creates the member skills,
+        new bindings, and the packaged plugin version atomically; source_type
+        is server-set and each member skill's source is derived from the package. Each
         member_skills entry carries a name, a subpath locating the skill within
         the package, a client-computed content digest, and an optional
         description read from its SKILL.md during local inspection. Returns
@@ -2089,8 +2137,9 @@ class MlflowClient:
 ```
 
 For SDK update methods, `NOT_SET` means "leave unchanged" while `None`
-means "clear this nullable field". This mirrors the store-layer update
-contract so callers can distinguish partial updates from explicit
+means "clear this nullable field". An omitted reason is cleared when the status
+changes; `status=None` is invalid because status is not nullable. This mirrors
+the store-layer update contract so callers can distinguish partial updates from explicit
 nulling.
 
 `pull` is implemented in the SDK/CLI layer, not the store mixin. Its
@@ -2198,10 +2247,10 @@ present, they must agree; a mismatch is rejected. The server does not fetch remo
 `import_agent_plugin()` performs source fetching, format detection, filesystem
 validation, and adapter translation, then submits the canonical payload and
 member references to the transactional `POST /import` endpoint
-(`ImportRegisterRequest`), which creates the member skills and the packaged
-plugin version atomically and returns both in an `ImportRegisterResponse` (the
-packaged plugin version and the newly created member skill versions), so the
-client populates its result without additional reads.
+(`ImportRegisterRequest`), which creates member skills, new bindings, and the
+plugin version atomically and returns the plugin (with allocated binding IDs)
+and member skills in `ImportRegisterResponse`, without requiring additional
+client reads.
 
 When a Skill's `source` is a local path, the registration request carries the
 packaged content. `POST /{name}/versions` and
@@ -2326,12 +2375,12 @@ All paths relative to the logical agent-plugins router prefix.
 |---|---|---|
 | `POST` | `/` | Create an agent plugin |
 | `GET` | `/` | Search agent plugins |
-| `POST` | `/register` | Validate or synthesize `plugin_json`, create or reuse the parent, and create a version |
-| `POST` | `/import` | Import a packaged plugin: atomically create the member skills (each with a derived source) and the plugin version from a client-prepared payload (`ImportRegisterRequest`); returns the packaged plugin version and the newly created member skill versions (`ImportRegisterResponse`) |
+| `POST` | `/register` | Validate or synthesize `plugin_json`, create or reuse the parent, and atomically create a version and any inline access bindings |
+| `POST` | `/import` | Import a packaged plugin: atomically create member skills (each with a derived source), inline access bindings, and the plugin version from a client-prepared payload (`ImportRegisterRequest`); returns the packaged plugin version and the newly created member skill versions (`ImportRegisterResponse`) |
 | `GET` | `/@{organization}/{name}` | Get agent plugin by organization and name |
 | `PATCH` | `/@{organization}/{name}` | Update agent plugin fields |
 | `DELETE` | `/@{organization}/{name}` | Hard-delete agent plugin (cascades versions, memberships, and aliases). With `cascade=true`, also hard-deletes member skills; the whole delete fails atomically if any member is still referenced by a live (non-`deleted`) plugin version other than the one being deleted (membership rows held only by soft-deleted plugin versions do not block and are purged with the member); without it, member skills are left in place |
-| `POST` | `/@{organization}/{name}/versions` | Create an agent plugin version with members |
+| `POST` | `/@{organization}/{name}/versions` | Atomically create an agent plugin version with members and any inline access bindings |
 | `GET` | `/@{organization}/{name}/versions` | Search agent plugin versions |
 | `GET` | `/@{organization}/{name}/versions/{version}` | Get a specific agent plugin version |
 | `PATCH` | `/@{organization}/{name}/versions/{version}` | Update agent plugin version status or reason |
@@ -2350,6 +2399,32 @@ with-organization route, and every such operation also has a no-organization
 route with the leading `@{organization}/` segment removed. Agent plugin
 version path values follow the same length and reserved character validation
 as Agent Plugin URIs.
+
+### Access-binding API extensions
+
+Extend [RFC-0004](../0004-mcp-registry/0004-mcp-registry.md) with these routes,
+relative to its existing MCP router:
+
+| Method | New path | Purpose |
+|---|---|---|
+| `POST` | `/bindings` | Create without a server parent |
+| `GET`, `PATCH`, `DELETE` | `/bindings/{binding_id}` | Operate by ID without a server parent |
+
+Existing nested routes remain; search also includes readable unassociated
+bindings. Apply these Python changes to `mlflow.genai`, `MlflowClient`, and stores:
+
+| Operation | Change from RFC-0004 |
+|---|---|
+| Create | Add `client_config=None`; make `server_name`, `endpoint_url`, and `transport_type` optional, defaulting to `None` |
+| Get/delete | Make `server_name=None` an optional scope check; retain required `binding_id` |
+| Update | Add `client_config=NOT_SET`; make `server_name=NOT_SET` a mutable association, using the ID route for retargeting |
+
+Replacing `client_config` derives endpoint/transport fields; stdio clears them.
+Endpoint/transport patches update the remote client entry; conflicting inputs
+are rejected. Clearing configuration requires valid remaining remote fields.
+Setting a version or alias clears the other; clearing `server_name` clears both.
+Validate the resulting binding, including stdio context. Endpoint-only creation
+retains RFC-0004's `streamable-http` default.
 
 ### Pagination and filtering
 
@@ -2413,7 +2488,8 @@ that memberships are not a stored field on the skill.
 
 Plugin parent/version searches support `mcp_member_name` and `mcp_server_name`;
 combined predicates match one member row. Parent search checks any non-deleted
-version, subject to READ permission. Server matches are declared, not observed.
+version, subject to READ permission. Resolve server-name predicates through
+current readable access bindings; server matches are declared, not observed.
 
 On parent search, `status` and `source_type` filters match values derived from
 the latest-resolved non-`deleted` version: `status` matches the same derived
@@ -2441,6 +2517,18 @@ named version routes, which can create or reuse the parent and create a version
 in one operation. The Agent Plugin `POST /register` endpoint accepts identity
 inputs in the body; its identity is extracted from or checked against
 `plugin_json`.
+
+For RFC-0004 binding models, only these changes are needed:
+
+| Model | Change |
+|---|---|
+| `CreateMCPAccessBindingRequest`, `UpdateMCPAccessBindingRequest` | Add optional `client_config` and `server_name`; allow null endpoint/transport for stdio |
+| `MCPAccessBindingResponse`, `MCPAccessBindingSummaryResponse` | Add optional `client_config`; make server and endpoint/transport fields nullable; retain required positive `binding_id` |
+| New `MCPAccessBindingPayload` | Inline writable binding fields plus optional positive `binding_id`; an ID requires an ID-only object, otherwise apply creation validation |
+
+The remaining binding fields and response projections follow RFC-0004.
+`MCPAccessBindingPayload` uses the extended creation fields without imposing
+creation validation on ID-only references; it rejects unknown/read-only fields.
 
 ```python
 from typing import Any
@@ -2532,19 +2620,11 @@ class PluginJSONPayload(BaseModel):
     extensions: Any = None
 
 
-class MCPConfigMemberPayload(BaseModel):
-    member_name: str = Field(min_length=1, max_length=128)
-    client_config: dict[str, Any]
-    server_name: str | None = None
-    server_version: str | None = None
-    server_alias: str | None = None  # input-only; resolved to server_version on registration
-
-
 class CreateAgentPluginVersionRequest(BaseModel):
     version: str | None = None
     plugin_json: PluginJSONPayload | None = None
     skills: list[str] | None = None
-    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    mcp_servers: dict[str, MCPAccessBindingPayload] = Field(default_factory=dict)
     source_type: str | None = None  # optional explicit type for an external package source (git/oci/zip only; mlflow and assembled are flow-derived and rejected here); validated against `source`, with inference as the fallback when omitted (see Field inference)
     source: str | None = None
     ref: str | None = None
@@ -2572,7 +2652,7 @@ class MemberSkillDefinition(BaseModel):
 
 class ImportRegisterRequest(BaseModel):
     # Submitted after the client fetches and inspects the source locally. The
-    # server creates the member skills and the packaged plugin version in one
+    # server creates member skills, new bindings, and the plugin version in one
     # transaction; the stored source_type is server-set and each member skill's
     # source is derived from the package (its source_type and source, plus the
     # member's subpath).
@@ -2580,7 +2660,7 @@ class ImportRegisterRequest(BaseModel):
     version: str | None = None  # required when plugin_json omits a version
     organization: str = ""
     member_skills: list[MemberSkillDefinition] = Field(default_factory=list)  # discovered members with metadata
-    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    mcp_servers: dict[str, MCPAccessBindingPayload] = Field(default_factory=dict)
     source_type: str | None = None  # optional explicit type for the external package pointer (git/oci/zip only); the import client fetched the source, so it always knows the type and submits it; validated against `source`, with inference as the fallback (see Field inference)
     source: str | None = None  # external package pointer; null for an MLflow-stored package
     ref: str | None = None
@@ -2689,7 +2769,7 @@ class AgentPluginVersionResponse(BaseModel):
     status: str = "active"
     status_reason: str | None = None
     skills: list[str] = Field(default_factory=list)
-    mcp_servers: list[MCPConfigMemberPayload] = Field(default_factory=list)
+    mcp_servers: dict[str, MCPAccessBindingResponse] = Field(default_factory=dict)
     aliases: list[str] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
@@ -2849,14 +2929,39 @@ as the SDK's typed source classes do), so registration through these
 surfaces never depends on the server inferring the type from the URL's
 shape.
 
-`import` accepts repeatable `--mcp-server MEMBER=SERVER_NAME` mappings,
-with optional `--mcp-server-version MEMBER=VERSION` or
-`--mcp-server-alias MEMBER=ALIAS` selectors (mutually exclusive per member).
-The SDK uses `mcp_server_associations`; packaged configurations come from root
-`mcp.json`. Low-level SDK/REST requests use `mcp_servers` with `server_name`
-and optional `server_version` or input-only `server_alias`.
-`register`/`create-version` accept repeatable `--mcp-binding MEMBER=BINDING_ID`
-to copy configuration and server associations from approved access bindings.
+`import` creates bindings from root `mcp.json`. Optional repeatable
+`--mcp-server MEMBER=SERVER_NAME` mappings, with `--mcp-server-version` or
+`--mcp-server-alias` selectors, set server context on newly created bindings
+(SDK: `mcp_server_associations`). Server associations are not required.
+`import`, `register`, and `create-version` accept repeatable
+`--mcp-binding MEMBER=BINDING_ID` references. SDK `mcp_servers` maps local names
+to `MCPAccessBinding` objects; REST uses the equivalent binding payload.
+Omit `binding_id` to create a binding atomically with the plugin; supply an ID
+to reuse an existing binding.
+
+```python
+mcp_servers = {
+    "remote": MCPAccessBinding(
+        client_config={"type": "streamable-http", "url": "https://mcp.example.com"},
+    ),  # binding_id=None: create with the plugin
+    "my-mcp": MCPAccessBinding(binding_id=17),
+}
+```
+
+The equivalent `POST /api/3.0/mlflow/agent-plugins/register` body is:
+
+```json
+{
+  "name": "support-tools",
+  "version": "1.0.0",
+  "mcp_servers": {
+    "remote": {
+      "client_config": {"type": "streamable-http", "url": "https://mcp.example.com"}
+    },
+    "my-mcp": {"binding_id": 17}
+  }
+}
+```
 
 Both `mlflow skills` and `mlflow agent-plugins` accept optional `--status-reason`
 on registration/import, `update-version`, and `delete-version`. Version DELETE
@@ -2932,7 +3037,7 @@ The importer:
 5. Otherwise applies the existing generic skill-directory discovery and
    synthesizes a minimal canonical manifest. `plugin_name` is used only when
    the adapter cannot infer a name.
-6. Discovers standard root `mcp.json` entries as MCP members using locally
+6. Discovers standard root `mcp.json` entries as uncreated binding objects using locally
    supported schema rules. Invalid MCP files/entries produce warnings with
    the component failure boundaries in the main RFC. Other non-skill content
    is reported without membership semantics; harness-native MCP formats are
@@ -2990,23 +3095,23 @@ package lives: the original typed source (preserving `ref` for Git
 sources) for a `git`, `oci`, or `zip` package, or `mlflow` with a null
 `source` for a package stored in MLflow artifact storage. It carries the
 immutable canonical `plugin_json` and member references for all
-discovered skills, plus the submitted MCP configuration members and optional
-server-identity associations. The server validates these entries and commits
-them in the same transaction. This preserves a pullable link to the complete original
-package (including `mcp.json` and other non-skill content) while also making
-each member independently addressable and pullable through its derived source.
+discovered skills and MCP bindings, creating bindings with no ID or validating
+existing IDs in the same transaction. The original package remains
+pullable, and each skill can be pulled independently from its derived source.
 A valid package with no skills creates an agent plugin version with an empty
 skill list and any discovered MCP members.
 
-Because the member skills and the plugin version are committed together, a
-failure at any step rolls the whole registration back: no member skill
-versions are left behind. Import
-requires a source that already exists (an external `git`, `oci`, or `zip`
+Because member skills, new bindings, and the plugin version commit together,
+a failure rolls the whole registration back, leaving no new skills or bindings.
+Import requires a source that already exists (an external `git`, `oci`, or `zip`
 pointer, or a package already resident in MLflow artifact storage) and preserves
 it as the plugin version's pullable pointer, so registration performs no content
 upload; the transaction is the only step that can fail.
 
 #### Re-import behavior
+
+Import creates new bindings unless existing IDs are explicitly selected;
+matching configuration alone does not cause reuse.
 
 When the target agent plugin already has at least one version, import first
 rejects an incoming canonical version that already exists. It then
@@ -3062,9 +3167,9 @@ version such as `"1.2.0"` may reference skill version `7`.
 
 ### Warnings and result
 
-Root `mcp.json` remains in the package and its valid entries are returned as
-owned MCP members on the plugin version. Other non-skill content is not
-registered. Recognized unregistered content is returned separately from warnings;
+Root `mcp.json` remains in the source package; its valid entries create access
+bindings referenced by the returned plugin version. Pull regenerates the file
+from current bindings. Other non-skill content is not registered. Recognized unregistered content is returned separately from warnings;
 adapter-specific or unknown skipped categories produce a `PluginImportWarning`
 containing category, path, and explanation. The CLI prints the detected format,
 canonical identity, MCP members, recognized unregistered content, and warnings. The SDK
@@ -3076,8 +3181,11 @@ install or export an MLflow agent plugin.
 
 ## Pull semantics details
 
-**MCP materialization.** Packaged pulls preserve `mcp.json` unchanged; assembled
-pulls generate it from stored `client_config` snapshots using local member names.
+**MCP materialization.** Both plugin kinds generate root `mcp.json` from current
+bindings using local member names, replacing the packaged file in local output.
+Read each distinct binding once per pull and validate stdio installation context
+against its resolved server metadata or the consuming package. See [MCP configuration members](0008-mvp-skill-registry.md#mcp-configuration-members)
+for permissions, failure behavior, and the effect of binding changes.
 
 **Source availability.** The registry stores source pointers but does
 not cache or proxy content. If a source is unreachable or the content
