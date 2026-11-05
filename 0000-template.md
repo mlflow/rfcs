@@ -47,3 +47,9 @@ If we implement this proposal, how will existing MLflow users adopt it? Is this 
 # Open questions
 
 What parts of the design are still TBD?
+
+# AI disclosure
+
+List which parts of this RFC were generated or substantially drafted by an LLM (for example, "codebase survey in Detailed design", "first draft of Alternatives"), or write "None".
+
+LLMs are great for searching the codebase and summarizing existing behavior, and we use them for this too. The purpose of an RFC, though, is to start a discussion, and that works best when authors can explain and defend each design decision themselves. RFCs that are mostly unreviewed LLM output may be closed by maintainers. See the [AI usage policy](https://github.com/mlflow/rfcs#ai-usage-policy).
