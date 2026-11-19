@@ -56,7 +56,7 @@ experiment.
 ### Review a fleet of agents
 
 1. An operator creates a fleet and adds several cooperating agents.
-2. A developer with read access opens the fleet to compare quality and usage, then filters its
+2. A developer with read access reviews quality and usage across fleet members, then filters
    traces and sessions to selected agents.
 3. From the fleet's **Agents** tab, they open one agent to investigate its activity.
 
@@ -92,10 +92,9 @@ from mlflow import MlflowClient
 client = MlflowClient()
 agent_id = client.create_agent(name="support-agent")
 mlflow.set_experiment(experiment_id="123")  # Existing workflow
-mlflow.clear_active_destination()  # Switch from experiment to agent
-mlflow.set_agent(agent_id=agent_id)
+mlflow.set_agent(agent_id=agent_id)  # Replaces the active experiment selection
 
-mlflow.search_traces(experiment_ids=["123"])
+mlflow.search_traces(locations=["123"])
 mlflow.search_traces(agent_ids=[agent_id])
 
 mlflow.genai.create_dataset(name="support-eval", agent_id=agent_id)
@@ -103,8 +102,9 @@ client.rename_agent(agent_id, "support-assistant")
 # create_dataset(..., experiment_id="123") remains supported.
 ```
 
-Explicit experiment and agent arguments are mutually exclusive. Setting an active agent while an
-experiment is active, or an experiment while an agent is active, is an error.
+Passing both an experiment and an agent to a single API call is an error. A successful `set_agent`
+call replaces the active experiment selection, and a successful `set_experiment` call replaces the
+active agent selection. Neither setter changes environment variables.
 
 Deployments can select an agent without calling `set_agent` by setting `MLFLOW_AGENT_ID`. An explicit
 `set_agent` or `set_experiment` call takes precedence; without one, agent and experiment selectors
